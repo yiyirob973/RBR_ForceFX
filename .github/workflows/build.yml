@@ -1,0 +1,31 @@
+name: Build RBR Trueforce Plugin
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC Developer Command Prompt (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Compile 32-bit DLL
+        run: |
+          cl /O2 /MT /EHsc /LD RBR_TrueforcePlugin.cpp /link /DEF:RbrTrueforce.def dinput8.lib dxguid.lib user32.lib ws2_32.lib /OUT:RBR_TrueforcePlugin.dll
+
+      - name: Upload Compiled DLL Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RBR_TrueforcePlugin
+          path: RBR_TrueforcePlugin.dll

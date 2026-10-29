@@ -1,0 +1,3 @@
+LIBRARY RbrTrueforce
+EXPORTS
+    RBR_CreatePlugin
