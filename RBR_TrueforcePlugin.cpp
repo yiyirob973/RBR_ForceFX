@@ -1,39 +1,30 @@
-// RBR_TrueforcePlugin.cpp  (v2)
+// RBR_TrueforcePlugin.cpp  (v3)
 //
-// Layers extra "Trueforce-like" vibration (engine + road surface) on top of
-// Richard Burns Rally's own force feedback.
+// Layers extra "Trueforce-like" vibration on top of Richard Burns Rally's own force feedback,
+// driven by NGP's UDP telemetry (rbr.telemetry.data.TelemetryData.h, NGP 7.4.778, 664 bytes).
 //
-// WHY v1 FAILED
-//   RBR already holds the wheel with an exclusive DirectInput acquire. A second
-//   device object in the plugin can never get exclusive access, and DirectInput
-//   only lets you CreateEffect() on an exclusively acquired device. (Also: the
-//   cooperative level used a NULL window handle, nothing was error-checked and
-//   the effect struct was incomplete.)
+// HOW IT REACHES THE WHEEL
+//   RBR/NGP already hold the wheel exclusively, so a second device object could never create effects.
+//   We patch the IDirectInputDevice8 vtable (Acquire / Unacquire / GetDeviceState / GetDeviceData / Poll),
+//   capture RBR's own device object (matched by instance GUID) and add our effects to it. The wheel sums
+//   them with RBR's own force.
 //
-// HOW v2 WORKS
-//   1. We patch the IDirectInputDevice8 vtable (Acquire / GetDeviceState /
-//      GetDeviceData / Poll). RBR polls its wheel every frame, so our hook sees
-//      RBR's own device object, matches it by instance GUID and keeps a
-//      reference to it.
-//   2. On that device we create two extra periodic (sine) effects. DirectInput
-//      sums them with RBR's own effects in the wheel firmware:
-//        - ENGINE: frequency follows RPM (cylinders/2 pulses per rev, folded
-//          into a range wheels can actually render), amplitude follows load.
-//        - ROAD:   frequency follows speed (+ jitter), amplitude follows
-//          suspension activity (fallback: speed only).
-//   3. Telemetry comes from NGP's UDP stream (rbr.telemetry.data.TelemetryData.h,
-//      NGP 7.4.778, packed, 664 bytes). Offsets used (all float32 unless noted):
-//        throttle 28 | speed 60 (kph or mph) | accHeave 120 | engine rpm 136
-//        suspension blocks LF/RF/LB/RB at 152 + n*128: strutForce +16, piston velocity +28
-//      They can be overridden in the INI if a future NGP changes the layout.
-//      NGP must send a SECOND UDP endpoint to this plugin, e.g. in NGP's ini:
-//        udpTelemetry=1
-//        udpTelemetryEndpoints=127.0.0.1:6776,127.0.0.1:6778   (6776 SimHub, 6777 RbrSurfaceAudio)
+// EFFECT LAYERS (4 DirectInput effects, all zero-mean vibration: they never push the wheel to one side)
+//   ENGINE   sine, firing frequency compressed into the wheel's usable band (monotonic, no pitch jumps).
+//            Amplitude is shaped by RPM (idle lump, resonance bumps, high-rev buzz), throttle load and a
+//            frequency compensation. Rev limiter stutters.
+//   LUMP     second, low sine (half order) = rough idle / beating against the main engine tone.
+//   ROAD     sawtooth with random frequency + amplitude jitter. Driven by the roughness of the FRONT tyres
+//            (high-passed strut force / mean load, as in RbrSurfaceAudio) and damper piston velocity.
+//            Symmetric vibration only: RBR's own steering force is never overridden.
+//            Smooth tarmac = nothing, gravel = grit, rough / dirt / kerbs = violent and sharp.
+//   BRAKE    sine: front-end judder under braking, grows with brake pedal and front load transfer (dive);
+//            front wheel lock-up (from the tyre segment counter vs car speed) makes it harsh.
 //
-// BUILD: 32-bit (RBR is x86), link ws2_32 / dinput8 / dxguid (pragmas below).
-//
-// FILES (next to the DLL): TrueforceRumble.ini, TrueforceRumble.log,
-//                           TrueforceRumble_packet.txt (first packet dump)
+// BUILD: 32-bit (RBR is x86), static CRT:
+//   cl /std:c++17 /EHsc /LD /MT /O2 RBR_TrueforcePlugin.cpp /Fe:RbrTrueforce.dll /link /DEF:RbrTrueforce.def
+// NGP: udpTelemetry=1, udpTelemetryEndpoints=127.0.0.1:6776,127.0.0.1:6777,127.0.0.1:6778
+// FILES (next to the DLL): TrueforceRumble.ini (written on first run), .log, _loaded.txt, _packet.txt
 
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
@@ -71,6 +62,11 @@ typedef std::chrono::steady_clock Clock;
 
 inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 inline float clamp01(float v) { return clampf(v, 0.0f, 1.0f); }
+inline float smooth01(float e0, float e1, float x) { float t = clamp01((x - e0) / (e1 - e0)); return t * t * (3.0f - 2.0f * t); }
+inline float gauss(float x, float c, float w) { float d = (x - c) / w; return std::exp(-d * d); }
+inline float alphaFor(float dt, float tau) { return 1.0f - std::exp(-dt / tau); }   // EMA coefficient
+inline float hpCoef(float dt, float tau) { return tau / (tau + dt); }               // 1st order high-pass
+inline float rnd() { return (rand() % 2001 - 1000) / 1000.0f; }                    // -1..1
 
 // ---------------------------------------------------------------- paths/log
 std::string g_dir;
@@ -97,26 +93,39 @@ void Logf(const char* fmt, ...) {
 
 // ------------------------------------------------------------------- config
 struct Config {
-    int   udpPort = 6778;            // 6776 = SimHub, 6777 = RbrSurfaceAudio; do not share a port (UDP unicast goes to one socket only)
-    int   minPacket = 664;           // NGP 7.4.778 packet length
+    int   udpPort = 6778;            // 6776 = SimHub, 6777 = RbrSurfaceAudio. Never share a port.
+    int   minPacket = 664;
     int   cylinders = 4;             // engine pulses per rev = cylinders / 2
-    float masterGain = 1.0f, engineGain = 1.0f, roadGain = 1.0f;
-    int   engineMaxMag = 3000;       // DirectInput units, 0..10000
-    int   roadMaxMag = 3000;
-    float engineMinHz = 18.0f, engineMaxHz = 110.0f;
-    float roadMinHz = 28.0f, roadMaxHz = 95.0f;
 
-    // Byte offsets of float32 fields inside the NGP UDP packet (defaults from TelemetryData.h, NGP 7.4.778).
-    int   offRpm = 136, offSpeed = 60, offThrottle = 28, offAccHeave = 120;
-    int   offSuspBase = 152, suspStride = 128, offPiston = 28, suspCount = 4;   // damper piston velocity per wheel
-    int   speedIsKph = 1;            // 0 if RBR is set to mph
+    // gains and per-layer ceilings (DirectInput units 0..10000)
+    float masterGain = 1.0f, engineGain = 1.0f, roadGain = 1.0f, brakeGain = 1.0f;
+    int   engineMaxMag = 3500, roadMaxMag = 5500, brakeMaxMag = 4500;
+    int   totalMaxMag = 8000;        // all layers together are scaled down to this
+
+    // engine
+    float engineMinHz = 14.0f, engineMaxHz = 100.0f;
+    float rpmMax = 0.0f;             // 0 = learn from the data (starts at RpmMaxInit)
+    float rpmMaxInit = 7500.0f;
+
+    // road
+    float roadMinHz = 30.0f, roadMaxHz = 95.0f;
+    float roughLow = 0.08f, roughHigh = 0.60f, roughGamma = 1.4f;   // tyre roughness -> 0..1 level (tarmac below roughLow)
+    float pistonScale = 1.0f;        // RMS damper piston velocity -> 0..1 (absolute hits, kerbs)
+    float bumpScale = 0.1f;          // heave acceleration spike -> 0..1
+    float maxSpeed = 40.0f;          // m/s that counts as full speed
+
+    // braking
+    float tyreCircumference = 1.95f; // m, until the plugin has learned it while coasting
+    float lockThreshold = 0.12f;     // relative wheel speed deficit where lock-up starts
+
+    // NGP packet offsets (float32 unless noted)
+    int   offThrottle = 28, offBrake = 32, offSpeed = 60, offAccHeave = 120, offRpm = 136;
+    int   offSuspBase = 152, suspStride = 128, offStrut = 16, offPiston = 28, offSegment = 60;   // segment = uint32
+    int   speedIsKph = 1;
     float rpmScale = 1.0f;
-    float suspScale = 1.0f;          // RMS piston velocity (m/s) -> 0..1 road texture; tune with the status page
-    float bumpScale = 0.1f;          // high-passed heave acceleration -> 0..1 bump impulse; tune with the status page
-    float maxSpeed = 40.0f;          // m/s that counts as "full speed" for road texture
 
     int         autoConnect = 0;
-    std::string wheel;               // device name (substring match, case-insensitive)
+    std::string wheel;
 };
 
 void SyncConfig(Config& c, const std::string& path, bool write) {
@@ -131,17 +140,22 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
         if (write) { snprintf(b, sizeof(b), "%d", v); WritePrivateProfileStringA(S, k, b, path.c_str()); }
         else { GetPrivateProfileStringA(S, k, "", b, sizeof(b), path.c_str()); if (b[0]) v = atoi(b); }
     };
-    I("UdpPort", c.udpPort);            I("MinPacketBytes", c.minPacket);
-    I("Cylinders", c.cylinders);
-    F("MasterGain", c.masterGain);      F("EngineGain", c.engineGain);   F("RoadGain", c.roadGain);
+    I("UdpPort", c.udpPort);  I("MinPacketBytes", c.minPacket);  I("Cylinders", c.cylinders);
+    F("MasterGain", c.masterGain); F("EngineGain", c.engineGain); F("RoadGain", c.roadGain);
+    F("BrakeGain", c.brakeGain);
     I("EngineMaxMagnitude", c.engineMaxMag); I("RoadMaxMagnitude", c.roadMaxMag);
-    F("EngineMinHz", c.engineMinHz);    F("EngineMaxHz", c.engineMaxHz);
-    F("RoadMinHz", c.roadMinHz);        F("RoadMaxHz", c.roadMaxHz);
-    I("OffsetRpm", c.offRpm);           I("OffsetSpeed", c.offSpeed);    I("OffsetThrottle", c.offThrottle);
-    I("OffsetAccHeave", c.offAccHeave); I("OffsetSuspBase", c.offSuspBase); I("SuspStride", c.suspStride);
-    I("OffsetPistonVel", c.offPiston);  I("SuspCount", c.suspCount);     I("SpeedIsKph", c.speedIsKph);
-    F("RpmScale", c.rpmScale);          F("SuspScale", c.suspScale);     F("BumpScale", c.bumpScale);
-    F("MaxSpeed", c.maxSpeed);
+    I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
+    F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
+    F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
+    F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
+    F("RoughLow", c.roughLow); F("RoughHigh", c.roughHigh); F("RoughGamma", c.roughGamma);
+    F("PistonScale", c.pistonScale); F("BumpScale", c.bumpScale); F("MaxSpeed", c.maxSpeed);
+    F("TyreCircumference", c.tyreCircumference); F("LockThreshold", c.lockThreshold);
+    I("OffsetThrottle", c.offThrottle); I("OffsetBrake", c.offBrake); I("OffsetSpeed", c.offSpeed);
+    I("OffsetAccHeave", c.offAccHeave); I("OffsetRpm", c.offRpm);
+    I("OffsetSuspBase", c.offSuspBase); I("SuspStride", c.suspStride); I("OffsetStrutForce", c.offStrut);
+    I("OffsetPistonVel", c.offPiston); I("OffsetTyreSegment", c.offSegment);
+    I("SpeedIsKph", c.speedIsKph); F("RpmScale", c.rpmScale);
     I("AutoConnect", c.autoConnect);
     char b[260];
     if (write) WritePrivateProfileStringA(S, "Wheel", c.wheel.c_str(), path.c_str());
@@ -149,11 +163,14 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
 
     if (!write) {
         c.cylinders = std::max(1, std::min(c.cylinders, 16));
-        c.suspCount = std::max(0, std::min(c.suspCount, 4));
         c.engineMaxMag = std::max(0, std::min(c.engineMaxMag, 10000));
         c.roadMaxMag = std::max(0, std::min(c.roadMaxMag, 10000));
-        if (c.engineMaxHz < c.engineMinHz * 2.0f) c.engineMinHz = c.engineMaxHz * 0.5f; // fold loop needs 2x range
+        c.brakeMaxMag = std::max(0, std::min(c.brakeMaxMag, 10000));
+        c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, 10000));
+        if (c.engineMaxHz < c.engineMinHz + 5.0f) c.engineMaxHz = c.engineMinHz + 5.0f;
+        if (c.roughHigh < c.roughLow + 0.05f) c.roughHigh = c.roughLow + 0.05f;
         if (c.maxSpeed < 1.0f) c.maxSpeed = 1.0f;
+        if (c.tyreCircumference < 0.5f) c.tyreCircumference = 1.95f;
     }
 }
 
@@ -345,8 +362,7 @@ void GameDeviceTap::Remove() {
 
 // ----------------------------------------------------------- effect layer
 BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
-    // Only reads fields that sit before the name strings, so it is safe for the
-    // ANSI and unicode variants alike.
+    // Reads only fields that sit before the name strings: safe for the ANSI and unicode variants.
     if (o->dwFlags & DIDOI_FFACTUATOR) {
         *static_cast<DWORD*>(ref) = o->dwType;
         return DIENUM_STOP;
@@ -354,9 +370,15 @@ BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
     return DIENUM_CONTINUE;
 }
 
+enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD, S_BRAKE, S_COUNT };
+const char* const kSlotName[S_COUNT] = {"engine", "lump", "road", "brake"};
+
 class FFLayer {
 public:
-    bool Ready() const { return m_engine && m_road; }
+    bool Ready() const {
+        for (int i = 0; i < S_COUNT; ++i) if (m_fx[i]) return true;
+        return false;
+    }
 
     HRESULT Create(IDirectInputDevice8A* dev) {
         Destroy();
@@ -364,43 +386,48 @@ public:
 
         DWORD axisId = 0xFFFFFFFF;
         dev->EnumObjects(FindFFAxisCb, &axisId, DIDFT_AXIS);
-        if (axisId == 0xFFFFFFFF) return E_NOTIMPL;   // no force feedback actuator on this device
+        if (axisId == 0xFFFFFFFF) return E_NOTIMPL;      // no force feedback actuator
         m_axisId = axisId;
 
-        HRESULT hr = MakeSine(&m_engine);
-        if (SUCCEEDED(hr)) hr = MakeSine(&m_road);
-        if (FAILED(hr)) { Destroy(); return hr; }
-
-        m_engine->Start(1, 0);
-        m_road->Start(1, 0);
-        m_lastEngMag = m_lastRoadMag = -1;
+        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_Sine };
+        HRESULT firstErr = DI_OK;
+        int ok = 0;
+        for (int i = 0; i < S_COUNT; ++i) {
+            HRESULT hr = Make(i, *guids[i]);
+            if (SUCCEEDED(hr)) { ++ok; m_fx[i]->Start(1, 0); }
+            else {
+                Logf("CreateEffect(%s) failed: 0x%08X", kSlotName[i], (unsigned)hr);
+                if (SUCCEEDED(firstErr)) firstErr = hr;
+            }
+            m_lastMag[i] = -100000; m_lastPer[i] = 0;
+        }
         m_fail = 0;
+        if (!ok) { Destroy(); return firstErr; }
+        Logf("Effects created: %d of %d", ok, (int)S_COUNT);
         return DI_OK;
     }
 
     void Destroy() {
-        if (m_engine) { m_engine->Stop(); m_engine->Release(); m_engine = nullptr; }
-        if (m_road)   { m_road->Stop();   m_road->Release();   m_road = nullptr; }
+        for (int i = 0; i < S_COUNT; ++i)
+            if (m_fx[i]) { m_fx[i]->Stop(); m_fx[i]->Release(); m_fx[i] = nullptr; }
         m_dev = nullptr;
     }
 
-    // RBR re-acquired the device (alt-tab, menu change): make sure we are playing.
+    // RBR re-acquired the device: make sure everything is playing again.
     void Restart() {
-        if (m_engine) m_engine->Start(1, 0);
-        if (m_road)   m_road->Start(1, 0);
-        m_lastEngMag = m_lastRoadMag = -1;
+        for (int i = 0; i < S_COUNT; ++i) if (m_fx[i]) { m_fx[i]->Start(1, 0); m_lastMag[i] = -100000; }
     }
 
-    // Returns false if effects look dead and should be recreated.
-    bool Push(int engMag, DWORD engPeriodUs, int roadMag, DWORD roadPeriodUs) {
-        HRESULT h1 = Update(m_engine, engMag, engPeriodUs, m_lastEngMag, m_lastEngPer);
-        HRESULT h2 = Update(m_road,   roadMag, roadPeriodUs, m_lastRoadMag, m_lastRoadPer);
-        if (FAILED(h1) || FAILED(h2)) {
-            m_lastHr = FAILED(h1) ? h1 : h2;
-            // lost/unloaded effect: try to start it again, give up after a while
-            if (m_engine) m_engine->Start(1, 0);
-            if (m_road)   m_road->Start(1, 0);
-            m_lastEngMag = m_lastRoadMag = -1;
+    // mag: 0..10000. per: period in microseconds.
+    bool Push(const int mag[S_COUNT], const DWORD per[S_COUNT]) {
+        bool bad = false;
+        for (int i = 0; i < S_COUNT; ++i) {
+            if (!m_fx[i]) continue;
+            HRESULT hr = Update(i, mag[i], per[i]);
+            if (FAILED(hr)) { bad = true; m_lastHr = hr; }
+        }
+        if (bad) {
+            for (int i = 0; i < S_COUNT; ++i) if (m_fx[i]) { m_fx[i]->Start(1, 0); m_lastMag[i] = -100000; }
             return ++m_fail < 100;
         }
         m_fail = 0;
@@ -410,76 +437,49 @@ public:
 
 private:
     IDirectInputDevice8A* m_dev = nullptr;
-    IDirectInputEffect* m_engine = nullptr;
-    IDirectInputEffect* m_road = nullptr;
+    IDirectInputEffect* m_fx[S_COUNT] = {nullptr, nullptr, nullptr, nullptr};
+    int m_lastMag[S_COUNT];
+    DWORD m_lastPer[S_COUNT];
     DWORD m_axisId = 0;
-    int m_lastEngMag = -1, m_lastRoadMag = -1;
-    DWORD m_lastEngPer = 0, m_lastRoadPer = 0;
     int m_fail = 0;
     HRESULT m_lastHr = DI_OK;
 
-    HRESULT MakeSine(IDirectInputEffect** out) {
+    HRESULT Make(int slot, const GUID& g) {
         DIPERIODIC per{};
-        per.dwMagnitude = 0;
-        per.lOffset = 0;
-        per.dwPhase = 0;
-        per.dwPeriod = 20000;                 // 50 Hz placeholder
-
+        per.dwPeriod = 20000;
         LONG dir = 0;
         DIEFFECT e{};
         e.dwSize = sizeof(DIEFFECT);
-        e.dwFlags = DIEFF_CARTESIAN | DIEFF_OBJECTIDS;   // axis given as object id: independent of RBR's data format
+        e.dwFlags = DIEFF_CARTESIAN | DIEFF_OBJECTIDS;   // axis by object id: independent of RBR's data format
         e.dwDuration = INFINITE;
-        e.dwSamplePeriod = 0;
         e.dwGain = DI_FFNOMINALMAX;
-        e.dwTriggerButton = DIEB_NOTRIGGER;              // v1 left this 0 = "button 0 triggers the effect"
-        e.dwTriggerRepeatInterval = 0;
+        e.dwTriggerButton = DIEB_NOTRIGGER;
         e.cAxes = 1;
         e.rgdwAxes = &m_axisId;
         e.rglDirection = &dir;
-        e.lpEnvelope = NULL;
         e.cbTypeSpecificParams = sizeof(per);
         e.lpvTypeSpecificParams = &per;
-        e.dwStartDelay = 0;
-        return m_dev->CreateEffect(GUID_Sine, &e, out, NULL);
+        return m_dev->CreateEffect(g, &e, &m_fx[slot], NULL);
     }
 
-    static HRESULT Update(IDirectInputEffect* fx, int mag, DWORD period, int& lastMag, DWORD& lastPer) {
-        if (!fx) return DI_OK;
-        mag = std::max(0, std::min(mag, 10000));
-        bool magChanged = (lastMag < 0) || std::abs(mag - lastMag) >= 20;
-        bool perChanged = (lastPer == 0) || (period > lastPer ? period - lastPer : lastPer - period) * 100 > lastPer * 2;
-        if (!magChanged && !perChanged) return DI_OK;      // spare the USB bus
-
-        DIPERIODIC per{};
-        per.dwMagnitude = (DWORD)mag;
-        per.lOffset = 0;
-        per.dwPhase = 0;
-        per.dwPeriod = period;
+    HRESULT Update(int slot, int mag, DWORD period) {
         DIEFFECT e{};
         e.dwSize = sizeof(DIEFFECT);
-        e.cbTypeSpecificParams = sizeof(per);
-        e.lpvTypeSpecificParams = &per;
-        HRESULT hr = fx->SetParameters(&e, DIEP_TYPESPECIFICPARAMS | DIEP_NORESTART);
-        if (SUCCEEDED(hr)) { lastMag = mag; lastPer = period; }
+        mag = std::max(0, std::min(mag, 10000));
+        bool magChanged = std::abs(mag - m_lastMag[slot]) >= 20;
+        bool perChanged = m_lastPer[slot] == 0 ||
+            (period > m_lastPer[slot] ? period - m_lastPer[slot] : m_lastPer[slot] - period) * 100 > m_lastPer[slot] * 2;
+        if (!magChanged && !perChanged) return DI_OK;
+        DIPERIODIC p{};
+        p.dwMagnitude = (DWORD)mag; p.lOffset = 0; p.dwPhase = 0; p.dwPeriod = period;
+        e.cbTypeSpecificParams = sizeof(p); e.lpvTypeSpecificParams = &p;
+        HRESULT hr = m_fx[slot]->SetParameters(&e, DIEP_TYPESPECIFICPARAMS | DIEP_NORESTART);
+        if (SUCCEEDED(hr)) { m_lastMag[slot] = mag; m_lastPer[slot] = period; }
         return hr;
     }
 };
 
-// ---------------------------------------------------------------- signals
-struct Signals {
-    float rpm = 0, speed = 0 /* m/s */, throttle = 0, susp = 0, bump = 0;
-};
-
-// Per-packet analysis state: road texture = RMS of the high-passed damper piston velocity of each wheel
-// (like the reference RbrSurfaceAudio analysis); bumps = high-passed heave acceleration with a decaying envelope.
-struct RoadDsp {
-    float lastPiston[4] = {0, 0, 0, 0}, hp[4] = {0, 0, 0, 0}, var[4] = {0, 0, 0, 0};
-    bool havePiston = false;
-    float lastAcc = 0, accHp = 0, bumpEnv = 0;
-    bool haveAcc = false;
-};
-
+// ------------------------------------------------------------------ telemetry
 inline bool readF(const uint8_t* b, int len, int off, float& out) {
     if (off < 0 || off + 4 > len) return false;
     float v; std::memcpy(&v, b + off, 4);
@@ -487,6 +487,181 @@ inline bool readF(const uint8_t* b, int len, int off, float& out) {
     out = v;
     return true;
 }
+
+struct Signals {
+    float rpm = 0, speed = 0 /* m/s */, throttle = 0, brake = 0;
+    float rough = 0;      // raw front-weighted tyre roughness
+    float level = 0;      // roughness mapped through low/high/gamma
+    float piston = 0;     // damper piston velocity level
+    float texture = 0;    // combined road texture 0..1
+    float bump = 0;       // heave acceleration spike envelope
+    float dive = 0;       // front load transfer under braking 0..1
+    float lock = 0;       // front wheel lock-up 0..1
+    float frontRev = 0;   // front wheel revolutions per second
+};
+
+struct Hp  { float y = 0, x = 0; bool init = false;
+             float step(float in, float a) { if (!init) { x = in; init = true; y = 0; return 0; } y = a * (y + in - x); x = in; return y; } };
+struct Ema { float v = 0; bool init = false;
+             float step(float in, float a) { if (!init) { v = in; init = true; } else v += (in - v) * a; return v; } };
+
+// Per-packet analysis state. Wheel order in NGP: LF, RF, LB, RB.
+struct Dsp {
+    Hp  sfHp[4], pistonHp[4], accHp;
+    Ema sfVar[4], pistonVar[4], loadShort[4], rev[4];
+    Ema loadRef, rollRatio, baseFront;
+    uint32_t lastSeg[4] = {0, 0, 0, 0};
+    bool haveSeg[4] = {false, false, false, false};
+    float bumpEnv = 0, diveSm = 0, lockSm = 0;
+};
+
+void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, float dt) {
+    dt = clampf(dt, 0.002f, 0.05f);
+    float v;
+    if (readF(b, n, c.offRpm, v))   s.rpm = std::max(0.0f, v * c.rpmScale);
+    if (readF(b, n, c.offSpeed, v)) s.speed = std::fabs(v) * (c.speedIsKph ? (1.0f / 3.6f) : 0.44704f);
+    s.throttle = readF(b, n, c.offThrottle, v) ? clamp01(v) : 0.6f;
+    s.brake    = readF(b, n, c.offBrake, v)    ? clamp01(v) : 0.0f;
+
+    const float aHp = hpCoef(dt, 0.032f);          // ~5 Hz: removes weight transfer, keeps texture and hits
+    const float aVar = alphaFor(dt, 0.10f);        // RMS window
+    const float aLoad = alphaFor(dt, 0.3f);
+
+    float rough[4] = {0, 0, 0, 0}, absSf[4] = {0, 0, 0, 0}, pRms[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 4 && c.offSuspBase >= 0; ++i) {
+        const int base = c.offSuspBase + i * c.suspStride;
+        float sf = 0, pv = 0;
+        if (readF(b, n, base + c.offStrut, sf)) {
+            absSf[i] = std::fabs(sf);
+            float ls = d.loadShort[i].step(absSf[i], aLoad);
+            float hpSf = d.sfHp[i].step(sf, aHp);
+            float var = d.sfVar[i].step(hpSf * hpSf, aVar);
+            float denom = std::max(ls, 0.3f * d.loadRef.v);
+            rough[i] = denom > 1e-6f ? std::sqrt(std::max(var, 0.0f)) / denom : 0.0f;
+        }
+        if (readF(b, n, base + c.offPiston, pv)) {
+            float hp = d.pistonHp[i].step(pv, hpCoef(dt, 0.04f));
+            pRms[i] = std::sqrt(std::max(d.pistonVar[i].step(hp * hp, aVar), 0.0f));
+        }
+        int so = base + c.offSegment;
+        if (so >= 0 && so + 4 <= n) {
+            uint32_t seg; std::memcpy(&seg, b + so, 4);
+            uint32_t sg = seg % 8u;
+            if (d.haveSeg[i]) {
+                int delta = (int)((sg + 8u - d.lastSeg[i]) % 8u);
+                d.rev[i].step(delta / 8.0f / dt, alphaFor(dt, 0.15f));
+            }
+            d.lastSeg[i] = sg; d.haveSeg[i] = true;
+        }
+    }
+    const float meanLoad = 0.25f * (absSf[0] + absSf[1] + absSf[2] + absSf[3]);
+    if (s.speed > 3.0f && meanLoad > 0) d.loadRef.step(meanLoad, alphaFor(dt, 8.0f));
+
+    // ---- road texture: FRONT tyres dominate (they are what the driver feels through the rack)
+    const float rF = std::max(rough[0], rough[1]), rR = std::max(rough[2], rough[3]);
+    s.rough = 0.75f * rF + 0.25f * rR;
+    s.level = std::pow(clamp01((s.rough - c.roughLow) / (c.roughHigh - c.roughLow)), c.roughGamma);
+    s.piston = std::pow(clamp01(std::max(pRms[0], pRms[1]) * c.pistonScale), 1.2f);
+    s.texture = clamp01(std::max(s.level, 0.8f * s.piston));
+
+    // ---- bumps / landings from heave acceleration
+    if (readF(b, n, c.offAccHeave, v)) {
+        float hp = d.accHp.step(v, hpCoef(dt, 0.05f));
+        d.bumpEnv = std::max(std::fabs(hp) * c.bumpScale, d.bumpEnv * std::exp(-dt / 0.12f));
+    }
+    s.bump = clamp01(d.bumpEnv);
+
+    // ---- braking: front load transfer ("dive") and front wheel lock-up
+    const float tot = absSf[0] + absSf[1] + absSf[2] + absSf[3];
+    if (tot > 1e-3f) {
+        float share = (absSf[0] + absSf[1]) / tot;
+        if (s.brake < 0.05f && s.speed > 3.0f) d.baseFront.step(share, alphaFor(dt, 2.0f));
+        float target = (s.brake > 0.1f && d.baseFront.init) ? clamp01((share - d.baseFront.v) / 0.10f) : 0.0f;
+        d.diveSm += (target - d.diveSm) * alphaFor(dt, 0.1f);
+    }
+    s.dive = d.diveSm;
+
+    const float rr = 0.5f * (d.rev[0].v + d.rev[1].v);
+    s.frontRev = rr;
+    if (s.throttle < 0.05f && s.brake < 0.02f && s.speed > 8.0f && rr > 0.5f)
+        d.rollRatio.step(rr / s.speed, alphaFor(dt, 1.0f));      // learn tyre rev/s per m/s while coasting
+    const float ratio = d.rollRatio.init ? d.rollRatio.v : 1.0f / c.tyreCircumference;
+    float lockT = 0;
+    if (s.speed > 4.0f && ratio > 1e-3f && s.brake > 0.2f) {
+        float slip = rr / (ratio * s.speed) - 1.0f;
+        lockT = clamp01((-slip - c.lockThreshold) / 0.5f);
+    }
+    d.lockSm += (lockT - d.lockSm) * alphaFor(dt, lockT > d.lockSm ? 0.05f : 0.15f);
+    s.lock = d.lockSm;
+}
+
+// -------------------------------------------------------------- synthesis
+// Turns the analysed signals into effect magnitudes / frequencies. Runs on the worker thread, ~125 Hz.
+struct Synth {
+    float sm[S_COUNT] = {0, 0, 0, 0};
+    float thrSm = 0, lope = 0, rpmPeak = 0, roadJit = 1.0f, ampJit = 1.0f;
+    double nextJit = 0;
+
+    void Run(const Config& c, const Signals& s, double t, float dt, int mag[S_COUNT], float hz[S_COUNT]) {
+        const float mg = c.masterGain;
+        thrSm += (s.throttle - thrSm) * alphaFor(dt, 0.12f);
+
+        // ---------------- ENGINE: gain AND frequency both follow the engine
+        rpmPeak = std::max(rpmPeak, s.rpm);
+        const float rmax = c.rpmMax > 0 ? c.rpmMax : std::max(rpmPeak, c.rpmMaxInit);
+        const float x = clamp01(s.rpm / rmax);
+        const float fire = s.rpm / 60.0f * c.cylinders * 0.5f;
+        const float fireMax = rmax / 60.0f * c.cylinders * 0.5f;
+        const float k = fireMax > c.engineMaxHz ? c.engineMaxHz / fireMax : 1.0f;     // linear compression: no pitch jumps
+        hz[S_ENG1] = clampf(fire * k, c.engineMinHz, c.engineMaxHz);
+
+        const float idle = 1.0f - smooth01(0.08f, 0.45f, x);                          // lumpy idle
+        const float res = gauss(x, 0.55f, 0.08f) + 0.8f * gauss(x, 0.80f, 0.07f);    // engine-order resonances
+        const float buzz = smooth01(0.60f, 1.0f, x);                                  // high-rev buzz
+        const float A1 = clamp01(0.22f + 0.45f * idle + 0.35f * res + 0.30f * buzz);
+        const float loadF = 0.45f + 0.55f * thrSm;                                    // engine under load shakes more
+        const float comp = clampf(1.4f - 0.009f * (hz[S_ENG1] - c.engineMinHz), 0.55f, 1.4f);   // wheel is weaker at high Hz
+        float t1 = s.rpm > 200 ? c.engineMaxMag * c.engineGain * mg * clamp01(A1 * loadF * comp) : 0.0f;
+        if (s.rpm > 200 && x > 0.985f && thrSm > 0.8f) t1 *= (std::fmod(t, 0.08) < 0.04 ? 1.0f : 0.25f);   // rev limiter
+
+        lope += (rnd() - lope) * 0.05f;                                               // uneven firing at low rpm
+        hz[S_ENG2] = clampf(fire * 0.5f, 7.0f, 42.0f);                                // half order: lump / beating
+        const float A2 = (0.15f + 0.85f * idle) * (0.5f + 0.5f * thrSm) * (1.0f + 0.25f * lope * (0.2f + idle));
+        float t2 = s.rpm > 200 ? c.engineMaxMag * 0.8f * c.engineGain * mg * clamp01(A2) : 0.0f;
+
+        // ---------------- ROAD: sharp sawtooth, violent on rough ground
+        const float spN = clamp01(s.speed / c.maxSpeed);
+        const float gSpd = smooth01(1.0f, 10.0f, s.speed);
+        const float tex = clamp01(s.texture + 0.9f * s.bump);
+        if (t >= nextJit) {
+            roadJit = 1.0f + (tex > 0.4f ? 0.35f : 0.10f) * rnd();
+            ampJit = 0.7f + 0.3f * (rnd() * 0.5f + 0.5f);
+            nextJit = t + 0.025;
+        }
+        hz[S_ROAD] = (c.roadMinHz + (c.roadMaxHz - c.roadMinHz) * clamp01(0.35f * spN + 0.65f * tex)) * roadJit;
+        float t3 = c.roadMaxMag * c.roadGain * mg * tex * gSpd * ampJit;
+
+        // ---------------- BRAKE: front judder, harsh on lock-up
+        const float gB = smooth01(2.0f, 8.0f, s.speed);
+        const float Ab = clamp01(std::pow(s.brake, 1.2f) * (0.3f + 0.7f * s.dive) * 0.6f + s.lock);
+        hz[S_BRAKE] = s.lock > 0.1f ? clampf(38.0f + 25.0f * rnd(), 25.0f, 70.0f) : clampf(s.frontRev * 2.0f, 12.0f, 60.0f);
+        float t4 = c.brakeMaxMag * c.brakeGain * mg * Ab * gB;
+
+        // attack / release: road is deliberately fast (sharpness), engine is rounder
+        auto follow = [&](int i, float target, float up, float down) {
+            sm[i] += (target - sm[i]) * (target > sm[i] ? up : down);
+        };
+        follow(S_ENG1, t1, 0.35f, 0.15f);
+        follow(S_ENG2, t2, 0.25f, 0.12f);
+        follow(S_ROAD, t3, 0.80f, 0.35f);
+        follow(S_BRAKE, t4, 0.50f, 0.20f);
+
+        float sum = 0;
+        for (int i = 0; i < S_COUNT; ++i) sum += std::fabs(sm[i]);
+        const float scale = sum > c.totalMaxMag ? c.totalMaxMag / sum : 1.0f;
+        for (int i = 0; i < S_COUNT; ++i) mag[i] = (int)(sm[i] * scale);
+    }
+};
 
 // ----------------------------------------------------------------- plugin
 struct DeviceInfo { GUID guid; char name[MAX_PATH]; };
@@ -501,19 +676,21 @@ private:
     Config m_cfg;
     std::string m_iniPath;
 
-    // thread + shared state
+    // worker thread + shared state
     std::thread m_thread;
     std::atomic<bool> m_run{false};
     std::atomic<bool> m_test{false};
+    std::atomic<int>  m_testPhase{0};
     std::atomic<long long> m_packets{0};
-    std::atomic<float> m_engMag{0}, m_roadMag{0}, m_engHz{0}, m_roadHz{0};
-    std::atomic<float> m_rRpm{0}, m_rSpeed{0}, m_rThr{0}, m_rSusp{0}, m_rBump{0};
+    std::atomic<float> m_mag[S_COUNT], m_hz[S_COUNT];
+    std::atomic<float> m_dRpm{0}, m_dSpeed{0}, m_dThr{0}, m_dBrk{0}, m_dTex{0}, m_dRough{0}, m_dBump{0},
+                       m_dDive{0}, m_dLock{0};
     std::atomic<bool> m_ffActive{false};
     std::mutex m_mtx;
     std::string m_status;
     uint8_t m_pkt[2048];
     int m_pktLen = 0;
-    int m_tableBase = 0;           // byte offset of the packet table shown on screen (UI thread only)
+    int m_tableBase = 0;           // UI thread only
 
     void SetStatus(const char* fmt, ...) {
         char b[256];
@@ -585,38 +762,6 @@ private:
         m_connectedIdx = -1;
     }
 
-    // --------------------------------------------------------- DSP helpers
-    void ParsePacket(const uint8_t* b, int n, Signals& s, RoadDsp& d, float dt) {
-        float v;
-        if (readF(b, n, m_cfg.offRpm, v))      s.rpm = std::max(0.0f, v * m_cfg.rpmScale);
-        if (readF(b, n, m_cfg.offSpeed, v))    s.speed = std::fabs(v) * (m_cfg.speedIsKph ? (1.0f / 3.6f) : 0.44704f);
-        if (readF(b, n, m_cfg.offThrottle, v)) s.throttle = clamp01(v);
-        else                                    s.throttle = 0.6f;
-
-        dt = clampf(dt, 0.002f, 0.05f);
-        const float hpA = 0.04f / (0.04f + dt);                       // ~4 Hz high-pass: removes body motion, keeps texture
-        const float emaA = 1.0f - std::exp(-dt / 0.12f);              // RMS window ~120 ms
-
-        float sum = 0; int cnt = 0;
-        for (int i = 0; i < m_cfg.suspCount && m_cfg.offSuspBase >= 0; ++i) {
-            if (readF(b, n, m_cfg.offSuspBase + i * m_cfg.suspStride + m_cfg.offPiston, v)) {
-                if (d.havePiston) d.hp[i] = hpA * (d.hp[i] + v - d.lastPiston[i]);
-                d.lastPiston[i] = v;
-                d.var[i] += (d.hp[i] * d.hp[i] - d.var[i]) * emaA;
-                sum += std::sqrt(std::max(0.0f, d.var[i])); ++cnt;
-            }
-        }
-        d.havePiston = d.havePiston || cnt > 0;
-        s.susp = cnt ? clamp01(sum / cnt * m_cfg.suspScale) : 0.0f;
-
-        if (readF(b, n, m_cfg.offAccHeave, v)) {
-            if (d.haveAcc) d.accHp = (0.05f / (0.05f + dt)) * (d.accHp + v - d.lastAcc);
-            d.lastAcc = v; d.haveAcc = true;
-            d.bumpEnv = std::max(std::fabs(d.accHp) * m_cfg.bumpScale, d.bumpEnv * std::exp(-dt / 0.12f));
-        }
-        s.bump = clamp01(d.bumpEnv);
-    }
-
     void DumpPacket(const uint8_t* b, int n) {
         FILE* f = fopen((g_dir + "TrueforceRumble_packet.txt").c_str(), "w");
         if (!f) return;
@@ -627,6 +772,25 @@ private:
             fprintf(f, "0x%03X   %-16.6g 0x%08X  %u\n", i, (double)v, u, u);
         }
         fclose(f);
+    }
+
+    // Synthetic signals for the TEST mode: 16 s loop through every layer, no telemetry needed.
+    void TestSignals(double t, Signals& s) {
+        s = Signals();
+        s.speed = 25.0f; s.throttle = 1.0f;
+        double ph = std::fmod(t, 16.0);
+        if (ph < 4.0) {                                   // 0 engine sweep
+            m_testPhase = 0; s.rpm = (float)(1000.0 + 6500.0 * (ph / 4.0));
+        } else if (ph < 7.0) {                            // 1 gravel
+            m_testPhase = 1; s.rpm = 3500; s.texture = 0.35f;
+        } else if (ph < 10.0) {                           // 2 rough / dirt
+            m_testPhase = 2; s.rpm = 4500; s.texture = 0.9f;
+        } else if (ph < 13.0) {                           // 3 hard braking, lock-up after 1.5 s
+            m_testPhase = 3; s.rpm = 3000; s.throttle = 0; s.brake = 1.0f; s.dive = 1.0f; s.frontRev = 15.0f;
+            if (ph > 11.5) s.lock = 0.9f;
+        } else {                                          // 4 idle
+            m_testPhase = 4; s.rpm = 900; s.throttle = 0; s.speed = 0;
+        }
     }
 
     // ------------------------------------------------------------ main loop
@@ -642,7 +806,7 @@ private:
                 a.sin_port = htons((u_short)m_cfg.udpPort);
                 a.sin_addr.s_addr = htonl(INADDR_ANY);
                 if (bind(sock, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
-                    Logf("UDP bind to port %d failed (WSA %d)", m_cfg.udpPort, WSAGetLastError());
+                    Logf("UDP bind to port %d failed (WSA %d). Another app on that port?", m_cfg.udpPort, WSAGetLastError());
                     closesocket(sock); sock = INVALID_SOCKET;
                 } else {
                     DWORD to = 20;
@@ -650,24 +814,22 @@ private:
                 }
             }
         }
-        bool haveSock = sock != INVALID_SOCKET;
-        if (!haveSock) Logf("No UDP socket: telemetry unavailable, only TEST mode will work");
+        const bool haveSock = sock != INVALID_SOCKET;
+        if (!haveSock) Logf("No UDP socket: only TEST mode will work");
 
         std::vector<uint8_t> buf(2048);
         FFLayer ff;
-        Signals sig, live;
-        RoadDsp dsp;
+        Dsp dsp;
+        Synth synth;
+        Signals live, sig;
         bool dumped = false;
-        auto lastPkt = Clock::now();
-        float engSm = 0, roadSm = 0, engHz = m_cfg.engineMinHz, roadHz = m_cfg.roadMinHz;
 
-        auto t0 = Clock::now();
+        const auto t0 = Clock::now();
         auto lastRx = t0 - std::chrono::seconds(10);
-        auto lastApply = t0;
-        auto nextTry = t0;
+        auto lastPkt = t0, lastApply = t0, nextTry = t0;
 
         while (m_run) {
-            auto now = Clock::now();
+            const auto now = Clock::now();
             bool got = false;
 
             if (haveSock) {
@@ -675,10 +837,9 @@ private:
                 if (n >= m_cfg.minPacket) {
                     m_packets++;
                     got = true;
-                    lastRx = now;
                     float pdt = std::chrono::duration<float>(now - lastPkt).count();
-                    lastPkt = now;
-                    ParsePacket(buf.data(), n, live, dsp, pdt);
+                    lastPkt = now; lastRx = now;
+                    ParsePacket(m_cfg, buf.data(), n, live, dsp, pdt);
                     {
                         std::lock_guard<std::mutex> lk(m_mtx);
                         m_pktLen = n;
@@ -690,59 +851,31 @@ private:
                 Sleep(10);
             }
 
-            double t = std::chrono::duration<double>(now - t0).count();
+            const double t = std::chrono::duration<double>(now - t0).count();
+            const float sinceApply = std::chrono::duration<float>(now - lastApply).count();
+            if (sinceApply < 0.008f) continue;
+            lastApply = now;
+            const float dt = clampf(sinceApply, 0.002f, 0.05f);
+
             if (m_test) {
-                sig.rpm = 1500.0f + 5500.0f * (0.5f + 0.5f * (float)std::sin(t * 0.6));
-                sig.speed = 25.0f;
-                sig.throttle = 1.0f;
-                sig.susp = 0.4f + 0.3f * (float)std::sin(t * 3.0);
-                sig.bump = std::fmod((float)t, 1.5f) < 0.1f ? 0.8f : 0.0f;
+                TestSignals(t, sig);
             } else if (std::chrono::duration<double>(now - lastRx).count() < 0.4) {
                 sig = live;
             } else {
-                sig = Signals();       // stage not running / no telemetry -> fade to zero
+                sig = Signals();                   // no telemetry (stage over / paused) -> fade to zero
             }
 
-            if (std::chrono::duration<double>(now - lastApply).count() < 0.008) continue;
-            lastApply = now;
+            m_dRpm = sig.rpm; m_dSpeed = sig.speed; m_dThr = sig.throttle; m_dBrk = sig.brake;
+            m_dTex = sig.texture; m_dRough = sig.rough; m_dBump = sig.bump;
+            m_dDive = sig.dive; m_dLock = sig.lock;
 
-            m_rRpm = sig.rpm; m_rSpeed = sig.speed; m_rThr = sig.throttle; m_rSusp = sig.susp; m_rBump = sig.bump;
-
-            // ------------------------------------------------ engine layer
-            float engT = 0;
-            if (sig.rpm > 200.0f) {
-                float hz = sig.rpm / 60.0f * (m_cfg.cylinders * 0.5f);
-                for (int i = 0; i < 16 && hz > m_cfg.engineMaxHz; ++i) hz *= 0.5f;   // fold into renderable range
-                for (int i = 0; i < 16 && hz < m_cfg.engineMinHz; ++i) hz *= 2.0f;
-                engHz = hz;
-                float load = 0.35f + 0.65f * clamp01(sig.throttle);
-                float rf = 0.5f + 0.5f * clamp01(sig.rpm / 8000.0f);
-                engT = m_cfg.engineMaxMag * m_cfg.engineGain * m_cfg.masterGain * load * rf;
+            int mag[S_COUNT]; float hz[S_COUNT];
+            synth.Run(m_cfg, sig, t, dt, mag, hz);
+            DWORD per[S_COUNT];
+            for (int i = 0; i < S_COUNT; ++i) {
+                m_mag[i] = (float)mag[i]; m_hz[i] = hz[i];
+                per[i] = (DWORD)(1000000.0f / std::max(1.0f, hz[i]));
             }
-
-            // ------------------------------------------------- road layer
-            float roadT = 0;
-            if (sig.speed > 1.0f) {
-                float spN = clamp01(sig.speed / m_cfg.maxSpeed);
-                float act = clamp01(sig.susp) * clamp01(sig.speed / 5.0f);
-                float norm = clamp01(0.15f * spN + 0.85f * act + 0.9f * clamp01(sig.bump));
-                roadHz = m_cfg.roadMinHz + (m_cfg.roadMaxHz - m_cfg.roadMinHz) * spN;
-                roadHz *= 1.0f + 0.08f * ((rand() % 2001 - 1000) / 1000.0f);        // grit
-                roadT = m_cfg.roadMaxMag * m_cfg.roadGain * m_cfg.masterGain * norm;
-            }
-
-            // attack / release smoothing so effects never click
-            engSm  += (engT  - engSm)  * (engT  > engSm  ? 0.5f : 0.15f);
-            roadSm += (roadT - roadSm) * (roadT > roadSm ? 0.5f : 0.15f);
-
-            // never exceed the device range once both layers are summed with RBR's own force
-            float total = engSm + roadSm;
-            float lim = (float)std::max(m_cfg.engineMaxMag, m_cfg.roadMaxMag);
-            float scale = total > lim * 1.5f ? (lim * 1.5f) / total : 1.0f;
-            int engOut = (int)(engSm * scale), roadOut = (int)(roadSm * scale);
-
-            m_engMag = (float)engOut; m_roadMag = (float)roadOut;
-            m_engHz = engHz; m_roadHz = roadHz;
 
             // ------------------------------------------------ push to wheel
             if (!ff.Ready()) {
@@ -756,13 +889,11 @@ private:
                         if (SUCCEEDED(hr)) {
                             m_ffActive = true;
                             SetStatus("ACTIVE: layered on RBR's FFB. Select = TEST vibration");
-                            Logf("Effects created");
                         } else {
                             m_ffActive = false;
-                            Logf("CreateEffect failed: 0x%08X", (unsigned)hr);
+                            Logf("Create failed: 0x%08X", (unsigned)hr);
                             if (hr == DIERR_NOTEXCLUSIVEACQUIRED || hr == DIERR_OTHERAPPHASPRIO) {
-                                // That device object is not the one holding the wheel exclusively (RBR/NGP may
-                                // use several). Let go of it; another object polling the same wheel can be captured.
+                                // Not the object that holds the wheel exclusively (RBR/NGP may use several).
                                 GameDeviceTap::I().ReleaseCaptured();
                                 SetStatus("Skipped a non-exclusive device object (0x%08X), looking for RBR's", (unsigned)hr);
                             } else {
@@ -780,13 +911,11 @@ private:
                     continue;
                 }
                 if (GameDeviceTap::I().ConsumeReacquired()) ff.Restart();
-                DWORD engPer = (DWORD)(1000000.0f / std::max(1.0f, engHz));
-                DWORD roadPer = (DWORD)(1000000.0f / std::max(1.0f, roadHz));
-                if (!ff.Push(engOut, engPer, roadOut, roadPer)) {
+                if (!ff.Push(mag, per)) {
                     Logf("Effects lost (0x%08X), recreating", (unsigned)ff.LastHr());
+                    SetStatus("Effects lost (0x%08X), retrying", (unsigned)ff.LastHr());
                     ff.Destroy();
                     m_ffActive = false;
-                    SetStatus("Effects lost (0x%08X), retrying", (unsigned)ff.LastHr());
                 }
             }
         }
@@ -801,6 +930,7 @@ public:
         g_dir = pluginDirectory();
         m_iniPath = g_dir + "TrueforceRumble.ini";
         std::memset(m_pkt, 0, sizeof(m_pkt));
+        for (int i = 0; i < S_COUNT; ++i) { m_mag[i] = 0; m_hz[i] = 0; }
         bool exists = GetFileAttributesA(m_iniPath.c_str()) != INVALID_FILE_ATTRIBUTES;
         if (!exists) SyncConfig(m_cfg, m_iniPath, true);     // write a template with every key
         SyncConfig(m_cfg, m_iniPath, false);
@@ -808,15 +938,15 @@ public:
         SetStatus("Pick the wheel with Left/Right, press Select");
         EnumerateDevices();
 
-        if (m_cfg.autoConnect && !m_cfg.wheel.empty()) {
+        if (!m_cfg.wheel.empty()) {
             std::string want = lower(m_cfg.wheel);
             for (int i = 0; i < (int)m_devices.size(); ++i) {
-                if (lower(m_devices[i].name).find(want) != std::string::npos) { m_sel = i; Connect(); break; }
+                if (lower(m_devices[i].name).find(want) != std::string::npos) {
+                    m_sel = i;
+                    if (m_cfg.autoConnect) Connect();
+                    break;
+                }
             }
-        } else if (!m_cfg.wheel.empty()) {
-            std::string want = lower(m_cfg.wheel);
-            for (int i = 0; i < (int)m_devices.size(); ++i)
-                if (lower(m_devices[i].name).find(want) != std::string::npos) { m_sel = i; break; }
         }
     }
 
@@ -830,79 +960,81 @@ public:
 
     void DrawFrontEndPage() override {
         if (!game_) return;
-        float y = 60.0f;
+        float y = 50.0f;
         game_->SetFont(IRBRGame::FONT_BIG);
         game_->SetMenuColor(IRBRGame::MENU_HEADING);
         game_->WriteText(70.0f, y, "Trueforce Rumble Settings");
-        y += 30.0f;
+        y += 28.0f;
 
         game_->SetFont(IRBRGame::FONT_SMALL);
         game_->SetMenuColor(IRBRGame::MENU_TEXT);
-        char buf[256];
+        char buf[300];
+        auto line = [&](const char* txt) { game_->WriteText(70.0f, y, txt); y += 19.0f; };
 
         snprintf(buf, sizeof(buf), "FFB devices: %d   (Left/Right = choose, Select = connect / toggle TEST)", (int)m_devices.size());
-        game_->WriteText(70.0f, y, buf); y += 20.0f;
-
+        line(buf);
         if (!m_devices.empty()) {
             snprintf(buf, sizeof(buf), "> [%d/%d] %s%s", m_sel + 1, (int)m_devices.size(), m_devices[m_sel].name,
                      m_sel == m_connectedIdx ? "  (connected)" : "");
             game_->SetMenuColor(IRBRGame::MENU_SELECTION);
-            game_->WriteText(70.0f, y, buf);
+            line(buf);
             game_->SetMenuColor(IRBRGame::MENU_TEXT);
         } else {
-            game_->WriteText(70.0f, y, "> [no force feedback devices detected]");
+            line("> [no force feedback devices detected]");
         }
-        y += 22.0f;
 
         std::string st;
         { std::lock_guard<std::mutex> lk(m_mtx); st = m_status; }
         snprintf(buf, sizeof(buf), "Status: %s", st.c_str());
-        game_->WriteText(70.0f, y, buf); y += 20.0f;
+        line(buf);
 
+        static const char* const kPhase[] = {"engine sweep", "gravel", "rough / dirt", "hard braking + lock-up", "idle"};
         snprintf(buf, sizeof(buf), "UDP packets: %lld (port %d)   TEST: %s", (long long)m_packets.load(), m_cfg.udpPort,
-                 m_test ? "ON" : "off");
-        game_->WriteText(70.0f, y, buf); y += 20.0f;
+                 m_test ? kPhase[std::max(0, std::min(m_testPhase.load(), 4))] : "off");
+        line(buf);
 
-        snprintf(buf, sizeof(buf), "rpm %.0f  speed %.1f m/s  throttle %.2f  road texture %.2f  bump %.2f",
-                 m_rRpm.load(), m_rSpeed.load(), m_rThr.load(), m_rSusp.load(), m_rBump.load());
-        game_->WriteText(70.0f, y, buf); y += 20.0f;
+        snprintf(buf, sizeof(buf), "rpm %.0f  speed %.1f m/s  throttle %.2f  brake %.2f",
+                 m_dRpm.load(), m_dSpeed.load(), m_dThr.load(), m_dBrk.load());
+        line(buf);
+        snprintf(buf, sizeof(buf), "texture %.2f (front roughness %.2f)  bump %.2f  dive %.2f  lock %.2f",
+                 m_dTex.load(), m_dRough.load(), m_dBump.load(), m_dDive.load(), m_dLock.load());
+        line(buf);
+        snprintf(buf, sizeof(buf), "engine %.0f@%.0fHz  lump %.0f@%.0fHz  road %.0f@%.0fHz  brake %.0f@%.0fHz",
+                 m_mag[S_ENG1].load(), m_hz[S_ENG1].load(), m_mag[S_ENG2].load(), m_hz[S_ENG2].load(),
+                 m_mag[S_ROAD].load(), m_hz[S_ROAD].load(), m_mag[S_BRAKE].load(), m_hz[S_BRAKE].load());
+        line(buf);
+        y += 6.0f;
 
-        snprintf(buf, sizeof(buf), "Engine %.0f Hz / mag %.0f     Road %.0f Hz / mag %.0f",
-                 m_engHz.load(), m_engMag.load(), m_roadHz.load(), m_roadMag.load());
-        game_->WriteText(70.0f, y, buf); y += 26.0f;
-
-        // calibration table: Up/Down scroll through the raw packet floats
         uint8_t pkt[2048]; int len;
         { std::lock_guard<std::mutex> lk(m_mtx); len = m_pktLen; std::memcpy(pkt, m_pkt, sizeof(pkt)); }
-        snprintf(buf, sizeof(buf), "Raw packet floats (Up/Down scroll); expected: rpm @0x88, speed @0x3C, throttle @0x1C:");
-        game_->WriteText(70.0f, y, buf); y += 18.0f;
-        for (int row = 0; row < 6; ++row) {
+        line("Raw packet floats (Up/Down scroll):");
+        for (int row = 0; row < 4; ++row) {
             int base = m_tableBase + row * 16;
-            char line[200]; int p = snprintf(line, sizeof(line), "0x%03X ", base);
+            char ln[200]; int p = snprintf(ln, sizeof(ln), "0x%03X ", base);
             for (int c = 0; c < 4; ++c) {
                 int off = base + c * 4;
                 if (off + 4 <= len) {
                     float v; std::memcpy(&v, pkt + off, 4);
-                    p += snprintf(line + p, sizeof(line) - p, " %10.4g", std::isfinite(v) ? (double)v : 0.0);
+                    p += snprintf(ln + p, sizeof(ln) - p, " %10.4g", std::isfinite(v) ? (double)v : 0.0);
                 } else {
-                    p += snprintf(line + p, sizeof(line) - p, " %10s", "-");
+                    p += snprintf(ln + p, sizeof(ln) - p, " %10s", "-");
                 }
             }
-            game_->WriteText(70.0f, y, line); y += 17.0f;
+            game_->WriteText(70.0f, y, ln); y += 17.0f;
         }
     }
 
     void DrawResultsUI() override {}
 
     void HandleFrontEndEvents(char, bool bUp, bool bDown, bool bLeft, bool bRight, bool bSelect) override {
-        if (bUp)   m_tableBase = std::max(0, m_tableBase - 96);
-        if (bDown) m_tableBase = std::min(2048 - 96, m_tableBase + 96);
+        if (bUp)   m_tableBase = std::max(0, m_tableBase - 64);
+        if (bDown) m_tableBase = std::min(2048 - 64, m_tableBase + 64);
         if (m_devices.empty()) return;
 
         if (bLeft)  { m_sel = (m_sel - 1 + (int)m_devices.size()) % (int)m_devices.size(); }
         if (bRight) { m_sel = (m_sel + 1) % (int)m_devices.size(); }
         if (bSelect) {
-            if (m_connectedIdx == m_sel && m_run) m_test = !m_test;   // already connected: toggle synthetic test vibration
+            if (m_connectedIdx == m_sel && m_run) m_test = !m_test;   // already connected: toggle synthetic TEST vibration
             else Connect();
         }
     }
