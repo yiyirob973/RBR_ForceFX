@@ -1,4 +1,4 @@
-// RBR_TrueforcePlugin.cpp  (v3)
+// RBR_TrueforcePlugin.cpp  (v4: safety limits + live gain hotkeys)
 //
 // Layers extra "Trueforce-like" vibration on top of Richard Burns Rally's own force feedback,
 // driven by NGP's UDP telemetry (rbr.telemetry.data.TelemetryData.h, NGP 7.4.778, 664 bytes).
@@ -24,6 +24,11 @@
 // BUILD: 32-bit (RBR is x86), static CRT:
 //   cl /std:c++17 /EHsc /LD /MT /O2 RBR_TrueforcePlugin.cpp /Fe:RbrTrueforce.dll /link /DEF:RbrTrueforce.def
 // NGP: udpTelemetry=1, udpTelemetryEndpoints=127.0.0.1:6776,127.0.0.1:6777,127.0.0.1:6778
+// LIVE GAIN (while driving): Ctrl + Numpad+ / Numpad- change the overall vibration level in equal-loudness steps (x or / 0.85),
+//   Ctrl + Numpad* mutes / unmutes. Only active while RBR is the foreground window. The level can only go DOWN
+//   from the configured ceilings (0..100%), never above them. Keys are configurable in the .ini.
+// SAFETY: hard compile-time ceilings (kHardTotalMax etc.), frequency floor, slow thermal derate,
+//   loopback-only UDP, fade-to-zero on shutdown, exception guard on the worker thread.
 // FILES (next to the DLL): TrueforceRumble.ini (written on first run), .log, _loaded.txt, _packet.txt
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -59,6 +64,13 @@
 namespace {
 
 typedef std::chrono::steady_clock Clock;
+
+// Hard ceilings: the .ini can never push past these, whatever it says.
+constexpr int   kHardTotalMax = 5000;    // sum of all layer magnitudes (0..10000 DirectInput units)
+constexpr float kHardMinHz    = 12.0f;   // below this a vibration becomes a visible wheel swing
+constexpr float kHardMaxHz    = 120.0f;
+constexpr int   kMagDeadband  = 60;      // skip USB updates for changes smaller than this
+constexpr float kApplyPeriod  = 0.010f;  // seconds between effect updates (~100 Hz)
 
 inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 inline float clamp01(float v) { return clampf(v, 0.0f, 1.0f); }
@@ -97,10 +109,10 @@ struct Config {
     int   minPacket = 664;
     int   cylinders = 4;             // engine pulses per rev = cylinders / 2
 
-    // gains and per-layer ceilings (DirectInput units 0..10000)
-    float masterGain = 1.0f, engineGain = 1.0f, roadGain = 1.0f, brakeGain = 1.0f;
-    int   engineMaxMag = 3500, roadMaxMag = 5500, brakeMaxMag = 4500;
-    int   totalMaxMag = 8000;        // all layers together are scaled down to this
+    // per-layer ceilings (DirectInput units 0..10000), a fixed total ceiling, and one live level (userGain)
+    int   engineMaxMag = 3000, roadMaxMag = 3500, brakeMaxMag = 3000;
+    int   totalMaxMag = 4000;        // all layers together are scaled down to this (hard ceiling kHardTotalMax)
+    float sustainedLimit = 0.10f;    // thermal derate: long-term mean-square level (0.10 ~ 32% RMS-equivalent)
 
     // engine
     float engineMinHz = 14.0f, engineMaxHz = 100.0f;
@@ -124,6 +136,13 @@ struct Config {
     int   speedIsKph = 1;
     float rpmScale = 1.0f;
 
+    // live gain (hotkeys, polled while RBR is the foreground window). VK codes, 0 = disabled.
+    float userGain = 1.0f;           // persisted live level 0..1 (can only reduce)
+    float gainRatio = 0.85f;         // each hotkey press multiplies/divides the level by this (~ -1.4 dB per step)
+    int   keyGainUp = 0x6B, keyGainDown = 0x6D, keyMute = 0x6A;   // Numpad + / - / *
+    int   keyModifier = 0x11;                                     // Ctrl (0 = no modifier)
+    int   gainBeep = 1;
+
     int         autoConnect = 0;
     std::string wheel;
 };
@@ -141,8 +160,6 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
         else { GetPrivateProfileStringA(S, k, "", b, sizeof(b), path.c_str()); if (b[0]) v = atoi(b); }
     };
     I("UdpPort", c.udpPort);  I("MinPacketBytes", c.minPacket);  I("Cylinders", c.cylinders);
-    F("MasterGain", c.masterGain); F("EngineGain", c.engineGain); F("RoadGain", c.roadGain);
-    F("BrakeGain", c.brakeGain);
     I("EngineMaxMagnitude", c.engineMaxMag); I("RoadMaxMagnitude", c.roadMaxMag);
     I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
@@ -156,6 +173,10 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     I("OffsetSuspBase", c.offSuspBase); I("SuspStride", c.suspStride); I("OffsetStrutForce", c.offStrut);
     I("OffsetPistonVel", c.offPiston); I("OffsetTyreSegment", c.offSegment);
     I("SpeedIsKph", c.speedIsKph); F("RpmScale", c.rpmScale);
+    F("SustainedLimit", c.sustainedLimit);
+    F("UserGain", c.userGain); F("GainRatio", c.gainRatio);
+    I("KeyGainUp", c.keyGainUp); I("KeyGainDown", c.keyGainDown); I("KeyMute", c.keyMute);
+    I("KeyModifier", c.keyModifier); I("GainBeep", c.gainBeep);
     I("AutoConnect", c.autoConnect);
     char b[260];
     if (write) WritePrivateProfileStringA(S, "Wheel", c.wheel.c_str(), path.c_str());
@@ -166,7 +187,14 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
         c.engineMaxMag = std::max(0, std::min(c.engineMaxMag, 10000));
         c.roadMaxMag = std::max(0, std::min(c.roadMaxMag, 10000));
         c.brakeMaxMag = std::max(0, std::min(c.brakeMaxMag, 10000));
-        c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, 10000));
+        c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, kHardTotalMax));
+        c.userGain   = clampf(c.userGain,   0.0f, 1.0f);
+        c.gainRatio  = clampf(c.gainRatio, 0.5f, 0.95f);
+        c.sustainedLimit = clampf(c.sustainedLimit, 0.02f, 0.20f);
+        c.engineMinHz = clampf(c.engineMinHz, kHardMinHz, kHardMaxHz);
+        c.engineMaxHz = clampf(c.engineMaxHz, kHardMinHz, kHardMaxHz);
+        c.roadMinHz = clampf(c.roadMinHz, 20.0f, 150.0f);
+        c.roadMaxHz = clampf(c.roadMaxHz, c.roadMinHz + 5.0f, 150.0f);
         if (c.engineMaxHz < c.engineMinHz + 5.0f) c.engineMaxHz = c.engineMinHz + 5.0f;
         if (c.roughHigh < c.roughLow + 0.05f) c.roughHigh = c.roughLow + 0.05f;
         if (c.maxSpeed < 1.0f) c.maxSpeed = 1.0f;
@@ -311,17 +339,22 @@ struct Tap {
         if (!ok) vtbl = nullptr;
         return ok;
     }
-    static void Unpatch() {
-        if (!vtbl) return;
+    // Returns false if another tool hooked on top of ours (we must then stay loaded).
+    static bool Unpatch() {
+        if (!vtbl) return true;
         const int idx[5] = { VT_ACQUIRE, VT_GETDEVICESTATE, VT_GETDEVICEDATA, VT_POLL, VT_UNACQUIRE };
+        void* const mine[5] = { (void*)&HAcquire, (void*)&HGetState, (void*)&HGetData, (void*)&HPoll, (void*)&HUnacquire };
+        bool clean = true;
         for (int i = 0; i < 5; ++i) {
+            if (vtbl[idx[i]] != mine[i]) { clean = false; continue; }   // not ours any more: leave it alone
             DWORD old;
             if (orig[i] && VirtualProtect(&vtbl[idx[i]], sizeof(void*), PAGE_READWRITE, &old)) {
                 vtbl[idx[i]] = orig[i];
                 VirtualProtect(&vtbl[idx[i]], sizeof(void*), old, &old);
             }
         }
-        vtbl = nullptr;
+        if (clean) vtbl = nullptr;
+        return clean;
     }
 };
 template <int V> void** Tap<V>::vtbl = nullptr;
@@ -355,8 +388,14 @@ bool GameDeviceTap::Install(LPDIRECTINPUT8A diA, const GUID& g) {
 void GameDeviceTap::Remove() {
     m_armed = false;
     ReleaseCaptured();
-    Tap<0>::Unpatch();
-    Tap<1>::Unpatch();
+    bool clean = Tap<0>::Unpatch();
+    clean = Tap<1>::Unpatch() && clean;
+    if (!clean) {
+        // Somebody chained their hook after ours; unloading would leave a pointer into freed code. Pin the DLL.
+        HMODULE h = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCSTR)&pluginDirectory, &h);
+        Logf("Hook chain detected on exit: DLL pinned in memory");
+    }
     m_installed = false;
 }
 
@@ -375,6 +414,7 @@ const char* const kSlotName[S_COUNT] = {"engine", "lump", "road", "brake"};
 
 class FFLayer {
 public:
+    ~FFLayer() { Destroy(); }      // also runs if the worker thread unwinds from an exception
     bool Ready() const {
         for (int i = 0; i < S_COUNT; ++i) if (m_fx[i]) return true;
         return false;
@@ -466,7 +506,7 @@ private:
         DIEFFECT e{};
         e.dwSize = sizeof(DIEFFECT);
         mag = std::max(0, std::min(mag, 10000));
-        bool magChanged = std::abs(mag - m_lastMag[slot]) >= 20;
+        bool magChanged = std::abs(mag - m_lastMag[slot]) >= kMagDeadband || (mag == 0 && m_lastMag[slot] != 0);
         bool perChanged = m_lastPer[slot] == 0 ||
             (period > m_lastPer[slot] ? period - m_lastPer[slot] : m_lastPer[slot] - period) * 100 > m_lastPer[slot] * 2;
         if (!magChanged && !perChanged) return DI_OK;
@@ -599,11 +639,10 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 // Turns the analysed signals into effect magnitudes / frequencies. Runs on the worker thread, ~125 Hz.
 struct Synth {
     float sm[S_COUNT] = {0, 0, 0, 0};
-    float thrSm = 0, lope = 0, rpmPeak = 0, roadJit = 1.0f, ampJit = 1.0f;
+    float thrSm = 0, lope = 0, rpmPeak = 0, roadJit = 1.0f, ampJit = 1.0f, heat = 0;
     double nextJit = 0;
 
-    void Run(const Config& c, const Signals& s, double t, float dt, int mag[S_COUNT], float hz[S_COUNT]) {
-        const float mg = c.masterGain;
+    void Run(const Config& c, const Signals& s, double t, float dt, float userGain, int mag[S_COUNT], float hz[S_COUNT]) {
         thrSm += (s.throttle - thrSm) * alphaFor(dt, 0.12f);
 
         // ---------------- ENGINE: gain AND frequency both follow the engine
@@ -621,13 +660,13 @@ struct Synth {
         const float A1 = clamp01(0.22f + 0.45f * idle + 0.35f * res + 0.30f * buzz);
         const float loadF = 0.45f + 0.55f * thrSm;                                    // engine under load shakes more
         const float comp = clampf(1.4f - 0.009f * (hz[S_ENG1] - c.engineMinHz), 0.55f, 1.4f);   // wheel is weaker at high Hz
-        float t1 = s.rpm > 200 ? c.engineMaxMag * c.engineGain * mg * clamp01(A1 * loadF * comp) : 0.0f;
+        float t1 = s.rpm > 200 ? c.engineMaxMag * clamp01(A1 * loadF * comp) : 0.0f;
         if (s.rpm > 200 && x > 0.985f && thrSm > 0.8f) t1 *= (std::fmod(t, 0.08) < 0.04 ? 1.0f : 0.25f);   // rev limiter
 
         lope += (rnd() - lope) * 0.05f;                                               // uneven firing at low rpm
         hz[S_ENG2] = clampf(fire * 0.5f, 7.0f, 42.0f);                                // half order: lump / beating
         const float A2 = (0.15f + 0.85f * idle) * (0.5f + 0.5f * thrSm) * (1.0f + 0.25f * lope * (0.2f + idle));
-        float t2 = s.rpm > 200 ? c.engineMaxMag * 0.8f * c.engineGain * mg * clamp01(A2) : 0.0f;
+        float t2 = s.rpm > 200 ? c.engineMaxMag * 0.8f * clamp01(A2) : 0.0f;
 
         // ---------------- ROAD: sharp sawtooth, violent on rough ground
         const float spN = clamp01(s.speed / c.maxSpeed);
@@ -639,13 +678,13 @@ struct Synth {
             nextJit = t + 0.025;
         }
         hz[S_ROAD] = (c.roadMinHz + (c.roadMaxHz - c.roadMinHz) * clamp01(0.35f * spN + 0.65f * tex)) * roadJit;
-        float t3 = c.roadMaxMag * c.roadGain * mg * tex * gSpd * ampJit;
+        float t3 = c.roadMaxMag * tex * gSpd * ampJit;
 
         // ---------------- BRAKE: front judder, harsh on lock-up
         const float gB = smooth01(2.0f, 8.0f, s.speed);
         const float Ab = clamp01(std::pow(s.brake, 1.2f) * (0.3f + 0.7f * s.dive) * 0.6f + s.lock);
         hz[S_BRAKE] = s.lock > 0.1f ? clampf(38.0f + 25.0f * rnd(), 25.0f, 70.0f) : clampf(s.frontRev * 2.0f, 12.0f, 60.0f);
-        float t4 = c.brakeMaxMag * c.brakeGain * mg * Ab * gB;
+        float t4 = c.brakeMaxMag * Ab * gB;
 
         // attack / release: road is deliberately fast (sharpness), engine is rounder
         auto follow = [&](int i, float target, float up, float down) {
@@ -653,13 +692,26 @@ struct Synth {
         };
         follow(S_ENG1, t1, 0.35f, 0.15f);
         follow(S_ENG2, t2, 0.25f, 0.12f);
-        follow(S_ROAD, t3, 0.80f, 0.35f);
+        follow(S_ROAD, t3, 0.50f, 0.35f);
         follow(S_BRAKE, t4, 0.50f, 0.20f);
 
         float sum = 0;
         for (int i = 0; i < S_COUNT; ++i) sum += std::fabs(sm[i]);
         const float scale = sum > c.totalMaxMag ? c.totalMaxMag / sum : 1.0f;
-        for (int i = 0; i < S_COUNT; ++i) mag[i] = (int)(sm[i] * scale);
+
+        // Slow thermal derate on the level actually delivered to the wheel (live gain included): turning the
+        // live gain down therefore relieves the derate instead of stacking with it.
+        const float ug = clampf(userGain, 0.0f, 1.0f);
+        const float lvl = std::min(sum * scale, (float)kHardTotalMax) / 10000.0f * ug;
+        heat += (lvl * lvl - heat) * alphaFor(dt, 20.0f);
+        const float derate = heat > c.sustainedLimit ? std::sqrt(c.sustainedLimit / heat) : 1.0f;
+
+        const float g = ug * derate;
+        for (int i = 0; i < S_COUNT; ++i) {
+            float m = sm[i] * scale * g;
+            if (!std::isfinite(m)) { m = 0.0f; sm[i] = 0.0f; }          // never let a NaN latch into the filters
+            mag[i] = std::max(0, std::min((int)m, kHardTotalMax));
+        }
     }
 };
 
@@ -686,6 +738,9 @@ private:
     std::atomic<float> m_dRpm{0}, m_dSpeed{0}, m_dThr{0}, m_dBrk{0}, m_dTex{0}, m_dRough{0}, m_dBump{0},
                        m_dDive{0}, m_dLock{0};
     std::atomic<bool> m_ffActive{false};
+    std::atomic<float> m_userGain{1.0f};   // live level 0..1, changed by hotkeys
+    std::atomic<bool>  m_muted{false};
+    std::atomic<float> m_dHeat{1.0f};      // shown in the menu: 1 = no derate
     std::mutex m_mtx;
     std::string m_status;
     uint8_t m_pkt[2048];
@@ -793,8 +848,53 @@ private:
         }
     }
 
+    // ------------------------------------------------------------ live gain hotkeys
+    static bool RbrHasFocus() {
+        HWND w = GetForegroundWindow();
+        if (!w) return false;
+        DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
+        return pid == GetCurrentProcessId();
+    }
+    static bool KeyDown(int vk) { return vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0; }
+    static void BeepAsync(int hz) { std::thread([hz] { Beep((DWORD)hz, 50); }).detach(); }
+
+    // Called from the worker thread every cycle. Edge-triggered, with a small auto-repeat for held keys.
+    void PollHotkeys(Clock::time_point now) {
+        static bool up = false, dn = false, mu = false;
+        static Clock::time_point nextRepeat{};
+        if (!RbrHasFocus() || (m_cfg.keyModifier && !KeyDown(m_cfg.keyModifier))) { up = dn = mu = false; return; }
+        const bool bu = KeyDown(m_cfg.keyGainUp), bd = KeyDown(m_cfg.keyGainDown), bm = KeyDown(m_cfg.keyMute);
+        bool changed = false;
+        float g = m_userGain.load();
+        const float r = m_cfg.gainRatio;
+        if (bu && (!up || now >= nextRepeat)) { g = g < 0.02f ? 0.05f : g / r; changed = true; }
+        if (bd && (!dn || now >= nextRepeat)) { g = g * r; if (g < 0.03f) g = 0.0f; changed = true; }
+        if (changed) {
+            nextRepeat = now + (((bu && up) || (bd && dn)) ? std::chrono::milliseconds(120) : std::chrono::milliseconds(350));
+            if (g > 0.98f) g = 1.0f;
+            g = clampf(g, 0.0f, 1.0f);
+            m_userGain = g;
+            m_muted = false;
+            char b[32]; snprintf(b, sizeof(b), "%g", g);
+            WritePrivateProfileStringA("Trueforce", "UserGain", b, m_iniPath.c_str());
+            if (m_cfg.gainBeep) BeepAsync(300 + (int)(g * 900.0f));          // pitch tells you the level
+            Logf("Live gain -> %.0f%%", g * 100.0f);
+        }
+        if (bm && !mu) {
+            m_muted = !m_muted;
+            if (m_cfg.gainBeep) BeepAsync(m_muted ? 200 : 700);
+            Logf("Vibration %s", m_muted ? "MUTED" : "unmuted");
+        }
+        up = bu; dn = bd; mu = bm;
+    }
+
     // ------------------------------------------------------------ main loop
     void Loop() {
+        try { LoopImpl(); }
+        catch (...) { Logf("Worker thread exception caught; effects released"); m_ffActive = false; }
+    }
+
+    void LoopImpl() {
         WSADATA wsa;
         bool wsaOk = WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
         SOCKET sock = INVALID_SOCKET;
@@ -804,7 +904,7 @@ private:
                 sockaddr_in a{};
                 a.sin_family = AF_INET;
                 a.sin_port = htons((u_short)m_cfg.udpPort);
-                a.sin_addr.s_addr = htonl(INADDR_ANY);
+                a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // telemetry is local only
                 if (bind(sock, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
                     Logf("UDP bind to port %d failed (WSA %d). Another app on that port?", m_cfg.udpPort, WSAGetLastError());
                     closesocket(sock); sock = INVALID_SOCKET;
@@ -822,7 +922,8 @@ private:
         Dsp dsp;
         Synth synth;
         Signals live, sig;
-        bool dumped = false;
+        bool dumped = false, prevTest = false;
+        double testT0 = 0;
 
         const auto t0 = Clock::now();
         auto lastRx = t0 - std::chrono::seconds(10);
@@ -853,7 +954,7 @@ private:
 
             const double t = std::chrono::duration<double>(now - t0).count();
             const float sinceApply = std::chrono::duration<float>(now - lastApply).count();
-            if (sinceApply < 0.008f) continue;
+            if (sinceApply < kApplyPeriod) continue;
             lastApply = now;
             const float dt = clampf(sinceApply, 0.002f, 0.05f);
 
@@ -869,12 +970,22 @@ private:
             m_dTex = sig.texture; m_dRough = sig.rough; m_dBump = sig.bump;
             m_dDive = sig.dive; m_dLock = sig.lock;
 
+            PollHotkeys(now);
+            const bool testNow = m_test.load();
+            if (testNow && !prevTest) testT0 = t;
+            prevTest = testNow;
+            // TEST mode fades in over one second so it never starts with a jolt.
+            const float testRamp = testNow ? clamp01((float)(t - testT0)) : 1.0f;
+            const float live_gain = m_muted.load() ? 0.0f : m_userGain.load() * testRamp;
+
             int mag[S_COUNT]; float hz[S_COUNT];
-            synth.Run(m_cfg, sig, t, dt, mag, hz);
+            synth.Run(m_cfg, sig, t, dt, live_gain, mag, hz);
+            m_dHeat = synth.heat > m_cfg.sustainedLimit ? std::sqrt(m_cfg.sustainedLimit / synth.heat) : 1.0f;
             DWORD per[S_COUNT];
             for (int i = 0; i < S_COUNT; ++i) {
+                hz[i] = std::isfinite(hz[i]) ? clampf(hz[i], kHardMinHz, kHardMaxHz) : kHardMinHz;
                 m_mag[i] = (float)mag[i]; m_hz[i] = hz[i];
-                per[i] = (DWORD)(1000000.0f / std::max(1.0f, hz[i]));
+                per[i] = (DWORD)(1000000.0f / hz[i]);
             }
 
             // ------------------------------------------------ push to wheel
@@ -920,6 +1031,12 @@ private:
             }
         }
 
+        if (ff.Ready()) {                       // settle to zero before the effects are torn down
+            int z[S_COUNT] = {0, 0, 0, 0};
+            DWORD p[S_COUNT] = {20000, 20000, 20000, 20000};
+            ff.Push(z, p);
+            Sleep(30);
+        }
         ff.Destroy();
         if (sock != INVALID_SOCKET) closesocket(sock);
         if (wsaOk) WSACleanup();
@@ -934,6 +1051,7 @@ public:
         bool exists = GetFileAttributesA(m_iniPath.c_str()) != INVALID_FILE_ATTRIBUTES;
         if (!exists) SyncConfig(m_cfg, m_iniPath, true);     // write a template with every key
         SyncConfig(m_cfg, m_iniPath, false);
+        m_userGain = m_cfg.userGain;
 
         SetStatus("Pick the wheel with Left/Right, press Select");
         EnumerateDevices();
@@ -998,6 +1116,9 @@ public:
         line(buf);
         snprintf(buf, sizeof(buf), "texture %.2f (front roughness %.2f)  bump %.2f  dive %.2f  lock %.2f",
                  m_dTex.load(), m_dRough.load(), m_dBump.load(), m_dDive.load(), m_dLock.load());
+        line(buf);
+        snprintf(buf, sizeof(buf), "live gain %.0f%%%s   thermal derate x%.2f   (Ctrl + Num+ / Num- / Num* in game)",
+                 m_userGain.load() * 100.0f, m_muted ? " MUTED" : "", m_dHeat.load());
         line(buf);
         snprintf(buf, sizeof(buf), "engine %.0f@%.0fHz  lump %.0f@%.0fHz  road %.0f@%.0fHz  brake %.0f@%.0fHz",
                  m_mag[S_ENG1].load(), m_hz[S_ENG1].load(), m_mag[S_ENG2].load(), m_hz[S_ENG2].load(),
