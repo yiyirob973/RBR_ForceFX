@@ -1,4 +1,4 @@
-// RBR_TrueforcePlugin.cpp  (v4: safety limits + live gain hotkeys)
+// RBR_TrueforcePlugin.cpp  (v5: safety limits, live gain, directional granular road, weight/load model, per-car profiles)
 //
 // Layers extra "Trueforce-like" vibration on top of Richard Burns Rally's own force feedback,
 // driven by NGP's UDP telemetry (rbr.telemetry.data.TelemetryData.h, NGP 7.4.778, 664 bytes).
@@ -29,7 +29,11 @@
 //   from the configured ceilings (0..100%), never above them. Keys are configurable in the .ini.
 // SAFETY: hard compile-time ceilings (kHardTotalMax etc.), frequency floor, slow thermal derate,
 //   loopback-only UDP, fade-to-zero on shutdown, exception guard on the worker thread.
-// FILES (next to the DLL): TrueforceRumble.ini (written on first run), .log, _loaded.txt, _packet.txt
+// WEIGHT: per-wheel strut load relative to the car's own static load drives road strength (loaded side transmits more),
+//   a compression/landing thump, quiet when airborne, and braking judder. TrueforceCars.ini gives each car index its own
+//   engine character (Preset=boxer4 ...) and WeightFeel.
+// FILES (next to the DLL): TrueforceRumble.ini (shipped defaults; written on first run if missing), TrueforceCars.ini
+//   (per-car profiles), .log, _loaded.txt, _packet.txt
 
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
@@ -110,7 +114,7 @@ struct Config {
     int   cylinders = 4;             // engine pulses per rev = cylinders / 2
 
     // per-layer ceilings (DirectInput units 0..10000), a fixed total ceiling, and one live level (userGain)
-    int   engineMaxMag = 3000, roadMaxMag = 3500, brakeMaxMag = 3000;
+    int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 3000;
     int   totalMaxMag = 4000;        // all layers together are scaled down to this (hard ceiling kHardTotalMax)
     float sustainedLimit = 0.10f;    // thermal derate: long-term mean-square level (0.10 ~ 32% RMS-equivalent)
 
@@ -130,6 +134,18 @@ struct Config {
     int   roadSideInvert = 0;        // 1 = swap which side pushes which way (wheel/driver polarity differs)
     float maxSpeed = 40.0f;          // m/s that counts as full speed
 
+    // weight / suspension load (all relative to the car's own static load, so units never matter)
+    float loadInfluence = 0.6f;      // 0 = ignore tyre load, 1 = strongly favour the more heavily loaded side
+    float thumpGain = 0.8f;          // compression / landing thump strength
+    float airborneFade = 1.0f;       // 1 = road and engine go quiet when the wheels are off the ground
+
+    // per-car character (the values below are the globals; a car profile can override them)
+    float weightFeel = 1.0f;         // >1 heavier: stronger thump, slower decay, lower road pitch
+    float lumpScale = 1.0f;          // idle lump / beat strength
+    float unevenness = 0.0f;         // uneven firing (boxer, five-cylinder, V8 cross-plane)
+    int   carProfiles = 1;           // use TrueforceCars.ini
+    int   offCarIndex = 56;          // NGP Car.Index
+
     // braking
     float tyreCircumference = 1.95f; // m, until the plugin has learned it while coasting
     float lockThreshold = 0.12f;     // relative wheel speed deficit where lock-up starts
@@ -137,18 +153,18 @@ struct Config {
     // NGP packet offsets (float32 unless noted)
     int   offThrottle = 28, offBrake = 32, offSpeed = 60, offAccHeave = 120, offRpm = 136;
     int   offSuspBase = 152, suspStride = 128, offStrut = 16, offPiston = 28, offSegment = 60;   // segment = uint32
-    int   speedIsKph = 1;
+    int   speedIsKph = 0;
     float rpmScale = 1.0f;
 
     // live gain (hotkeys, polled while RBR is the foreground window). VK codes, 0 = disabled.
     float userGain = 1.0f;           // persisted live level 0..1 (can only reduce)
     float gainRatio = 0.85f;         // each hotkey press multiplies/divides the level by this (~ -1.4 dB per step)
     int   keyGainUp = 0x6B, keyGainDown = 0x6D, keyMute = 0x6A;   // Numpad + / - / *
-    int   keyModifier = 0x11;                                     // Ctrl (0 = no modifier)
+    int   keyModifier = 0;                                        // 0 = no modifier (0x11 = Ctrl)
     int   gainBeep = 1;
 
-    int         autoConnect = 0;
-    std::string wheel;
+    int         autoConnect = 1;
+    std::string wheel = "SIMAGIC Alpha EVO Wheelbase";   // default from the shipped ini; the menu overwrites it
 };
 
 void SyncConfig(Config& c, const std::string& path, bool write) {
@@ -172,6 +188,9 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     F("RoughLow", c.roughLow); F("RoughHigh", c.roughHigh); F("RoughGamma", c.roughGamma);
     F("RoadGrain", c.roadGrain); F("RoadDirectional", c.roadDirectional); I("RoadSideInvert", c.roadSideInvert);
     F("EngineGrit", c.engineGrit);
+    F("LoadInfluence", c.loadInfluence); F("ThumpGain", c.thumpGain); F("AirborneFade", c.airborneFade);
+    F("WeightFeel", c.weightFeel); F("LumpScale", c.lumpScale); F("Unevenness", c.unevenness);
+    I("CarProfiles", c.carProfiles); I("OffsetCarIndex", c.offCarIndex);
     F("PistonScale", c.pistonScale); F("BumpScale", c.bumpScale); F("MaxSpeed", c.maxSpeed);
     F("TyreCircumference", c.tyreCircumference); F("LockThreshold", c.lockThreshold);
     I("OffsetThrottle", c.offThrottle); I("OffsetBrake", c.offBrake); I("OffsetSpeed", c.offSpeed);
@@ -198,6 +217,12 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
         c.roadGrain = clampf(c.roadGrain, 0.0f, 1.0f);
         c.roadDirectional = clampf(c.roadDirectional, 0.0f, 1.0f);
         c.engineGrit = clampf(c.engineGrit, 0.0f, 1.0f);
+        c.loadInfluence = clampf(c.loadInfluence, 0.0f, 1.0f);
+        c.thumpGain = clampf(c.thumpGain, 0.0f, 2.0f);
+        c.airborneFade = clampf(c.airborneFade, 0.0f, 1.0f);
+        c.weightFeel = clampf(c.weightFeel, 0.5f, 2.0f);
+        c.lumpScale = clampf(c.lumpScale, 0.0f, 2.0f);
+        c.unevenness = clampf(c.unevenness, 0.0f, 1.0f);
         c.gainRatio  = clampf(c.gainRatio, 0.5f, 0.95f);
         c.sustainedLimit = clampf(c.sustainedLimit, 0.02f, 0.20f);
         c.engineMinHz = clampf(c.engineMinHz, kHardMinHz, kHardMaxHz);
@@ -209,6 +234,66 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
         if (c.maxSpeed < 1.0f) c.maxSpeed = 1.0f;
         if (c.tyreCircumference < 0.5f) c.tyreCircumference = 1.95f;
     }
+}
+
+// ------------------------------------------------------------ per-car profiles
+// TrueforceCars.ini, one section per NGP Car.Index:  [Car3]  Name=...  Preset=boxer4  Cylinders=4  RpmMax=7800 ...
+// Anything a profile does not set falls back to the [Trueforce] values. Presets give an engine character in one word.
+struct CarProfile {
+    bool found = false;
+    std::string name, preset;
+    int   cylinders = 0;             // 0 = keep global
+    float rpmMax = 0;                // 0 = keep global / learn
+    float engineScale = 1.0f, roadScale = 1.0f;
+    float lumpScale = -1, grit = -1, unevenness = -1, weightFeel = -1;   // negative = keep global
+};
+
+struct Preset { const char* name; int cyl; float lump, grit, uneven, engine; };
+const Preset kPresets[] = {
+    { "inline4",      4, 1.00f, 0.50f, 0.00f, 1.00f },   // plain four
+    { "inline4turbo", 4, 0.80f, 0.65f, 0.05f, 1.10f },   // turbo four: rougher, less lumpy
+    { "boxer4",       4, 1.50f, 0.45f, 0.45f, 1.10f },   // unequal-length headers: burble and sway at low revs
+    { "inline5",      5, 1.20f, 0.50f, 0.30f, 1.05f },   // five-cylinder: uneven, gravelly
+    { "v6",           6, 0.60f, 0.30f, 0.10f, 0.95f },
+    { "flat6",        6, 1.00f, 0.40f, 0.20f, 1.00f },
+    { "v8",           8, 0.70f, 0.30f, 0.25f, 1.00f },
+};
+
+std::string CarsIniPath() { return g_dir + "TrueforceCars.ini"; }
+
+std::string LowerStr(std::string v) { for (char& ch : v) ch = (char)tolower((unsigned char)ch); return v; }
+
+bool LoadCarProfile(int idx, CarProfile& p) {
+    char sec[32]; snprintf(sec, sizeof(sec), "Car%d", idx);
+    const std::string path = CarsIniPath();
+    char raw[1024];
+    if (GetPrivateProfileSectionA(sec, raw, sizeof(raw), path.c_str()) == 0) return false;
+    p.found = true;
+    char b[128];
+    auto GS = [&](const char* k, std::string& v) { GetPrivateProfileStringA(sec, k, "", b, sizeof(b), path.c_str()); if (b[0]) v = b; };
+    auto GF = [&](const char* k, float& v) { GetPrivateProfileStringA(sec, k, "", b, sizeof(b), path.c_str()); if (b[0]) v = (float)atof(b); };
+    GS("Name", p.name); GS("Preset", p.preset);
+    // preset first, explicit keys override it
+    for (const Preset& pr : kPresets) if (LowerStr(p.preset) == pr.name) {
+        p.cylinders = pr.cyl; p.lumpScale = pr.lump; p.grit = pr.grit; p.unevenness = pr.uneven; p.engineScale = pr.engine;
+    }
+    GetPrivateProfileStringA(sec, "Cylinders", "", b, sizeof(b), path.c_str()); if (b[0]) p.cylinders = atoi(b);
+    GF("RpmMax", p.rpmMax); GF("EngineScale", p.engineScale); GF("RoadScale", p.roadScale);
+    GF("LumpScale", p.lumpScale); GF("Grit", p.grit); GF("Unevenness", p.unevenness); GF("WeightFeel", p.weightFeel);
+    return true;
+}
+
+void ApplyProfile(const Config& base, const CarProfile& p, Config& e) {
+    e = base;
+    if (!p.found) return;
+    if (p.cylinders > 0) e.cylinders = std::max(1, std::min(p.cylinders, 16));
+    if (p.rpmMax > 500.0f) e.rpmMax = p.rpmMax;
+    e.engineMaxMag = std::max(0, std::min((int)(base.engineMaxMag * clampf(p.engineScale, 0.0f, 2.0f)), 10000));
+    e.roadMaxMag   = std::max(0, std::min((int)(base.roadMaxMag * clampf(p.roadScale, 0.0f, 2.0f)), 10000));
+    if (p.lumpScale >= 0)   e.lumpScale  = clampf(p.lumpScale, 0.0f, 2.0f);
+    if (p.grit >= 0)        e.engineGrit = clampf(p.grit, 0.0f, 1.0f);
+    if (p.unevenness >= 0)  e.unevenness = clampf(p.unevenness, 0.0f, 1.0f);
+    if (p.weightFeel > 0)   e.weightFeel = clampf(p.weightFeel, 0.5f, 2.0f);
 }
 
 // -------------------------------------------------- tap on RBR's own device
@@ -529,6 +614,16 @@ private:
 };
 
 // ------------------------------------------------------------------ telemetry
+// Car.Index may be a uint32 or an integral float depending on the NGP build: accept either.
+inline bool readIndex(const uint8_t* b, int len, int off, int& out) {
+    if (off < 0 || off + 4 > len) return false;
+    uint32_t u; std::memcpy(&u, b + off, 4);
+    if (u <= 255u) { out = (int)u; return true; }
+    float f; std::memcpy(&f, b + off, 4);
+    if (std::isfinite(f) && f >= 0.0f && f <= 255.0f && f == std::floor(f)) { out = (int)f; return true; }
+    return false;
+}
+
 inline bool readF(const uint8_t* b, int len, int off, float& out) {
     if (off < 0 || off + 4 > len) return false;
     float v; std::memcpy(&v, b + off, 4);
@@ -548,6 +643,12 @@ struct Signals {
     float dive = 0;       // front load transfer under braking 0..1
     float lock = 0;       // front wheel lock-up 0..1
     float frontRev = 0;   // front wheel revolutions per second
+    int   carIndex = -1;  // NGP Car.Index (-1 = unknown)
+    // weight / suspension load, relative to this car's own static load (1 = at rest)
+    float loadL = 1, loadR = 1, loadF = 1;
+    float airborne = 0;   // 0 = wheels loaded, 1 = off the ground
+    float thumpL = 0, thumpR = 0;   // compression / landing envelope per side
+    float staticLoad = 0; // learned static strut load, all four wheels (units of the telemetry)
 };
 
 struct Hp  { float y = 0, x = 0; bool init = false;
@@ -563,11 +664,14 @@ struct Dsp {
     uint32_t lastSeg[4] = {0, 0, 0, 0};
     bool haveSeg[4] = {false, false, false, false};
     float bumpEnv = 0, diveSm = 0, lockSm = 0;
+    Ema statRef[4], rLsm, rRsm, rFsm;
+    float thumpL = 0, thumpR = 0;
 };
 
 void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, float dt) {
     dt = clampf(dt, 0.002f, 0.05f);
     float v;
+    { int ci; if (readIndex(b, n, c.offCarIndex, ci)) s.carIndex = ci; }
     if (readF(b, n, c.offRpm, v))   s.rpm = std::max(0.0f, v * c.rpmScale);
     if (readF(b, n, c.offSpeed, v)) s.speed = std::fabs(v) * (c.speedIsKph ? (1.0f / 3.6f) : 0.44704f);
     s.throttle = readF(b, n, c.offThrottle, v) ? clamp01(v) : 0.6f;
@@ -606,6 +710,34 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
     }
     const float meanLoad = 0.25f * (absSf[0] + absSf[1] + absSf[2] + absSf[3]);
     if (s.speed > 3.0f && meanLoad > 0) d.loadRef.step(meanLoad, alphaFor(dt, 8.0f));
+
+    // ---- weight / suspension load model. Everything is relative to this car's own static load (learned slowly,
+    //      reset at stage start when the car stands still), so the telemetry units and the car's mass don't matter.
+    {
+        const float tot = absSf[0] + absSf[1] + absSf[2] + absSf[3];
+        float statTot = 0; bool seeded = true;
+        for (int i = 0; i < 4; ++i) { statTot += d.statRef[i].v; seeded = seeded && d.statRef[i].init; }
+        if (!seeded || tot > 0.5f * statTot)                       // never learn while airborne
+            for (int i = 0; i < 4; ++i) d.statRef[i].step(absSf[i], alphaFor(dt, 30.0f));
+        statTot = 0;
+        for (int i = 0; i < 4; ++i) statTot += d.statRef[i].v;
+        s.staticLoad = statTot;
+        if (statTot > 1e-3f) {
+            float rw[4];
+            for (int i = 0; i < 4; ++i)
+                rw[i] = clampf(absSf[i] / std::max(d.statRef[i].v, 0.0375f * statTot), 0.0f, 3.5f);
+            const float rl = 0.65f * rw[0] + 0.35f * rw[2], rr2 = 0.65f * rw[1] + 0.35f * rw[3];
+            const float aR = alphaFor(dt, 0.08f);
+            s.loadL = d.rLsm.step(rl, aR);
+            s.loadR = d.rRsm.step(rr2, aR);
+            s.loadF = d.rFsm.step(0.5f * (rw[0] + rw[1]), aR);
+            s.airborne = s.speed > 3.0f ? 1.0f - smooth01(0.06f, 0.35f, tot / statTot) : 0.0f;
+            const float eDecay = std::exp(-dt / 0.14f);               // compression / landing thump per side
+            d.thumpL = std::max(clamp01((rl  - 1.7f) / 1.2f), d.thumpL * eDecay);
+            d.thumpR = std::max(clamp01((rr2 - 1.7f) / 1.2f), d.thumpR * eDecay);
+            s.thumpL = d.thumpL; s.thumpR = d.thumpR;
+        }
+    }
 
     // ---- road texture: FRONT tyres dominate (they are what the driver feels through the rack)
     const float rF = std::max(rough[0], rough[1]), rR = std::max(rough[2], rough[3]);
@@ -660,7 +792,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 struct Synth {
     float sm[S_COUNT] = {};
     float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
-    float roadJit[2] = {1.0f, 1.0f}, ampJit[2] = {1.0f, 1.0f}, engJit = 1.0f, engHzJit = 1.0f;
+    float roadJit[2] = {1.0f, 1.0f}, ampJit[2] = {1.0f, 1.0f}, engJit = 1.0f, engHzJit = 1.0f, unevPhase = 0;
     double nextJit = 0;
 
     void Run(const Config& c, const Signals& s, double t, float dt, float userGain, int mag[S_COUNT], float hz[S_COUNT]) {
@@ -683,7 +815,9 @@ struct Synth {
         const float A1 = clamp01(0.22f + 0.45f * idle + 0.35f * res + 0.30f * buzz);
         const float loadF = 0.45f + 0.55f * thrSm;                                    // engine under load shakes more
         const float comp = clampf(1.4f - 0.009f * (hz[S_ENG1] - c.engineMinHz), 0.55f, 1.4f);   // wheel is weaker at high Hz
-        float t1 = s.rpm > 200 ? c.engineMaxMag * clamp01(A1 * loadF * comp * (1.0f - 0.45f * grit * (0.5f - 0.5f * engJit))) : 0.0f;   // irregular firing strength
+        const float engAir  = 1.0f - 0.35f * c.airborneFade * s.airborne;                       // revving in the air feels lighter
+        const float unevMod = 1.0f - 0.35f * c.unevenness * (0.5f + 0.5f * std::sin(unevPhase)); // uneven firing sways the amplitude
+        float t1 = s.rpm > 200 ? c.engineMaxMag * clamp01(A1 * loadF * comp * unevMod * engAir * (1.0f - 0.45f * grit * (0.5f - 0.5f * engJit))) : 0.0f;   // irregular firing strength
         if (s.rpm > 200 && x > 0.985f && thrSm > 0.8f) t1 *= (std::fmod(t, 0.08) < 0.04 ? 1.0f : 0.25f);   // rev limiter
 
         lope += (rnd() - lope) * 0.05f;                                               // uneven firing at low rpm
@@ -693,9 +827,11 @@ struct Synth {
         const float hzLump = clampf(fire * 0.5f, 7.0f, 42.0f);
         const float hzBeat = clampf(hz[S_ENG1] * 1.37f, c.engineMinHz, kHardMaxHz);
         hz[S_ENG2] = hzLump + (hzBeat - hzLump) * xover;
+        unevPhase += 6.2831853f * hzLump * dt;
+        if (unevPhase > 6.2831853f) unevPhase -= 6.2831853f;
         const float A2 = (0.15f + 0.85f * idle) * (0.5f + 0.5f * thrSm) * (1.0f + 0.25f * lope * (0.2f + idle))
                        + 0.55f * grit * (0.6f + 0.4f * thrSm);
-        float t2 = s.rpm > 200 ? c.engineMaxMag * 0.8f * clamp01(A2) : 0.0f;
+        float t2 = s.rpm > 200 ? c.engineMaxMag * 0.8f * clamp01(A2 * c.lumpScale) * engAir : 0.0f;
 
         // ---------------- ROAD: two sawtooth effects with opposite sharp edges (zero mean, so they never shift
         // RBR's own force). S_ROAD's sharp edge snaps toward negative (left), S_ROADR's toward positive (right);
@@ -703,9 +839,17 @@ struct Synth {
         const float spN = clamp01(s.speed / c.maxSpeed);
         const float gSpd = smooth01(1.0f, 10.0f, s.speed);
         const float texMono = clamp01(s.texture + 0.9f * s.bump);
-        const float texSide[2] = {                                                    // [0] = left, [1] = right
-            clamp01(texMono + (clamp01(s.texL + 0.9f * s.bump) - texMono) * c.roadDirectional),
-            clamp01(texMono + (clamp01(s.texR + 0.9f * s.bump) - texMono) * c.roadDirectional) };
+        const float wf = clampf(c.weightFeel, 0.5f, 2.0f);
+        const float thump[2] = { s.thumpL, s.thumpR };
+        const float sideTex[2] = { s.texL, s.texR };
+        const float sideLoad[2] = { s.loadL, s.loadR };
+        float texSide[2], loadGain[2];                                                // [0] = left, [1] = right
+        for (int k2 = 0; k2 < 2; ++k2) {
+            const float tm = texMono + (clamp01(sideTex[k2] + 0.9f * s.bump) - texMono) * c.roadDirectional;
+            texSide[k2] = clamp01(tm + c.thumpGain * wf * thump[k2]);                 // heavier car: harder landing thump
+            loadGain[k2] = 1.0f + c.loadInfluence * (clampf(sideLoad[k2], 0.4f, 1.8f) - 1.0f);   // loaded tyres transmit more
+        }
+        const float roadAir = 1.0f - c.airborneFade * s.airborne;                     // off the ground: no road
         if (t >= nextJit) {                                                           // ~12 ms grain: new random amplitude + pitch per side
             for (int k2 = 0; k2 < 2; ++k2) {
                 const float tx = texSide[k2];
@@ -719,8 +863,8 @@ struct Synth {
         float t3[2];
         for (int k2 = 0; k2 < 2; ++k2) {
             const float spd = c.roadMinHz + (c.roadMaxHz - c.roadMinHz) * clamp01(0.35f * spN + 0.65f * texSide[k2]);
-            hz[k2 == 0 ? S_ROAD : S_ROADR] = spd * roadJit[k2] * (k2 ? 1.31f : 1.0f);   // detuned: sides never lock in phase
-            t3[k2] = c.roadMaxMag * 0.7f * texSide[k2] * gSpd * ampJit[k2];                // two effects share the road budget
+            hz[k2 == 0 ? S_ROAD : S_ROADR] = spd * roadJit[k2] * (k2 ? 1.31f : 1.0f) / std::sqrt(wf);   // detuned sides; heavier = lower pitch
+            t3[k2] = c.roadMaxMag * 0.7f * texSide[k2] * gSpd * ampJit[k2] * loadGain[k2] * roadAir;     // two effects share the road budget
         }
         // A = sharp edge to the left (negative), B = to the right. Default: an impact on the left tyre snaps left.
         const int sA = c.roadSideInvert ? 1 : 0, sB = 1 - sA;
@@ -732,7 +876,7 @@ struct Synth {
         const float gB = smooth01(2.0f, 8.0f, s.speed);
         const float Ab = clamp01(std::pow(s.brake, 1.2f) * (0.3f + 0.7f * s.dive) * 0.6f + s.lock);
         hz[S_BRAKE] = s.lock > 0.1f ? clampf(38.0f + 25.0f * rnd(), 25.0f, 70.0f) : clampf(s.frontRev * 2.0f, 12.0f, 60.0f);
-        float t4 = c.brakeMaxMag * Ab * gB;
+        float t4 = c.brakeMaxMag * Ab * gB * clampf(0.65f + 0.35f * s.loadF, 0.5f, 1.3f);   // more load on the fronts = more judder
 
         // attack / release: road is deliberately fast (sharpness), engine is rounder
         auto follow = [&](int i, float target, float up, float down) {
@@ -740,8 +884,9 @@ struct Synth {
         };
         follow(S_ENG1, t1, 0.35f, 0.15f);
         follow(S_ENG2, t2, 0.25f, 0.12f);
-        follow(S_ROAD,  tRoadA, 0.55f, 0.40f);
-        follow(S_ROADR, tRoadB, 0.55f, 0.40f);
+        const float roadDown = clampf(0.40f / wf, 0.15f, 0.70f);                     // heavier = the thump rings out longer
+        follow(S_ROAD,  tRoadA, 0.55f, roadDown);
+        follow(S_ROADR, tRoadB, 0.55f, roadDown);
         follow(S_BRAKE, t4, 0.50f, 0.20f);
 
         float sum = 0;
@@ -790,6 +935,10 @@ private:
     std::atomic<float> m_userGain{1.0f};   // live level 0..1, changed by hotkeys
     std::atomic<bool>  m_muted{false};
     std::atomic<float> m_dHeat{1.0f};      // shown in the menu: 1 = no derate
+    std::atomic<int>   m_dCar{-1};
+    std::atomic<float> m_dStat{0}, m_dLoadL{1}, m_dLoadR{1}, m_dAir{0};
+    std::atomic<bool>  m_stageReset{false};
+    std::string m_carName, m_carPreset;    // guarded by m_mtx
     std::mutex m_mtx;
     std::string m_status;
     uint8_t m_pkt[2048];
@@ -974,6 +1123,9 @@ private:
         Dsp dsp;
         Synth synth;
         Signals live, sig;
+        Config eff = m_cfg;                    // m_cfg + the active car profile
+        int curCar = -2;
+        CarProfile prof;
         bool dumped = false, prevTest = false;
         double testT0 = 0;
 
@@ -992,7 +1144,25 @@ private:
                     got = true;
                     float pdt = std::chrono::duration<float>(now - lastPkt).count();
                     lastPkt = now; lastRx = now;
-                    ParsePacket(m_cfg, buf.data(), n, live, dsp, pdt);
+                    if (m_stageReset.exchange(false)) {                 // car is standing at the start line: re-learn static load
+                        for (int i = 0; i < 4; ++i) dsp.statRef[i] = Ema();
+                        dsp.thumpL = dsp.thumpR = 0;
+                    }
+                    ParsePacket(eff, buf.data(), n, live, dsp, pdt);
+                    if (live.carIndex >= 0 && live.carIndex != curCar) {   // new car: load its profile, forget what the last one taught us
+                        curCar = live.carIndex;
+                        prof = CarProfile();
+                        if (m_cfg.carProfiles) LoadCarProfile(curCar, prof);
+                        ApplyProfile(m_cfg, prof, eff);
+                        dsp = Dsp(); synth.rpmPeak = 0;
+                        { std::lock_guard<std::mutex> lk(m_mtx);
+                          m_carName = prof.found ? (prof.name.empty() ? "(unnamed profile)" : prof.name) : "no profile";
+                          m_carPreset = prof.preset; }
+                        m_dCar = curCar;
+                        Logf("Car index %d: %s  preset=%s  cyl=%d rpmMax=%.0f weightFeel=%.2f", curCar,
+                             prof.found ? "profile loaded" : "no profile in TrueforceCars.ini", prof.preset.c_str(),
+                             eff.cylinders, eff.rpmMax, eff.weightFeel);
+                    }
                     {
                         std::lock_guard<std::mutex> lk(m_mtx);
                         m_pktLen = n;
@@ -1021,6 +1191,7 @@ private:
             m_dRpm = sig.rpm; m_dSpeed = sig.speed; m_dThr = sig.throttle; m_dBrk = sig.brake;
             m_dTex = sig.texture; m_dRough = sig.rough; m_dBump = sig.bump;
             m_dDive = sig.dive; m_dLock = sig.lock;
+            m_dStat = sig.staticLoad; m_dLoadL = sig.loadL; m_dLoadR = sig.loadR; m_dAir = sig.airborne;
 
             PollHotkeys(now);
             const bool testNow = m_test.load();
@@ -1031,7 +1202,7 @@ private:
             const float live_gain = m_muted.load() ? 0.0f : m_userGain.load() * testRamp;
 
             int mag[S_COUNT]; float hz[S_COUNT];
-            synth.Run(m_cfg, sig, t, dt, live_gain, mag, hz);
+            synth.Run(eff, sig, t, dt, live_gain, mag, hz);
             m_dHeat = synth.heat > m_cfg.sustainedLimit ? std::sqrt(m_cfg.sustainedLimit / synth.heat) : 1.0f;
             DWORD per[S_COUNT];
             for (int i = 0; i < S_COUNT; ++i) {
@@ -1170,6 +1341,11 @@ public:
         snprintf(buf, sizeof(buf), "texture %.2f (front roughness %.2f)  bump %.2f  dive %.2f  lock %.2f",
                  m_dTex.load(), m_dRough.load(), m_dBump.load(), m_dDive.load(), m_dLock.load());
         line(buf);
+        { std::string nm, pr; { std::lock_guard<std::mutex> lk(m_mtx); nm = m_carName; pr = m_carPreset; }
+          snprintf(buf, sizeof(buf), "car %d: %s%s%s   static load %.0f   load L %.2f R %.2f   airborne %.2f",
+                   m_dCar.load(), nm.empty() ? "waiting for telemetry" : nm.c_str(), pr.empty() ? "" : "  preset ", pr.c_str(),
+                   m_dStat.load(), m_dLoadL.load(), m_dLoadR.load(), m_dAir.load());
+          line(buf); }
         snprintf(buf, sizeof(buf), "live gain %.0f%%%s   thermal derate x%.2f   (Ctrl + Num+ / Num- / Num* in game)",
                  m_userGain.load() * 100.0f, m_muted ? " MUTED" : "", m_dHeat.load());
         line(buf);
@@ -1214,7 +1390,7 @@ public:
     }
 
     void TickFrontEndPage(float) override {}
-    void StageStarted(int, const char*, bool) override {}
+    void StageStarted(int, const char*, bool) override { m_stageReset = true; }
     void HandleResults(float, float, float, const char*) override {}
     void CheckPoint(float, int, const char*) override {}
 };

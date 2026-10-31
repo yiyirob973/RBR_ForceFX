@@ -22,3 +22,17 @@ plugin for RBR with NGP7 that enhances FFB with additional effects
 - **Granular road:** amplitude and pitch are re-randomised every ~12 ms per side, and the two sides are detuned so they never lock in phase. `RoadGrain` (0..1) sets how coarse it gets.
 - **Rougher high revs:** random firing-strength variation, a little pitch jitter, and the half-order effect turns into a detuned second oscillator (x1.37) at high revs, so it beats against the main one. `EngineGrit` (0..1) sets how much.
 - TEST mode phase 3 now alternates left-side and right-side hits every 1.5 s so you can check direction without driving.
+
+## v5: weight / suspension load, per-car profiles, shipped default inis
+
+- **Defaults** are now the tuned values (engine 1200, road 3000, brake 3000, total 4000, no hotkey modifier, auto-connect to the SIMAGIC Alpha EVO). `TrueforceRumble.ini` and `TrueforceCars.ini` live in the repo as reference defaults to copy next to the DLL. The build does not use them, and the plugin writes `TrueforceRumble.ini` itself on first run if it is missing. If you add a key in `SyncConfig`, add it to the repo ini by hand.
+- **Weight / load model** (relative to each car's own static load, so units don't matter; static load is re-learned at stage start):
+  - the more heavily loaded side transmits more road (`LoadInfluence`)
+  - compression and landing thump per side (`ThumpGain`), stronger and longer for a heavier car (`WeightFeel`)
+  - road and engine go quiet when the wheels leave the ground (`AirborneFade`)
+  - braking judder grows with the load on the front tyres
+- **Per-car profiles:** the plugin reads NGP `Car.Index` (offset 56, `OffsetCarIndex`) and looks up `[Car<N>]` in `TrueforceCars.ini`: `Preset` (inline4, inline4turbo, boxer4, inline5, v6, flat6, v8), `Cylinders`, `RpmMax`, `EngineScale`, `RoadScale`, `LumpScale`, `Grit`, `Unevenness`, `WeightFeel`. Switching cars resets the learned rev limit and load.
+
+## Note
+
+This plugin enhances Richard Burns Rally's own force feedback; it never replaces or overrides it. All effects are zero-mean vibrations added to the wheel alongside RBR's steering force, the wheel's gain and autocenter are never touched, and RBR's force is unaffected when the plugin is muted or unloaded.
