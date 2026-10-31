@@ -15,3 +15,10 @@ plugin for RBR with NGP7 that enhances FFB with additional effects
   - Keys are Windows virtual-key codes in the `.ini` (`KeyGainUp`, `KeyGainDown`, `KeyMute`, `KeyModifier`, `GainRatio`, `GainBeep`); 0 disables a key.
 - Existing `TrueforceRumble.ini` files keep their old values (clamped to the new ceilings). Delete it once to get the new, lower defaults.
 - Gain structure is now: per-layer `*MaxMagnitude` (the mix) -> `TotalMaxMagnitude` (fixed safety ceiling) -> `UserGain` (live level). `MasterGain` and the per-layer `*Gain` keys were removed because they duplicated these. The thermal derate measures the level actually delivered, including `UserGain`.
+
+## v4.1: granular road, directional impacts, rougher high revs
+
+- **Road is now two zero-mean sawtooth effects with opposite sharp edges**, each fed by one side's tyre roughness. An impact on the left tyres snaps one way, on the right tyres the other. Because both waveforms average to zero, nothing is added to RBR's own force. `RoadDirectional` (0..1) blends between identical sides and fully separate sides; `RoadSideInvert=1` swaps the polarity if left/right feel backwards on your wheel.
+- **Granular road:** amplitude and pitch are re-randomised every ~12 ms per side, and the two sides are detuned so they never lock in phase. `RoadGrain` (0..1) sets how coarse it gets.
+- **Rougher high revs:** random firing-strength variation, a little pitch jitter, and the half-order effect turns into a detuned second oscillator (x1.37) at high revs, so it beats against the main one. `EngineGrit` (0..1) sets how much.
+- TEST mode phase 3 now alternates left-side and right-side hits every 1.5 s so you can check direction without driving.

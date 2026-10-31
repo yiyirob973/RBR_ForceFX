@@ -118,12 +118,16 @@ struct Config {
     float engineMinHz = 14.0f, engineMaxHz = 100.0f;
     float rpmMax = 0.0f;             // 0 = learn from the data (starts at RpmMaxInit)
     float rpmMaxInit = 7500.0f;
+    float engineGrit = 0.5f;         // 0 = clean sine at high revs, 1 = rough, beating, irregular
 
     // road
     float roadMinHz = 30.0f, roadMaxHz = 95.0f;
     float roughLow = 0.08f, roughHigh = 0.60f, roughGamma = 1.4f;   // tyre roughness -> 0..1 level (tarmac below roughLow)
     float pistonScale = 1.0f;        // RMS damper piston velocity -> 0..1 (absolute hits, kerbs)
     float bumpScale = 0.1f;          // heave acceleration spike -> 0..1
+    float roadGrain = 0.6f;          // 0 = smooth buzz, 1 = coarse, irregular grain (amplitude + frequency randomness)
+    float roadDirectional = 0.7f;    // 0 = both sides identical, 1 = left/right impacts fully separate
+    int   roadSideInvert = 0;        // 1 = swap which side pushes which way (wheel/driver polarity differs)
     float maxSpeed = 40.0f;          // m/s that counts as full speed
 
     // braking
@@ -166,6 +170,8 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
     F("RoughLow", c.roughLow); F("RoughHigh", c.roughHigh); F("RoughGamma", c.roughGamma);
+    F("RoadGrain", c.roadGrain); F("RoadDirectional", c.roadDirectional); I("RoadSideInvert", c.roadSideInvert);
+    F("EngineGrit", c.engineGrit);
     F("PistonScale", c.pistonScale); F("BumpScale", c.bumpScale); F("MaxSpeed", c.maxSpeed);
     F("TyreCircumference", c.tyreCircumference); F("LockThreshold", c.lockThreshold);
     I("OffsetThrottle", c.offThrottle); I("OffsetBrake", c.offBrake); I("OffsetSpeed", c.offSpeed);
@@ -189,6 +195,9 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
         c.brakeMaxMag = std::max(0, std::min(c.brakeMaxMag, 10000));
         c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, kHardTotalMax));
         c.userGain   = clampf(c.userGain,   0.0f, 1.0f);
+        c.roadGrain = clampf(c.roadGrain, 0.0f, 1.0f);
+        c.roadDirectional = clampf(c.roadDirectional, 0.0f, 1.0f);
+        c.engineGrit = clampf(c.engineGrit, 0.0f, 1.0f);
         c.gainRatio  = clampf(c.gainRatio, 0.5f, 0.95f);
         c.sustainedLimit = clampf(c.sustainedLimit, 0.02f, 0.20f);
         c.engineMinHz = clampf(c.engineMinHz, kHardMinHz, kHardMaxHz);
@@ -409,8 +418,8 @@ BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
     return DIENUM_CONTINUE;
 }
 
-enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD, S_BRAKE, S_COUNT };
-const char* const kSlotName[S_COUNT] = {"engine", "lump", "road", "brake"};
+enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD, S_ROADR, S_BRAKE, S_COUNT };   // S_ROAD = sawtooth-up (sharp edge toward negative/left), S_ROADR = sawtooth-down
+const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-A", "road-B", "brake"};
 
 class FFLayer {
 public:
@@ -429,7 +438,7 @@ public:
         if (axisId == 0xFFFFFFFF) return E_NOTIMPL;      // no force feedback actuator
         m_axisId = axisId;
 
-        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_Sine };
+        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown, &GUID_Sine };
         HRESULT firstErr = DI_OK;
         int ok = 0;
         for (int i = 0; i < S_COUNT; ++i) {
@@ -477,7 +486,7 @@ public:
 
 private:
     IDirectInputDevice8A* m_dev = nullptr;
-    IDirectInputEffect* m_fx[S_COUNT] = {nullptr, nullptr, nullptr, nullptr};
+    IDirectInputEffect* m_fx[S_COUNT] = {};
     int m_lastMag[S_COUNT];
     DWORD m_lastPer[S_COUNT];
     DWORD m_axisId = 0;
@@ -534,6 +543,7 @@ struct Signals {
     float level = 0;      // roughness mapped through low/high/gamma
     float piston = 0;     // damper piston velocity level
     float texture = 0;    // combined road texture 0..1
+    float texL = 0, texR = 0;   // the same, per side (left / right tyres)
     float bump = 0;       // heave acceleration spike envelope
     float dive = 0;       // front load transfer under braking 0..1
     float lock = 0;       // front wheel lock-up 0..1
@@ -604,6 +614,16 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
     s.piston = std::pow(clamp01(std::max(pRms[0], pRms[1]) * c.pistonScale), 1.2f);
     s.texture = clamp01(std::max(s.level, 0.8f * s.piston));
 
+    // ---- per side (NGP wheel order LF, RF, LB, RB): same mapping, fronts weigh most
+    auto side = [&](int front, int back) {
+        const float r = 0.75f * rough[front] + 0.25f * rough[back];
+        const float lv = std::pow(clamp01((r - c.roughLow) / (c.roughHigh - c.roughLow)), c.roughGamma);
+        const float pi = std::pow(clamp01(pRms[front] * c.pistonScale), 1.2f);
+        return clamp01(std::max(lv, 0.8f * pi));
+    };
+    s.texL = side(0, 2);
+    s.texR = side(1, 3);
+
     // ---- bumps / landings from heave acceleration
     if (readF(b, n, c.offAccHeave, v)) {
         float hp = d.accHp.step(v, hpCoef(dt, 0.05f));
@@ -638,8 +658,9 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 // -------------------------------------------------------------- synthesis
 // Turns the analysed signals into effect magnitudes / frequencies. Runs on the worker thread, ~125 Hz.
 struct Synth {
-    float sm[S_COUNT] = {0, 0, 0, 0};
-    float thrSm = 0, lope = 0, rpmPeak = 0, roadJit = 1.0f, ampJit = 1.0f, heat = 0;
+    float sm[S_COUNT] = {};
+    float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
+    float roadJit[2] = {1.0f, 1.0f}, ampJit[2] = {1.0f, 1.0f}, engJit = 1.0f, engHzJit = 1.0f;
     double nextJit = 0;
 
     void Run(const Config& c, const Signals& s, double t, float dt, float userGain, int mag[S_COUNT], float hz[S_COUNT]) {
@@ -652,7 +673,9 @@ struct Synth {
         const float fire = s.rpm / 60.0f * c.cylinders * 0.5f;
         const float fireMax = rmax / 60.0f * c.cylinders * 0.5f;
         const float k = fireMax > c.engineMaxHz ? c.engineMaxHz / fireMax : 1.0f;     // linear compression: no pitch jumps
-        hz[S_ENG1] = clampf(fire * k, c.engineMinHz, c.engineMaxHz);
+        const float buzzW = smooth01(0.50f, 1.0f, x);                                 // how much of the high-rev range we are in
+        const float grit = c.engineGrit * buzzW;
+        hz[S_ENG1] = clampf(fire * k * (1.0f + 0.04f * grit * engHzJit), c.engineMinHz, c.engineMaxHz);
 
         const float idle = 1.0f - smooth01(0.08f, 0.45f, x);                          // lumpy idle
         const float res = gauss(x, 0.55f, 0.08f) + 0.8f * gauss(x, 0.80f, 0.07f);    // engine-order resonances
@@ -660,25 +683,50 @@ struct Synth {
         const float A1 = clamp01(0.22f + 0.45f * idle + 0.35f * res + 0.30f * buzz);
         const float loadF = 0.45f + 0.55f * thrSm;                                    // engine under load shakes more
         const float comp = clampf(1.4f - 0.009f * (hz[S_ENG1] - c.engineMinHz), 0.55f, 1.4f);   // wheel is weaker at high Hz
-        float t1 = s.rpm > 200 ? c.engineMaxMag * clamp01(A1 * loadF * comp) : 0.0f;
+        float t1 = s.rpm > 200 ? c.engineMaxMag * clamp01(A1 * loadF * comp * (1.0f - 0.45f * grit * (0.5f - 0.5f * engJit))) : 0.0f;   // irregular firing strength
         if (s.rpm > 200 && x > 0.985f && thrSm > 0.8f) t1 *= (std::fmod(t, 0.08) < 0.04 ? 1.0f : 0.25f);   // rev limiter
 
         lope += (rnd() - lope) * 0.05f;                                               // uneven firing at low rpm
-        hz[S_ENG2] = clampf(fire * 0.5f, 7.0f, 42.0f);                                // half order: lump / beating
-        const float A2 = (0.15f + 0.85f * idle) * (0.5f + 0.5f * thrSm) * (1.0f + 0.25f * lope * (0.2f + idle));
+        // half-order lump at low revs; at high revs the same effect becomes a detuned second oscillator (x1.37)
+        // whose beating against the main one is what makes a high-rev engine feel rough instead of a clean sine
+        const float xover = smooth01(0.45f, 0.75f, x) * c.engineGrit;
+        const float hzLump = clampf(fire * 0.5f, 7.0f, 42.0f);
+        const float hzBeat = clampf(hz[S_ENG1] * 1.37f, c.engineMinHz, kHardMaxHz);
+        hz[S_ENG2] = hzLump + (hzBeat - hzLump) * xover;
+        const float A2 = (0.15f + 0.85f * idle) * (0.5f + 0.5f * thrSm) * (1.0f + 0.25f * lope * (0.2f + idle))
+                       + 0.55f * grit * (0.6f + 0.4f * thrSm);
         float t2 = s.rpm > 200 ? c.engineMaxMag * 0.8f * clamp01(A2) : 0.0f;
 
-        // ---------------- ROAD: sharp sawtooth, violent on rough ground
+        // ---------------- ROAD: two sawtooth effects with opposite sharp edges (zero mean, so they never shift
+        // RBR's own force). S_ROAD's sharp edge snaps toward negative (left), S_ROADR's toward positive (right);
+        // each is fed by one side's tyre roughness, so an impact on one side is felt as a one-directional snap.
         const float spN = clamp01(s.speed / c.maxSpeed);
         const float gSpd = smooth01(1.0f, 10.0f, s.speed);
-        const float tex = clamp01(s.texture + 0.9f * s.bump);
-        if (t >= nextJit) {
-            roadJit = 1.0f + (tex > 0.4f ? 0.35f : 0.10f) * rnd();
-            ampJit = 0.7f + 0.3f * (rnd() * 0.5f + 0.5f);
-            nextJit = t + 0.025;
+        const float texMono = clamp01(s.texture + 0.9f * s.bump);
+        const float texSide[2] = {                                                    // [0] = left, [1] = right
+            clamp01(texMono + (clamp01(s.texL + 0.9f * s.bump) - texMono) * c.roadDirectional),
+            clamp01(texMono + (clamp01(s.texR + 0.9f * s.bump) - texMono) * c.roadDirectional) };
+        if (t >= nextJit) {                                                           // ~12 ms grain: new random amplitude + pitch per side
+            for (int k2 = 0; k2 < 2; ++k2) {
+                const float tx = texSide[k2];
+                roadJit[k2] = 1.0f + (0.10f + 0.40f * c.roadGrain * (tx > 0.3f ? 1.0f : 0.5f)) * rnd();
+                const float lo = 1.0f - 0.65f * c.roadGrain;                          // grain: amplitude varies lo..1
+                ampJit[k2] = lo + (1.0f - lo) * (rnd() * 0.5f + 0.5f);
+            }
+            engJit = rnd(); engHzJit = rnd();
+            nextJit = t + 0.012;
         }
-        hz[S_ROAD] = (c.roadMinHz + (c.roadMaxHz - c.roadMinHz) * clamp01(0.35f * spN + 0.65f * tex)) * roadJit;
-        float t3 = c.roadMaxMag * tex * gSpd * ampJit;
+        float t3[2];
+        for (int k2 = 0; k2 < 2; ++k2) {
+            const float spd = c.roadMinHz + (c.roadMaxHz - c.roadMinHz) * clamp01(0.35f * spN + 0.65f * texSide[k2]);
+            hz[k2 == 0 ? S_ROAD : S_ROADR] = spd * roadJit[k2] * (k2 ? 1.31f : 1.0f);   // detuned: sides never lock in phase
+            t3[k2] = c.roadMaxMag * 0.7f * texSide[k2] * gSpd * ampJit[k2];                // two effects share the road budget
+        }
+        // A = sharp edge to the left (negative), B = to the right. Default: an impact on the left tyre snaps left.
+        const int sA = c.roadSideInvert ? 1 : 0, sB = 1 - sA;
+        const float tRoadA = t3[sA], tRoadB = t3[sB];
+        { const float hzA = hz[sA == 0 ? S_ROAD : S_ROADR], hzB = hz[sB == 0 ? S_ROAD : S_ROADR];
+          hz[S_ROAD] = hzA; hz[S_ROADR] = hzB; }
 
         // ---------------- BRAKE: front judder, harsh on lock-up
         const float gB = smooth01(2.0f, 8.0f, s.speed);
@@ -692,7 +740,8 @@ struct Synth {
         };
         follow(S_ENG1, t1, 0.35f, 0.15f);
         follow(S_ENG2, t2, 0.25f, 0.12f);
-        follow(S_ROAD, t3, 0.50f, 0.35f);
+        follow(S_ROAD,  tRoadA, 0.55f, 0.40f);
+        follow(S_ROADR, tRoadB, 0.55f, 0.40f);
         follow(S_BRAKE, t4, 0.50f, 0.20f);
 
         float sum = 0;
@@ -840,12 +889,15 @@ private:
             m_testPhase = 1; s.rpm = 3500; s.texture = 0.35f;
         } else if (ph < 10.0) {                           // 2 rough / dirt
             m_testPhase = 2; s.rpm = 4500; s.texture = 0.9f;
+            const bool leftHit = std::fmod(ph - 7.0, 3.0) < 1.5;                      // 1.5 s left-side hits, then 1.5 s right-side
+            s.texL = leftHit ? 0.9f : 0.15f; s.texR = leftHit ? 0.15f : 0.9f;
         } else if (ph < 13.0) {                           // 3 hard braking, lock-up after 1.5 s
             m_testPhase = 3; s.rpm = 3000; s.throttle = 0; s.brake = 1.0f; s.dive = 1.0f; s.frontRev = 15.0f;
             if (ph > 11.5) s.lock = 0.9f;
         } else {                                          // 4 idle
             m_testPhase = 4; s.rpm = 900; s.throttle = 0; s.speed = 0;
         }
+        if (m_testPhase != 2) s.texL = s.texR = s.texture;
     }
 
     // ------------------------------------------------------------ live gain hotkeys
@@ -1032,8 +1084,9 @@ private:
         }
 
         if (ff.Ready()) {                       // settle to zero before the effects are torn down
-            int z[S_COUNT] = {0, 0, 0, 0};
-            DWORD p[S_COUNT] = {20000, 20000, 20000, 20000};
+            int z[S_COUNT] = {};
+            DWORD p[S_COUNT];
+            for (int i = 0; i < S_COUNT; ++i) p[i] = 20000;
             ff.Push(z, p);
             Sleep(30);
         }
@@ -1120,9 +1173,9 @@ public:
         snprintf(buf, sizeof(buf), "live gain %.0f%%%s   thermal derate x%.2f   (Ctrl + Num+ / Num- / Num* in game)",
                  m_userGain.load() * 100.0f, m_muted ? " MUTED" : "", m_dHeat.load());
         line(buf);
-        snprintf(buf, sizeof(buf), "engine %.0f@%.0fHz  lump %.0f@%.0fHz  road %.0f@%.0fHz  brake %.0f@%.0fHz",
+        snprintf(buf, sizeof(buf), "engine %.0f@%.0fHz  lump %.0f@%.0fHz  road L %.0f R %.0f  brake %.0f@%.0fHz",
                  m_mag[S_ENG1].load(), m_hz[S_ENG1].load(), m_mag[S_ENG2].load(), m_hz[S_ENG2].load(),
-                 m_mag[S_ROAD].load(), m_hz[S_ROAD].load(), m_mag[S_BRAKE].load(), m_hz[S_BRAKE].load());
+                 m_mag[S_ROAD].load(), m_mag[S_ROADR].load(), m_mag[S_BRAKE].load(), m_hz[S_BRAKE].load());
         line(buf);
         y += 6.0f;
 
