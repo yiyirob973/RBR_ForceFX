@@ -29,6 +29,8 @@
 //   from the configured ceilings (0..100%), never above them. Keys are configurable in the .ini.
 // SAFETY: hard compile-time ceilings (kHardTotalMax etc.), frequency floor, slow thermal derate,
 //   loopback-only UDP, fade-to-zero on shutdown, exception guard on the worker thread.
+// CAR IDENTITY: by name text (rallysimfans.ini slot -> Cars\Cars.ini CarName / RSFCarID), matched loosely against
+//   the Name= of each section in TrueforceCars.ini.
 // WEIGHT: per-wheel strut load relative to the car's own static load drives road strength (loaded side transmits more),
 //   a compression/landing thump, quiet when airborne, and braking judder. TrueforceCars.ini gives each car index its own
 //   engine character (Preset=boxer4 ...) and WeightFeel.
@@ -51,6 +53,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <set>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -237,11 +240,16 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
 }
 
 // ------------------------------------------------------------ per-car profiles
-// TrueforceCars.ini, one section per NGP Car.Index:  [Car3]  Name=...  Preset=boxer4  Cylinders=4  RpmMax=7800 ...
-// Anything a profile does not set falls back to the [Trueforce] values. Presets give an engine character in one word.
+// The car is identified by its NAME (plain text), the way RSF / RBR store it: rallysimfans.ini [cars] slot selects the
+// active slot, Cars\Cars.ini [Car0<slot>] holds CarName and RSFCarID. TrueforceCars.ini then holds any number of
+// sections, each with Name= (and optionally Match=a,b  RSFCarID=  Index=), plus the settings for that car.
+// Names are compared loosely (case, punctuation, "Grp"/"Group" spelling, missing manufacturer words), see MatchScore.
 struct CarProfile {
     bool found = false;
-    std::string name, preset;
+    std::string section, name, preset;
+    std::vector<std::string> alias;  // extra names that should also match this profile
+    int   rsfId = -1;                // exact RSF car id match (strongest)
+    int   slotIndex = -1;            // legacy: NGP Car.Index, only used when no name could be read
     int   cylinders = 0;             // 0 = keep global
     float rpmMax = 0;                // 0 = keep global / learn
     float engineScale = 1.0f, roadScale = 1.0f;
@@ -260,27 +268,174 @@ const Preset kPresets[] = {
 };
 
 std::string CarsIniPath() { return g_dir + "TrueforceCars.ini"; }
-
 std::string LowerStr(std::string v) { for (char& ch : v) ch = (char)tolower((unsigned char)ch); return v; }
+std::string TrimStr(const std::string& v) {
+    size_t a = 0, b = v.size();
+    while (a < b && isspace((unsigned char)v[a])) ++a;
+    while (b > a && isspace((unsigned char)v[b - 1])) --b;
+    return v.substr(a, b - a);
+}
 
-bool LoadCarProfile(int idx, CarProfile& p) {
-    char sec[32]; snprintf(sec, sizeof(sec), "Car%d", idx);
-    const std::string path = CarsIniPath();
-    char raw[1024];
-    if (GetPrivateProfileSectionA(sec, raw, sizeof(raw), path.c_str()) == 0) return false;
-    p.found = true;
-    char b[128];
-    auto GS = [&](const char* k, std::string& v) { GetPrivateProfileStringA(sec, k, "", b, sizeof(b), path.c_str()); if (b[0]) v = b; };
-    auto GF = [&](const char* k, float& v) { GetPrivateProfileStringA(sec, k, "", b, sizeof(b), path.c_str()); if (b[0]) v = (float)atof(b); };
-    GS("Name", p.name); GS("Preset", p.preset);
-    // preset first, explicit keys override it
-    for (const Preset& pr : kPresets) if (LowerStr(p.preset) == pr.name) {
-        p.cylinders = pr.cyl; p.lumpScale = pr.lump; p.grit = pr.grit; p.unevenness = pr.uneven; p.engineScale = pr.engine;
+// "Ford Escort RS Cosworth GrpA" -> {ford, escort, rs, cosworth, gra}
+std::vector<std::string> NameTokens(const std::string& s) {
+    std::vector<std::string> out; std::string cur;
+    auto flush = [&]() {
+        if (cur.empty()) return;
+        if (cur.rfind("grp", 0) == 0 && cur.size() <= 5) cur = "gr" + cur.substr(3);          // grpa -> gra, grp4 -> gr4
+        else if (cur.rfind("group", 0) == 0 && cur.size() <= 7) cur = "gr" + cur.substr(5);   // groupa -> gra
+        out.push_back(cur); cur.clear();
+    };
+    for (unsigned char ch : s) { if (isalnum(ch)) cur.push_back((char)tolower(ch)); else flush(); }
+    flush();
+    return out;
+}
+
+// Tokens that tell two cars of the same model apart (years, model numbers, roman numerals): they must agree.
+bool IsDiscriminator(const std::string& t) {
+    for (char ch : t) if (isdigit((unsigned char)ch)) return true;
+    static const char* roman[] = { "ii", "iii", "iv", "vi", "vii", "viii", "ix", "x" };
+    for (const char* r : roman) if (t == r) return true;
+    return false;
+}
+
+// Higher = better, -1 = not the same car. Every token of the shorter name must appear in the longer one (so the
+// game's "Escort Cosworth GrA" matches "Ford Escort RS Cosworth GrpA"), and distinguishing tokens must agree.
+float MatchScore(const std::vector<std::string>& a, const std::vector<std::string>& b) {
+    if (a.empty() || b.empty()) return -1.0f;
+    const std::set<std::string> A(a.begin(), a.end()), B(b.begin(), b.end());
+    const std::set<std::string>& small = A.size() <= B.size() ? A : B;
+    const std::set<std::string>& big   = A.size() <= B.size() ? B : A;
+    int inter = 0;
+    for (const std::string& t : small) {
+        if (big.count(t)) ++inter;
+        else if (IsDiscriminator(t)) return -1.0f;
     }
-    GetPrivateProfileStringA(sec, "Cylinders", "", b, sizeof(b), path.c_str()); if (b[0]) p.cylinders = atoi(b);
-    GF("RpmMax", p.rpmMax); GF("EngineScale", p.engineScale); GF("RoadScale", p.roadScale);
-    GF("LumpScale", p.lumpScale); GF("Grit", p.grit); GF("Unevenness", p.unevenness); GF("WeightFeel", p.weightFeel);
-    return true;
+    const float contain = (float)inter / (float)small.size();
+    if (contain < 0.8f) return -1.0f;
+    const float jac = (float)inter / (float)(A.size() + B.size() - inter);
+    return contain + 0.5f * jac;
+}
+
+struct CarDb {
+    std::vector<CarProfile> list;
+    FILETIME stamp{};
+    bool loaded = false;
+
+    void Reload() {                                           // re-reads the file only when it changed
+        const std::string path = CarsIniPath();
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fa)) { list.clear(); loaded = false; return; }
+        if (loaded && CompareFileTime(&fa.ftLastWriteTime, &stamp) == 0) return;
+        stamp = fa.ftLastWriteTime; loaded = true; list.clear();
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) return;
+        std::string text; char chunk[4096]; size_t n;
+        while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) text.append(chunk, n);
+        fclose(f);
+
+        typedef std::vector<std::pair<std::string, std::string> > KV;
+        std::vector<std::pair<std::string, KV> > secs;        // own parser: duplicate section names are allowed
+        size_t pos = 0;
+        while (pos <= text.size()) {
+            size_t e = text.find('\n', pos); if (e == std::string::npos) e = text.size();
+            std::string line = TrimStr(text.substr(pos, e - pos));
+            pos = e + 1;
+            if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+            if (line[0] == '[') { size_t r = line.find(']'); secs.push_back(std::make_pair(TrimStr(line.substr(1, r == std::string::npos ? std::string::npos : r - 1)), KV())); continue; }
+            size_t eq = line.find('=');
+            if (eq == std::string::npos || secs.empty()) continue;
+            std::string v = TrimStr(line.substr(eq + 1));
+            if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+            secs.back().second.push_back(std::make_pair(LowerStr(TrimStr(line.substr(0, eq))), v));
+        }
+        for (auto& sec : secs) {
+            CarProfile p; p.section = sec.first;
+            bool identified = false;
+            for (auto& kv : sec.second) {                       // identity + preset first, so explicit keys can override the preset
+                if (kv.first == "name") { p.name = kv.second; identified = true; }
+                else if (kv.first == "match") {
+                    std::string cur;
+                    for (char ch : kv.second + ",") { if (ch == ',' || ch == '|') { cur = TrimStr(cur); if (!cur.empty()) p.alias.push_back(cur); cur.clear(); } else cur.push_back(ch); }
+                    identified = true;
+                }
+                else if (kv.first == "rsfcarid") { p.rsfId = atoi(kv.second.c_str()); identified = true; }
+                else if (kv.first == "index")    { p.slotIndex = atoi(kv.second.c_str()); identified = true; }
+                else if (kv.first == "preset") {
+                    p.preset = kv.second;
+                    for (const Preset& pr : kPresets) if (LowerStr(kv.second) == pr.name) {
+                        p.cylinders = pr.cyl; p.lumpScale = pr.lump; p.grit = pr.grit; p.unevenness = pr.uneven; p.engineScale = pr.engine;
+                    }
+                }
+            }
+            if (!identified) continue;
+            for (auto& kv : sec.second) {
+                const float fv = (float)atof(kv.second.c_str());
+                if (kv.first == "cylinders") p.cylinders = atoi(kv.second.c_str());
+                else if (kv.first == "rpmmax") p.rpmMax = fv;
+                else if (kv.first == "enginescale") p.engineScale = fv;
+                else if (kv.first == "roadscale") p.roadScale = fv;
+                else if (kv.first == "lumpscale") p.lumpScale = fv;
+                else if (kv.first == "grit") p.grit = fv;
+                else if (kv.first == "unevenness") p.unevenness = fv;
+                else if (kv.first == "weightfeel") p.weightFeel = fv;
+            }
+            p.found = true;
+            list.push_back(p);
+        }
+        Logf("TrueforceCars.ini: %d car profiles", (int)list.size());
+    }
+
+    // 1) exact RSFCarID  2) best name match  3) legacy Index, only when no name could be read
+    const CarProfile* Match(const std::string& name, int rsfId, int index, float& score) const {
+        score = 0;
+        if (rsfId >= 0) for (const CarProfile& p : list) if (p.rsfId == rsfId) { score = 3.0f; return &p; }
+        if (!name.empty()) {
+            const std::vector<std::string> g = NameTokens(name);
+            const CarProfile* best = nullptr; float bs = -1.0f;
+            for (const CarProfile& p : list) {
+                float sc = p.name.empty() ? -1.0f : MatchScore(g, NameTokens(p.name));
+                for (const std::string& al : p.alias) sc = std::max(sc, MatchScore(g, NameTokens(al)));
+                if (sc > bs) { bs = sc; best = &p; }
+            }
+            if (best && bs >= 0) { score = bs; return best; }
+            return nullptr;
+        }
+        if (index >= 0) for (const CarProfile& p : list) if (p.slotIndex == index) { score = 1.0f; return &p; }
+        return nullptr;
+    }
+};
+
+struct CarIdent { std::string name; int rsfId = -1; };
+
+std::string GameDir() {
+    char b[MAX_PATH]; DWORD n = GetModuleFileNameA(NULL, b, MAX_PATH);
+    std::string d(b, n); size_t k = d.find_last_of("\\/");
+    return k == std::string::npos ? std::string() : d.substr(0, k + 1);
+}
+
+// Same sources RSF itself uses (and the SimHub RBR reader): rallysimfans.ini [cars] slot -> Cars\Cars.ini [Car0<slot>].
+// Vanilla/RBRCIT installs have no rallysimfans.ini: the telemetry slot is used, and the name falls back to the car's folder.
+CarIdent ResolveCarIdentity(int telemSlot) {
+    CarIdent id;
+    const std::string gd = GameDir();
+    if (gd.empty()) return id;
+    int slot = (int)GetPrivateProfileIntA("cars", "slot", -1, (gd + "rallysimfans.ini").c_str());
+    if (slot < 0 || slot > 7) slot = telemSlot;
+    if (slot < 0 || slot > 7) return id;
+    char sec[16]; snprintf(sec, sizeof(sec), "Car%02d", slot);
+    const std::string ini = gd + "Cars\\Cars.ini";
+    char b[260];
+    id.rsfId = (int)GetPrivateProfileIntA(sec, "RSFCarID", -1, ini.c_str());
+    GetPrivateProfileStringA(sec, "CarName", "", b, sizeof(b), ini.c_str());
+    id.name = TrimStr(b);
+    if (id.name.empty()) {                                    // fall back to the model file name: ...\Sunny_GTi-R\Sunny_GTi-R.ini
+        GetPrivateProfileStringA(sec, "IniFile", "", b, sizeof(b), ini.c_str());
+        std::string f = b; size_t k = f.find_last_of("\\/"); if (k != std::string::npos) f = f.substr(k + 1);
+        size_t d = f.find_last_of('.'); if (d != std::string::npos) f = f.substr(0, d);
+        for (char& ch : f) if (ch == '_') ch = ' ';
+        id.name = TrimStr(f);
+    }
+    return id;
 }
 
 void ApplyProfile(const Config& base, const CarProfile& p, Config& e) {
@@ -938,6 +1093,7 @@ private:
     std::atomic<int>   m_dCar{-1};
     std::atomic<float> m_dStat{0}, m_dLoadL{1}, m_dLoadR{1}, m_dAir{0};
     std::atomic<bool>  m_stageReset{false};
+    std::atomic<bool>  m_carRescan{false};
     std::string m_carName, m_carPreset;    // guarded by m_mtx
     std::mutex m_mtx;
     std::string m_status;
@@ -1124,8 +1280,11 @@ private:
         Synth synth;
         Signals live, sig;
         Config eff = m_cfg;                    // m_cfg + the active car profile
-        int curCar = -2;
+        CarDb carDb;
         CarProfile prof;
+        int curSlot = -2;                      // telemetry Car.Index
+        std::string curKey;                    // name|rsfId|slot of the car the profile was applied for
+        Clock::time_point carDue{};            // second look at the car identity shortly after a stage starts
         bool dumped = false, prevTest = false;
         double testT0 = 0;
 
@@ -1149,19 +1308,36 @@ private:
                         dsp.thumpL = dsp.thumpR = 0;
                     }
                     ParsePacket(eff, buf.data(), n, live, dsp, pdt);
-                    if (live.carIndex >= 0 && live.carIndex != curCar) {   // new car: load its profile, forget what the last one taught us
-                        curCar = live.carIndex;
-                        prof = CarProfile();
-                        if (m_cfg.carProfiles) LoadCarProfile(curCar, prof);
-                        ApplyProfile(m_cfg, prof, eff);
-                        dsp = Dsp(); synth.rpmPeak = 0;
-                        { std::lock_guard<std::mutex> lk(m_mtx);
-                          m_carName = prof.found ? (prof.name.empty() ? "(unnamed profile)" : prof.name) : "no profile";
-                          m_carPreset = prof.preset; }
-                        m_dCar = curCar;
-                        Logf("Car index %d: %s  preset=%s  cyl=%d rpmMax=%.0f weightFeel=%.2f", curCar,
-                             prof.found ? "profile loaded" : "no profile in TrueforceCars.ini", prof.preset.c_str(),
-                             eff.cylinders, eff.rpmMax, eff.weightFeel);
+                    {   // ---- which car is this? (name text from RSF/RBR Cars.ini, see ResolveCarIdentity)
+                        bool lookNow = false;
+                        if (live.carIndex >= 0 && live.carIndex != curSlot) { curSlot = live.carIndex; lookNow = true; carDue = now + std::chrono::seconds(2); }
+                        if (m_carRescan.exchange(false)) { lookNow = true; carDue = now + std::chrono::seconds(2); }
+                        if (carDue.time_since_epoch().count() != 0 && now >= carDue) { lookNow = true; carDue = Clock::time_point{}; }
+                        if (lookNow && curSlot >= 0) {
+                            const CarIdent id = ResolveCarIdentity(curSlot);
+                            char kb[320]; snprintf(kb, sizeof(kb), "%s|%d|%d", id.name.c_str(), id.rsfId, curSlot);
+                            if (curKey != kb) {                       // a different car: load its profile, forget what the last one taught us
+                                curKey = kb;
+                                prof = CarProfile();
+                                float score = 0;
+                                if (m_cfg.carProfiles) {
+                                    carDb.Reload();
+                                    if (const CarProfile* m = carDb.Match(id.name, id.rsfId, curSlot, score)) prof = *m;
+                                }
+                                ApplyProfile(m_cfg, prof, eff);
+                                dsp = Dsp(); synth.rpmPeak = 0;
+                                char lab[200];
+                                if (prof.found) snprintf(lab, sizeof(lab), "-> %s%s%s (match %.2f)", prof.name.empty() ? prof.section.c_str() : prof.name.c_str(),
+                                                         prof.preset.empty() ? "" : ", ", prof.preset.c_str(), score);
+                                else snprintf(lab, sizeof(lab), "-> no profile in TrueforceCars.ini");
+                                { std::lock_guard<std::mutex> lk(m_mtx);
+                                  m_carName = id.name.empty() ? "(name unknown)" : id.name;
+                                  m_carPreset = lab; }
+                                m_dCar = curSlot;
+                                Logf("Car slot %d, RSFCarID %d, name \"%s\" %s  cyl=%d rpmMax=%.0f weightFeel=%.2f", curSlot, id.rsfId,
+                                     id.name.c_str(), lab, eff.cylinders, eff.rpmMax, eff.weightFeel);
+                            }
+                        }
                     }
                     {
                         std::lock_guard<std::mutex> lk(m_mtx);
@@ -1342,8 +1518,8 @@ public:
                  m_dTex.load(), m_dRough.load(), m_dBump.load(), m_dDive.load(), m_dLock.load());
         line(buf);
         { std::string nm, pr; { std::lock_guard<std::mutex> lk(m_mtx); nm = m_carName; pr = m_carPreset; }
-          snprintf(buf, sizeof(buf), "car %d: %s%s%s   static load %.0f   load L %.2f R %.2f   airborne %.2f",
-                   m_dCar.load(), nm.empty() ? "waiting for telemetry" : nm.c_str(), pr.empty() ? "" : "  preset ", pr.c_str(),
+          snprintf(buf, sizeof(buf), "car slot %d: %s %s   static load %.0f   load L %.2f R %.2f   airborne %.2f",
+                   m_dCar.load(), nm.empty() ? "waiting for telemetry" : nm.c_str(), pr.c_str(),
                    m_dStat.load(), m_dLoadL.load(), m_dLoadR.load(), m_dAir.load());
           line(buf); }
         snprintf(buf, sizeof(buf), "live gain %.0f%%%s   thermal derate x%.2f   (Ctrl + Num+ / Num- / Num* in game)",
@@ -1390,7 +1566,7 @@ public:
     }
 
     void TickFrontEndPage(float) override {}
-    void StageStarted(int, const char*, bool) override { m_stageReset = true; }
+    void StageStarted(int, const char*, bool) override { m_stageReset = true; m_carRescan = true; }
     void HandleResults(float, float, float, const char*) override {}
     void CheckPoint(float, int, const char*) override {}
 };

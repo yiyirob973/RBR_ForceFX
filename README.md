@@ -31,7 +31,7 @@ plugin for RBR with NGP7 that enhances FFB with additional effects
   - compression and landing thump per side (`ThumpGain`), stronger and longer for a heavier car (`WeightFeel`)
   - road and engine go quiet when the wheels leave the ground (`AirborneFade`)
   - braking judder grows with the load on the front tyres
-- **Per-car profiles:** the plugin reads NGP `Car.Index` (offset 56, `OffsetCarIndex`) and looks up `[Car<N>]` in `TrueforceCars.ini`: `Preset` (inline4, inline4turbo, boxer4, inline5, v6, flat6, v8), `Cylinders`, `RpmMax`, `EngineScale`, `RoadScale`, `LumpScale`, `Grit`, `Unevenness`, `WeightFeel`. Switching cars resets the learned rev limit and load.
+- **Per-car profiles, matched by car name:** the plugin reads the car's name text the way RSF does (`rallysimfans.ini` `[cars] slot`, then `Cars\Cars.ini` `[Car0<slot>]` `CarName` / `RSFCarID`; vanilla installs fall back to the telemetry slot and the car's model file name). Each section in `TrueforceCars.ini` with a `Name=` is a profile; names are matched loosely (case, punctuation, `Grp`/`Group`, missing manufacturer words), but years, model numbers and roman numerals must agree. `Match=` adds aliases and `RSFCarID=` gives an exact match. Keys: `Preset` (inline4, inline4turbo, boxer4, inline5, v6, flat6, v8), `Cylinders`, `RpmMax`, `EngineScale`, `RoadScale`, `LumpScale`, `Grit`, `Unevenness`, `WeightFeel`. The file is re-read when it changes; the menu page and `TrueforceRumble.log` show the detected name and the matched profile. A car change (or a new stage) resets the learned rev limit and load.
 
 ## Note
 
