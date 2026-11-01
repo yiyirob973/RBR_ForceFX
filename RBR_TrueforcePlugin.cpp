@@ -1,4 +1,4 @@
-// RBR_TrueforcePlugin.cpp  (v5: safety limits, live gain, directional granular road, weight/load model, per-car profiles)
+// RBR_TrueforcePlugin.cpp  (v5.1: safety limits, live gain, directional granular road, weight/load model, per-car profiles, landing impacts)
 //
 // Layers extra "Trueforce-like" vibration on top of Richard Burns Rally's own force feedback,
 // driven by NGP's UDP telemetry (rbr.telemetry.data.TelemetryData.h, NGP 7.4.778, 664 bytes).
@@ -18,6 +18,8 @@
 //            (high-passed strut force / mean load, as in RbrSurfaceAudio) and damper piston velocity.
 //            Symmetric vibration only: RBR's own steering force is never overridden.
 //            Smooth tarmac = nothing, gravel = grit, rough / dirt / kerbs = violent and sharp.
+//   IMPACT   square burst on landings / hard compressions: instant attack, short decay, symmetric (zero-mean). Own layer with
+//            its own ceiling (ImpactMaxMagnitude); while it plays the other layers duck so the hit is not diluted.
 //   BRAKE    sine: front-end judder under braking, grows with brake pedal and front load transfer (dive);
 //            front wheel lock-up (from the tyre segment counter vs car speed) makes it harsh.
 //
@@ -118,32 +120,34 @@ struct Config {
 
     // per-layer ceilings (DirectInput units 0..10000), a fixed total ceiling, and one live level (userGain)
     int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 3000;
+    int   impactMaxMag = 3500;       // landing / hard-hit layer (it gets priority inside TotalMaxMagnitude)
+    float impactGain = 1.0f;         // landing sensitivity 0..2 (1 = normal, 0 = off)
     int   totalMaxMag = 4000;        // all layers together are scaled down to this (hard ceiling kHardTotalMax)
     float sustainedLimit = 0.10f;    // thermal derate: long-term mean-square level (0.10 ~ 32% RMS-equivalent)
 
     // engine
     float engineMinHz = 14.0f, engineMaxHz = 100.0f;
-    float rpmMax = 0.0f;             // 0 = learn from the data (starts at RpmMaxInit)
+    float rpmMax = 0.0f;             // fallback only: used when the telemetry has no rev limit (0 = learn from the data, starts at RpmMaxInit)
     float rpmMaxInit = 7500.0f;
     float engineGrit = 0.5f;         // 0 = clean sine at high revs, 1 = rough, beating, irregular
 
     // road
-    float roadMinHz = 30.0f, roadMaxHz = 95.0f;
-    float roughLow = 0.08f, roughHigh = 0.60f, roughGamma = 1.4f;   // tyre roughness -> 0..1 level (tarmac below roughLow)
+    float roadMinHz = 25.0f, roadMaxHz = 100.0f;
+    float roughLow = 0.03f, roughHigh = 0.35f, roughGamma = 1.0f;   // tyre roughness -> 0..1 level (tarmac below roughLow)
     float pistonScale = 1.0f;        // RMS damper piston velocity -> 0..1 (absolute hits, kerbs)
-    float bumpScale = 0.1f;          // heave acceleration spike -> 0..1
-    float roadGrain = 0.6f;          // 0 = smooth buzz, 1 = coarse, irregular grain (amplitude + frequency randomness)
+    float bumpScale = 0.25f;         // heave acceleration spike -> 0..1
+    float roadGrain = 0.9f;          // 0 = smooth buzz, 1 = coarse, irregular grain (amplitude + frequency randomness)
     float roadDirectional = 0.7f;    // 0 = both sides identical, 1 = left/right impacts fully separate
     int   roadSideInvert = 0;        // 1 = swap which side pushes which way (wheel/driver polarity differs)
     float maxSpeed = 40.0f;          // m/s that counts as full speed
 
     // weight / suspension load (all relative to the car's own static load, so units never matter)
     float loadInfluence = 0.6f;      // 0 = ignore tyre load, 1 = strongly favour the more heavily loaded side
-    float thumpGain = 0.8f;          // compression / landing thump strength
+    float thumpGain = 1.4f;          // compression / landing thump strength
     float airborneFade = 1.0f;       // 1 = road and engine go quiet when the wheels are off the ground
 
     // per-car character (the values below are the globals; a car profile can override them)
-    float weightFeel = 1.0f;         // >1 heavier: stronger thump, slower decay, lower road pitch
+    float weightFeel = 1.2f;         // >1 heavier: stronger thump, slower decay, lower road pitch
     float lumpScale = 1.0f;          // idle lump / beat strength
     float unevenness = 0.0f;         // uneven firing (boxer, five-cylinder, V8 cross-plane)
     int   carProfiles = 1;           // use TrueforceCars.ini
@@ -155,6 +159,7 @@ struct Config {
 
     // NGP packet offsets (float32 unless noted)
     int   offThrottle = 28, offBrake = 32, offSpeed = 60, offAccHeave = 120, offRpm = 136;
+    int   offRpmMax = -1;            // float32 rev limit / max rpm in the packet (-1 = not in this packet: fall back to profile / learned)
     int   offSuspBase = 152, suspStride = 128, offStrut = 16, offPiston = 28, offSegment = 60;   // segment = uint32
     int   speedIsKph = 0;
     float rpmScale = 1.0f;
@@ -185,6 +190,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     I("UdpPort", c.udpPort);  I("MinPacketBytes", c.minPacket);  I("Cylinders", c.cylinders);
     I("EngineMaxMagnitude", c.engineMaxMag); I("RoadMaxMagnitude", c.roadMaxMag);
     I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
+    I("ImpactMaxMagnitude", c.impactMaxMag); F("ImpactGain", c.impactGain);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
@@ -197,7 +203,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     F("PistonScale", c.pistonScale); F("BumpScale", c.bumpScale); F("MaxSpeed", c.maxSpeed);
     F("TyreCircumference", c.tyreCircumference); F("LockThreshold", c.lockThreshold);
     I("OffsetThrottle", c.offThrottle); I("OffsetBrake", c.offBrake); I("OffsetSpeed", c.offSpeed);
-    I("OffsetAccHeave", c.offAccHeave); I("OffsetRpm", c.offRpm);
+    I("OffsetAccHeave", c.offAccHeave); I("OffsetRpm", c.offRpm); I("OffsetRpmMax", c.offRpmMax);
     I("OffsetSuspBase", c.offSuspBase); I("SuspStride", c.suspStride); I("OffsetStrutForce", c.offStrut);
     I("OffsetPistonVel", c.offPiston); I("OffsetTyreSegment", c.offSegment);
     I("SpeedIsKph", c.speedIsKph); F("RpmScale", c.rpmScale);
@@ -215,6 +221,8 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
         c.engineMaxMag = std::max(0, std::min(c.engineMaxMag, 10000));
         c.roadMaxMag = std::max(0, std::min(c.roadMaxMag, 10000));
         c.brakeMaxMag = std::max(0, std::min(c.brakeMaxMag, 10000));
+        c.impactMaxMag = std::max(0, std::min(c.impactMaxMag, kHardTotalMax));
+        c.impactGain = clampf(c.impactGain, 0.0f, 2.0f);
         c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, kHardTotalMax));
         c.userGain   = clampf(c.userGain,   0.0f, 1.0f);
         c.roadGrain = clampf(c.roadGrain, 0.0f, 1.0f);
@@ -321,14 +329,14 @@ struct CarDb {
     FILETIME stamp{};
     bool loaded = false;
 
-    void Reload() {                                           // re-reads the file only when it changed
+    bool Reload() {                                           // re-reads the file only when it changed; true = it was (re)loaded
         const std::string path = CarsIniPath();
         WIN32_FILE_ATTRIBUTE_DATA fa;
-        if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fa)) { list.clear(); loaded = false; return; }
-        if (loaded && CompareFileTime(&fa.ftLastWriteTime, &stamp) == 0) return;
+        if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fa)) { const bool had = !list.empty(); list.clear(); loaded = false; return had; }
+        if (loaded && CompareFileTime(&fa.ftLastWriteTime, &stamp) == 0) return false;
         stamp = fa.ftLastWriteTime; loaded = true; list.clear();
         FILE* f = fopen(path.c_str(), "rb");
-        if (!f) return;
+        if (!f) { loaded = false; return true; }                // being written right now: try again on the next poll
         std::string text; char chunk[4096]; size_t n;
         while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) text.append(chunk, n);
         fclose(f);
@@ -383,6 +391,7 @@ struct CarDb {
             list.push_back(p);
         }
         Logf("TrueforceCars.ini: %d car profiles", (int)list.size());
+        return true;
     }
 
     // 1) exact RSFCarID  2) best name match  3) legacy Index, only when no name could be read
@@ -658,8 +667,8 @@ BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
     return DIENUM_CONTINUE;
 }
 
-enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD, S_ROADR, S_BRAKE, S_COUNT };   // S_ROAD = sawtooth-up (sharp edge toward negative/left), S_ROADR = sawtooth-down
-const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-A", "road-B", "brake"};
+enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD, S_ROADR, S_BRAKE, S_IMPACT, S_COUNT };   // S_ROAD = sawtooth-up (sharp edge toward negative/left), S_ROADR = sawtooth-down
+const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-A", "road-B", "brake", "impact"};
 
 class FFLayer {
 public:
@@ -678,7 +687,7 @@ public:
         if (axisId == 0xFFFFFFFF) return E_NOTIMPL;      // no force feedback actuator
         m_axisId = axisId;
 
-        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown, &GUID_Sine };
+        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown, &GUID_Sine, &GUID_Square };
         HRESULT firstErr = DI_OK;
         int ok = 0;
         for (int i = 0; i < S_COUNT; ++i) {
@@ -789,6 +798,7 @@ inline bool readF(const uint8_t* b, int len, int off, float& out) {
 
 struct Signals {
     float rpm = 0, speed = 0 /* m/s */, throttle = 0, brake = 0;
+    float rpmMaxTelem = 0;   // rev limit straight from the telemetry (0 = not available)
     float rough = 0;      // raw front-weighted tyre roughness
     float level = 0;      // roughness mapped through low/high/gamma
     float piston = 0;     // damper piston velocity level
@@ -803,6 +813,7 @@ struct Signals {
     float loadL = 1, loadR = 1, loadF = 1;
     float airborne = 0;   // 0 = wheels loaded, 1 = off the ground
     float thumpL = 0, thumpR = 0;   // compression / landing envelope per side
+    float impact = 0;     // landing / hard-hit severity envelope 0..1 (instant attack, decays)
     float staticLoad = 0; // learned static strut load, all four wheels (units of the telemetry)
 };
 
@@ -821,6 +832,9 @@ struct Dsp {
     float bumpEnv = 0, diveSm = 0, lockSm = 0;
     Ema statRef[4], rLsm, rRsm, rFsm;
     float thumpL = 0, thumpR = 0;
+    // landing / impact detector (works on raw, unsmoothed load so the spike is not averaged away)
+    float peakRw = 0, prevPeakRw = 0, totRatio = 1;
+    float airT = 0, landWin = 0, landAir = 0, landPeak = 0, landBump = 0, imRefr = 0, impactEnv = 0;
 };
 
 void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, float dt) {
@@ -829,6 +843,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
     { int ci; if (readIndex(b, n, c.offCarIndex, ci)) s.carIndex = ci; }
     if (readF(b, n, c.offRpm, v))   s.rpm = std::max(0.0f, v * c.rpmScale);
     if (readF(b, n, c.offSpeed, v)) s.speed = std::fabs(v) * (c.speedIsKph ? (1.0f / 3.6f) : 0.44704f);
+    if (readF(b, n, c.offRpmMax, v) && v * c.rpmScale >= 1500.0f && v * c.rpmScale <= 20000.0f) s.rpmMaxTelem = v * c.rpmScale;
     s.throttle = readF(b, n, c.offThrottle, v) ? clamp01(v) : 0.6f;
     s.brake    = readF(b, n, c.offBrake, v)    ? clamp01(v) : 0.0f;
 
@@ -887,6 +902,8 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
             s.loadR = d.rRsm.step(rr2, aR);
             s.loadF = d.rFsm.step(0.5f * (rw[0] + rw[1]), aR);
             s.airborne = s.speed > 3.0f ? 1.0f - smooth01(0.06f, 0.35f, tot / statTot) : 0.0f;
+            d.totRatio = tot / statTot;
+            d.peakRw = std::max(std::max(rw[0], rw[1]), std::max(rw[2], rw[3]));
             const float eDecay = std::exp(-dt / 0.14f);               // compression / landing thump per side
             d.thumpL = std::max(clamp01((rl  - 1.7f) / 1.2f), d.thumpL * eDecay);
             d.thumpR = std::max(clamp01((rr2 - 1.7f) / 1.2f), d.thumpR * eDecay);
@@ -917,6 +934,38 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
         d.bumpEnv = std::max(std::fabs(hp) * c.bumpScale, d.bumpEnv * std::exp(-dt / 0.12f));
     }
     s.bump = clamp01(d.bumpEnv);
+
+    // ---- landings and hard hits. A landing = wheels were off the ground for a moment, then the struts load up again;
+    //      severity comes from the RAW peak strut load (not the smoothed one), the time spent in the air and the heave
+    //      spike. The envelope attacks instantly and decays over ~0.2 s (longer for a heavier car).
+    {
+        d.imRefr = std::max(0.0f, d.imRefr - dt);
+        const bool off = s.speed > 3.0f && d.totRatio < 0.25f;
+        if (off) {
+            d.airT += dt;
+        } else {
+            if (d.airT > 0.10f && d.landWin <= 0.0f) { d.landWin = 0.08f; d.landAir = d.airT; d.landPeak = 0; d.landBump = 0; }
+            d.airT = 0;
+        }
+        if (d.landWin > 0.0f) {                                   // refine the estimate while the suspension compresses
+            d.landPeak = std::max(d.landPeak, d.peakRw);
+            d.landBump = std::max(d.landBump, clamp01(d.bumpEnv));
+            const float peakT = clamp01((d.landPeak - 1.4f) / 1.6f);
+            const float airT2 = clamp01(d.landAir / 0.6f);
+            float sev = clamp01(0.55f * peakT + 0.30f * airT2 + 0.30f * d.landBump);
+            sev = std::max(sev, 0.40f * airT2);                   // anything that left the ground is always felt
+            d.impactEnv = std::max(d.impactEnv, sev);
+            d.landWin -= dt;
+            if (d.landWin <= 0.0f) { d.landWin = 0.0f; d.imRefr = 0.15f; }
+        } else if (!off && d.imRefr <= 0.0f && d.peakRw > 2.4f && d.prevPeakRw < 2.0f) {   // bottoming out / hard drop without airtime
+            d.impactEnv = std::max(d.impactEnv, 0.8f * clamp01((d.peakRw - 2.2f) / 1.3f));
+            d.imRefr = 0.15f;
+        }
+        d.prevPeakRw = d.peakRw;
+        d.impactEnv *= std::exp(-dt / (0.16f * clampf(c.weightFeel, 0.5f, 2.0f)));
+        if (d.impactEnv < 0.005f) d.impactEnv = 0.0f;
+        s.impact = clamp01(d.impactEnv * c.impactGain);
+    }
 
     // ---- braking: front load transfer ("dive") and front wheel lock-up
     const float tot = absSf[0] + absSf[1] + absSf[2] + absSf[3];
@@ -955,7 +1004,8 @@ struct Synth {
 
         // ---------------- ENGINE: gain AND frequency both follow the engine
         rpmPeak = std::max(rpmPeak, s.rpm);
-        const float rmax = c.rpmMax > 0 ? c.rpmMax : std::max(rpmPeak, c.rpmMaxInit);
+        // rev limit: telemetry first, then the car profile / ini, then learned from the highest rpm seen
+        const float rmax = s.rpmMaxTelem > 0 ? s.rpmMaxTelem : (c.rpmMax > 0 ? c.rpmMax : std::max(rpmPeak, c.rpmMaxInit));
         const float x = clamp01(s.rpm / rmax);
         const float fire = s.rpm / 60.0f * c.cylinders * 0.5f;
         const float fireMax = rmax / 60.0f * c.cylinders * 0.5f;
@@ -1033,6 +1083,11 @@ struct Synth {
         hz[S_BRAKE] = s.lock > 0.1f ? clampf(38.0f + 25.0f * rnd(), 25.0f, 70.0f) : clampf(s.frontRev * 2.0f, 12.0f, 60.0f);
         float t4 = c.brakeMaxMag * Ab * gB * clampf(0.65f + 0.35f * s.loadF, 0.5f, 1.3f);   // more load on the fronts = more judder
 
+        // ---------------- IMPACT: landing / hard-hit slap. Square wave, lower pitch for bigger hits and heavier cars.
+        const float imp = clamp01(s.impact);
+        hz[S_IMPACT] = clampf((54.0f - 24.0f * imp) / std::sqrt(wf), 24.0f, 60.0f);
+        const float t5 = std::min((float)c.impactMaxMag, (float)c.totalMaxMag) * std::pow(imp, 0.75f);
+
         // attack / release: road is deliberately fast (sharpness), engine is rounder
         auto follow = [&](int i, float target, float up, float down) {
             sm[i] += (target - sm[i]) * (target > sm[i] ? up : down);
@@ -1043,10 +1098,15 @@ struct Synth {
         follow(S_ROAD,  tRoadA, 0.55f, roadDown);
         follow(S_ROADR, tRoadB, 0.55f, roadDown);
         follow(S_BRAKE, t4, 0.50f, 0.20f);
+        follow(S_IMPACT, t5, 1.00f, 0.50f);                                        // instant attack: a landing must hit, not swell
 
-        float sum = 0;
-        for (int i = 0; i < S_COUNT; ++i) sum += std::fabs(sm[i]);
-        const float scale = sum > c.totalMaxMag ? c.totalMaxMag / sum : 1.0f;
+        // The impact layer has priority inside the total ceiling: the other layers duck to make room for it.
+        const float impM = std::min(std::fabs(sm[S_IMPACT]), (float)c.totalMaxMag);
+        float sumO = 0;
+        for (int i = 0; i < S_COUNT; ++i) if (i != S_IMPACT) sumO += std::fabs(sm[i]);
+        const float room = std::max(0.0f, (float)c.totalMaxMag - impM);
+        const float scale = sumO > room && sumO > 0.0f ? room / sumO : 1.0f;
+        const float sum = sumO * scale + impM;
 
         // Slow thermal derate on the level actually delivered to the wheel (live gain included): turning the
         // live gain down therefore relieves the derate instead of stacking with it.
@@ -1057,7 +1117,7 @@ struct Synth {
 
         const float g = ug * derate;
         for (int i = 0; i < S_COUNT; ++i) {
-            float m = sm[i] * scale * g;
+            float m = (i == S_IMPACT ? impM : sm[i] * scale) * g;
             if (!std::isfinite(m)) { m = 0.0f; sm[i] = 0.0f; }          // never let a NaN latch into the filters
             mag[i] = std::max(0, std::min((int)m, kHardTotalMax));
         }
@@ -1199,8 +1259,11 @@ private:
         } else if (ph < 13.0) {                           // 3 hard braking, lock-up after 1.5 s
             m_testPhase = 3; s.rpm = 3000; s.throttle = 0; s.brake = 1.0f; s.dive = 1.0f; s.frontRev = 15.0f;
             if (ph > 11.5) s.lock = 0.9f;
-        } else {                                          // 4 idle
+        } else {                                          // 4 landing hits: a big one, then a medium one, every 1.5 s
             m_testPhase = 4; s.rpm = 900; s.throttle = 0; s.speed = 0;
+            const double lt = std::fmod(ph - 13.0, 1.5);
+            const float big = std::fmod(ph - 13.0, 3.0) < 1.5 ? 1.0f : 0.5f;
+            s.impact = big * (float)std::exp(-lt / 0.19);
         }
         if (m_testPhase != 2) s.texL = s.texR = s.texture;
     }
@@ -1284,13 +1347,43 @@ private:
         CarProfile prof;
         int curSlot = -2;                      // telemetry Car.Index
         std::string curKey;                    // name|rsfId|slot of the car the profile was applied for
-        Clock::time_point carDue{};            // second look at the car identity shortly after a stage starts
+        Clock::time_point nextCarPoll{};       // identity is polled about once a second, with or without telemetry
+        bool carForce = true;                  // look at the car right away (stage start, telemetry back, slot changed)
         bool dumped = false, prevTest = false;
         double testT0 = 0;
 
         const auto t0 = Clock::now();
         auto lastRx = t0 - std::chrono::seconds(10);
         auto lastPkt = t0, lastApply = t0, nextTry = t0;
+
+        // Which car is this? The name text comes from RSF / RBR (see ResolveCarIdentity). Polled continuously instead of
+        // only on a few events, because the car is changed in the menus, where no telemetry flows, and RSF may write its
+        // files a moment after the stage loads. A changed identity, or an edited TrueforceCars.ini, reloads the profile.
+        auto pollCar = [&]() {
+            const bool reloaded = m_cfg.carProfiles ? carDb.Reload() : false;
+            const CarIdent id = ResolveCarIdentity(curSlot);
+            if (id.name.empty() && id.rsfId < 0 && (curSlot < 0 || !curKey.empty())) return;   // nothing readable right now: keep the current car
+            char kb[320]; snprintf(kb, sizeof(kb), "%s|%d|%d", id.name.c_str(), id.rsfId, curSlot);
+            if (curKey == kb && !reloaded) return;
+            const bool sameCar = (curKey == kb);
+            curKey = kb;
+            prof = CarProfile();
+            float score = 0;
+            if (m_cfg.carProfiles)
+                if (const CarProfile* m = carDb.Match(id.name, id.rsfId, curSlot, score)) prof = *m;
+            ApplyProfile(m_cfg, prof, eff);
+            if (!sameCar) { dsp = Dsp(); synth.rpmPeak = 0; }           // a different car: forget what the last one taught us
+            char lab[200];
+            if (prof.found) snprintf(lab, sizeof(lab), "-> %s%s%s (match %.2f)", prof.name.empty() ? prof.section.c_str() : prof.name.c_str(),
+                                     prof.preset.empty() ? "" : ", ", prof.preset.c_str(), score);
+            else snprintf(lab, sizeof(lab), "-> no profile in TrueforceCars.ini");
+            { std::lock_guard<std::mutex> lk(m_mtx);
+              m_carName = id.name.empty() ? "(name unknown)" : id.name;
+              m_carPreset = lab; }
+            m_dCar = curSlot;
+            Logf("Car slot %d, RSFCarID %d, name \"%s\" %s  cyl=%d rpmMax=%.0f weightFeel=%.2f%s", curSlot, id.rsfId,
+                 id.name.c_str(), lab, eff.cylinders, eff.rpmMax, eff.weightFeel, sameCar ? "  (profiles reloaded)" : "");
+        };
 
         while (m_run) {
             const auto now = Clock::now();
@@ -1303,42 +1396,14 @@ private:
                     got = true;
                     float pdt = std::chrono::duration<float>(now - lastPkt).count();
                     lastPkt = now; lastRx = now;
+                    if (pdt > 1.0f) carForce = true;                   // telemetry is back after a pause: a new stage, maybe a new car
                     if (m_stageReset.exchange(false)) {                 // car is standing at the start line: re-learn static load
                         for (int i = 0; i < 4; ++i) dsp.statRef[i] = Ema();
                         dsp.thumpL = dsp.thumpR = 0;
+                        dsp.impactEnv = 0; dsp.airT = 0; dsp.landWin = 0;
                     }
                     ParsePacket(eff, buf.data(), n, live, dsp, pdt);
-                    {   // ---- which car is this? (name text from RSF/RBR Cars.ini, see ResolveCarIdentity)
-                        bool lookNow = false;
-                        if (live.carIndex >= 0 && live.carIndex != curSlot) { curSlot = live.carIndex; lookNow = true; carDue = now + std::chrono::seconds(2); }
-                        if (m_carRescan.exchange(false)) { lookNow = true; carDue = now + std::chrono::seconds(2); }
-                        if (carDue.time_since_epoch().count() != 0 && now >= carDue) { lookNow = true; carDue = Clock::time_point{}; }
-                        if (lookNow && curSlot >= 0) {
-                            const CarIdent id = ResolveCarIdentity(curSlot);
-                            char kb[320]; snprintf(kb, sizeof(kb), "%s|%d|%d", id.name.c_str(), id.rsfId, curSlot);
-                            if (curKey != kb) {                       // a different car: load its profile, forget what the last one taught us
-                                curKey = kb;
-                                prof = CarProfile();
-                                float score = 0;
-                                if (m_cfg.carProfiles) {
-                                    carDb.Reload();
-                                    if (const CarProfile* m = carDb.Match(id.name, id.rsfId, curSlot, score)) prof = *m;
-                                }
-                                ApplyProfile(m_cfg, prof, eff);
-                                dsp = Dsp(); synth.rpmPeak = 0;
-                                char lab[200];
-                                if (prof.found) snprintf(lab, sizeof(lab), "-> %s%s%s (match %.2f)", prof.name.empty() ? prof.section.c_str() : prof.name.c_str(),
-                                                         prof.preset.empty() ? "" : ", ", prof.preset.c_str(), score);
-                                else snprintf(lab, sizeof(lab), "-> no profile in TrueforceCars.ini");
-                                { std::lock_guard<std::mutex> lk(m_mtx);
-                                  m_carName = id.name.empty() ? "(name unknown)" : id.name;
-                                  m_carPreset = lab; }
-                                m_dCar = curSlot;
-                                Logf("Car slot %d, RSFCarID %d, name \"%s\" %s  cyl=%d rpmMax=%.0f weightFeel=%.2f", curSlot, id.rsfId,
-                                     id.name.c_str(), lab, eff.cylinders, eff.rpmMax, eff.weightFeel);
-                            }
-                        }
-                    }
+                    if (live.carIndex >= 0 && live.carIndex != curSlot) { curSlot = live.carIndex; carForce = true; }
                     {
                         std::lock_guard<std::mutex> lk(m_mtx);
                         m_pktLen = n;
@@ -1348,6 +1413,13 @@ private:
                 }
             } else {
                 Sleep(10);
+            }
+
+            if (m_carRescan.exchange(false)) carForce = true;
+            if (carForce || now >= nextCarPoll) {
+                carForce = false;
+                nextCarPoll = now + std::chrono::milliseconds(1000);
+                pollCar();
             }
 
             const double t = std::chrono::duration<double>(now - t0).count();
@@ -1506,7 +1578,7 @@ public:
         snprintf(buf, sizeof(buf), "Status: %s", st.c_str());
         line(buf);
 
-        static const char* const kPhase[] = {"engine sweep", "gravel", "rough / dirt", "hard braking + lock-up", "idle"};
+        static const char* const kPhase[] = {"engine sweep", "gravel", "rough / dirt", "hard braking + lock-up", "landing hits"};
         snprintf(buf, sizeof(buf), "UDP packets: %lld (port %d)   TEST: %s", (long long)m_packets.load(), m_cfg.udpPort,
                  m_test ? kPhase[std::max(0, std::min(m_testPhase.load(), 4))] : "off");
         line(buf);
@@ -1525,9 +1597,9 @@ public:
         snprintf(buf, sizeof(buf), "live gain %.0f%%%s   thermal derate x%.2f   (Ctrl + Num+ / Num- / Num* in game)",
                  m_userGain.load() * 100.0f, m_muted ? " MUTED" : "", m_dHeat.load());
         line(buf);
-        snprintf(buf, sizeof(buf), "engine %.0f@%.0fHz  lump %.0f@%.0fHz  road L %.0f R %.0f  brake %.0f@%.0fHz",
+        snprintf(buf, sizeof(buf), "engine %.0f@%.0fHz  lump %.0f@%.0fHz  road L %.0f R %.0f  brake %.0f@%.0fHz  impact %.0f",
                  m_mag[S_ENG1].load(), m_hz[S_ENG1].load(), m_mag[S_ENG2].load(), m_hz[S_ENG2].load(),
-                 m_mag[S_ROAD].load(), m_mag[S_ROADR].load(), m_mag[S_BRAKE].load(), m_hz[S_BRAKE].load());
+                 m_mag[S_ROAD].load(), m_mag[S_ROADR].load(), m_mag[S_BRAKE].load(), m_hz[S_BRAKE].load(), m_mag[S_IMPACT].load());
         line(buf);
         y += 6.0f;
 
