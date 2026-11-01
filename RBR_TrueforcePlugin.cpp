@@ -303,14 +303,14 @@ bool IsDiscriminator(const std::string& t) {
 float MatchScore(const std::vector<std::string>& a, const std::vector<std::string>& b) {
     if (a.empty() || b.empty()) return -1.0f;
     const std::set<std::string> A(a.begin(), a.end()), B(b.begin(), b.end());
-    const std::set<std::string>& small = A.size() <= B.size() ? A : B;
-    const std::set<std::string>& big   = A.size() <= B.size() ? B : A;
+    const std::set<std::string>& shortSet = A.size() <= B.size() ? A : B;
+    const std::set<std::string>& longSet   = A.size() <= B.size() ? B : A;
     int inter = 0;
-    for (const std::string& t : small) {
-        if (big.count(t)) ++inter;
+    for (const std::string& t : shortSet) {
+        if (longSet.count(t)) ++inter;
         else if (IsDiscriminator(t)) return -1.0f;
     }
-    const float contain = (float)inter / (float)small.size();
+    const float contain = (float)inter / (float)shortSet.size();
     if (contain < 0.8f) return -1.0f;
     const float jac = (float)inter / (float)(A.size() + B.size() - inter);
     return contain + 0.5f * jac;
@@ -1215,7 +1215,7 @@ private:
     static bool KeyDown(int vk) { return vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0; }
     static void BeepAsync(int hz) { std::thread([hz] { Beep((DWORD)hz, 50); }).detach(); }
 
-    // Called from the worker thread every cycle. Edge-triggered, with a small auto-repeat for held keys.
+    // Called from the worker thread every cycle. Edge-triggered, with a shortSet auto-repeat for held keys.
     void PollHotkeys(Clock::time_point now) {
         static bool up = false, dn = false, mu = false;
         static Clock::time_point nextRepeat{};
