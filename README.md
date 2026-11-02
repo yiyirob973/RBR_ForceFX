@@ -42,3 +42,9 @@ plugin for RBR with NGP7 that enhances FFB with additional effects
 ## Note
 
 This plugin enhances Richard Burns Rally's own force feedback; it never replaces or overrides it. All effects are zero-mean vibrations added to the wheel alongside RBR's steering force, the wheel's gain and autocenter are never touched, and RBR's force is unaffected when the plugin is muted or unloaded.
+
+## v5.2: landings rewritten
+
+- Landing detection no longer needs 0.1 s of full airtime. Severity now combines three cues with `max()` (peak strut load, how fast the total strut load jumped from its recent minimum, airtime + heave spike), so short hops, crest drops and bottoming out register too, and the severity is continuous: a small hop is a tap, a big jump is a full-strength hit.
+- The hit curve is more concave (`^0.6`) and `ImpactMaxMagnitude` default is 5000 (the hard ceiling). The hit may use its own ceiling; the other layers duck to make room.
+- Every detected landing / hit is written to `TrueforceRumble.log` with its severity and the cues behind it. Existing `TrueforceRumble.ini` files keep their old `ImpactMaxMagnitude`; set it to 5000 or delete the file.

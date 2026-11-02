@@ -1,4 +1,4 @@
-// RBR_TrueforcePlugin.cpp  (v5.1: safety limits, live gain, directional granular road, weight/load model, per-car profiles, landing impacts)
+// RBR_TrueforcePlugin.cpp  (v5.2: safety limits, live gain, directional granular road, weight/load model, per-car profiles, landing impacts)
 //
 // Layers extra "Trueforce-like" vibration on top of Richard Burns Rally's own force feedback,
 // driven by NGP's UDP telemetry (rbr.telemetry.data.TelemetryData.h, NGP 7.4.778, 664 bytes).
@@ -120,7 +120,7 @@ struct Config {
 
     // per-layer ceilings (DirectInput units 0..10000), a fixed total ceiling, and one live level (userGain)
     int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 3000;
-    int   impactMaxMag = 3500;       // landing / hard-hit layer (it gets priority inside TotalMaxMagnitude)
+    int   impactMaxMag = 5000;       // landing / hard-hit layer (it gets priority inside TotalMaxMagnitude)
     float impactGain = 1.0f;         // landing sensitivity 0..2 (1 = normal, 0 = off)
     int   totalMaxMag = 4000;        // all layers together are scaled down to this (hard ceiling kHardTotalMax)
     float sustainedLimit = 0.10f;    // thermal derate: long-term mean-square level (0.10 ~ 32% RMS-equivalent)
@@ -834,7 +834,8 @@ struct Dsp {
     float thumpL = 0, thumpR = 0;
     // landing / impact detector (works on raw, unsmoothed load so the spike is not averaged away)
     float peakRw = 0, prevPeakRw = 0, totRatio = 1;
-    float airT = 0, landWin = 0, landAir = 0, landPeak = 0, landBump = 0, imRefr = 0, impactEnv = 0;
+    float airT = 0, landWin = 0, landAir = 0, landPeak = 0, landBump = 0, landJump = 0, imRefr = 0, impactEnv = 0;
+    float totLow = 1.0f;   // running minimum of total strut load (relative): a sudden rise above it = something hit the car
 };
 
 void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, float dt) {
@@ -935,31 +936,55 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
     }
     s.bump = clamp01(d.bumpEnv);
 
-    // ---- landings and hard hits. A landing = wheels were off the ground for a moment, then the struts load up again;
-    //      severity comes from the RAW peak strut load (not the smoothed one), the time spent in the air and the heave
-    //      spike. The envelope attacks instantly and decays over ~0.2 s (longer for a heavier car).
+    // ---- landings and hard hits. Three cues, combined with max() so that ANY strong one gives a full-strength hit:
+    //      peak   raw peak strut load of any wheel (relative to its static load)
+    //      jump   how fast the TOTAL strut load rose from its recent minimum (works with no airtime at all: drops,
+    //             crests, bottoming out)
+    //      air    time the wheels were unloaded before the hit, and the heave acceleration spike
+    //      The severity is continuous (no on/off threshold), so a small hop is a small tap and a big jump is violent.
     {
         d.imRefr = std::max(0.0f, d.imRefr - dt);
-        const bool off = s.speed > 3.0f && d.totRatio < 0.25f;
+        const float rawTot = d.totRatio;
+        d.totLow = std::min(rawTot, d.totLow + (rawTot - d.totLow) * alphaFor(dt, 0.12f));
+        const float jump = std::max(0.0f, rawTot - d.totLow);
+        const bool off = s.speed > 3.0f && rawTot < 0.35f;
+
+        auto severity = [&](float peak, float air, float bump, float jmp) {
+            const float peakT = clamp01((peak - 1.3f) / 1.7f);
+            const float jumpT = clamp01((jmp - 0.35f) / 1.4f);
+            const float airT2 = clamp01(air / 0.5f);
+            const float bumpT = clamp01(bump);
+            const float top = std::max(std::max(peakT, jumpT), std::max(0.85f * airT2, 0.7f * bumpT));
+            const float sum = peakT + jumpT + airT2 + bumpT;
+            float sev = clamp01(top + 0.15f * (sum - top));
+            if (air > 0.05f) sev = std::max(sev, 0.25f + 0.45f * airT2);    // anything that left the ground is always felt
+            return sev;
+        };
+
         if (off) {
             d.airT += dt;
         } else {
-            if (d.airT > 0.10f && d.landWin <= 0.0f) { d.landWin = 0.08f; d.landAir = d.airT; d.landPeak = 0; d.landBump = 0; }
+            if (d.airT > 0.05f && d.landWin <= 0.0f) { d.landWin = 0.10f; d.landAir = d.airT; d.landPeak = 0; d.landBump = 0; d.landJump = 0; }
             d.airT = 0;
         }
         if (d.landWin > 0.0f) {                                   // refine the estimate while the suspension compresses
             d.landPeak = std::max(d.landPeak, d.peakRw);
             d.landBump = std::max(d.landBump, clamp01(d.bumpEnv));
-            const float peakT = clamp01((d.landPeak - 1.4f) / 1.6f);
-            const float airT2 = clamp01(d.landAir / 0.6f);
-            float sev = clamp01(0.55f * peakT + 0.30f * airT2 + 0.30f * d.landBump);
-            sev = std::max(sev, 0.40f * airT2);                   // anything that left the ground is always felt
+            d.landJump = std::max(d.landJump, jump);
+            const float sev = severity(d.landPeak, d.landAir, d.landBump, d.landJump);
             d.impactEnv = std::max(d.impactEnv, sev);
             d.landWin -= dt;
-            if (d.landWin <= 0.0f) { d.landWin = 0.0f; d.imRefr = 0.15f; }
-        } else if (!off && d.imRefr <= 0.0f && d.peakRw > 2.4f && d.prevPeakRw < 2.0f) {   // bottoming out / hard drop without airtime
-            d.impactEnv = std::max(d.impactEnv, 0.8f * clamp01((d.peakRw - 2.2f) / 1.3f));
-            d.imRefr = 0.15f;
+            if (d.landWin <= 0.0f) {
+                d.landWin = 0.0f; d.imRefr = 0.15f;
+                Logf("landing: severity %.2f  (air %.2fs, peak load %.2f, load jump %.2f, heave %.2f)", d.impactEnv, d.landAir, d.landPeak, d.landJump, d.landBump);
+            }
+        } else if (!off && d.imRefr <= 0.0f && jump > 0.35f && d.peakRw > 1.5f) {   // hard hit / bottoming out with no airtime
+            const float sev = severity(d.peakRw, 0.0f, clamp01(d.bumpEnv), jump);
+            if (sev > 0.12f) {
+                d.impactEnv = std::max(d.impactEnv, sev);
+                d.imRefr = 0.15f;
+                Logf("hit: severity %.2f  (peak load %.2f, load jump %.2f, heave %.2f)", sev, d.peakRw, jump, clamp01(d.bumpEnv));
+            }
         }
         d.prevPeakRw = d.peakRw;
         d.impactEnv *= std::exp(-dt / (0.16f * clampf(c.weightFeel, 0.5f, 2.0f)));
@@ -1086,7 +1111,7 @@ struct Synth {
         // ---------------- IMPACT: landing / hard-hit slap. Square wave, lower pitch for bigger hits and heavier cars.
         const float imp = clamp01(s.impact);
         hz[S_IMPACT] = clampf((54.0f - 24.0f * imp) / std::sqrt(wf), 24.0f, 60.0f);
-        const float t5 = std::min((float)c.impactMaxMag, (float)c.totalMaxMag) * std::pow(imp, 0.75f);
+        const float t5 = (float)std::min(c.impactMaxMag, kHardTotalMax) * std::pow(imp, 0.6f);   // concave: small hops still register, big ones saturate
 
         // attack / release: road is deliberately fast (sharpness), engine is rounder
         auto follow = [&](int i, float target, float up, float down) {
@@ -1101,10 +1126,10 @@ struct Synth {
         follow(S_IMPACT, t5, 1.00f, 0.50f);                                        // instant attack: a landing must hit, not swell
 
         // The impact layer has priority inside the total ceiling: the other layers duck to make room for it.
-        const float impM = std::min(std::fabs(sm[S_IMPACT]), (float)c.totalMaxMag);
+        const float impM = std::min(std::fabs(sm[S_IMPACT]), (float)kHardTotalMax);   // the hit may use its own ceiling (<= hard max), not just the shared one
         float sumO = 0;
         for (int i = 0; i < S_COUNT; ++i) if (i != S_IMPACT) sumO += std::fabs(sm[i]);
-        const float room = std::max(0.0f, (float)c.totalMaxMag - impM);
+        const float room = std::max(0.0f, (float)c.totalMaxMag - impM);   // others duck fully when the hit fills the ceiling
         const float scale = sumO > room && sumO > 0.0f ? room / sumO : 1.0f;
         const float sum = sumO * scale + impM;
 
@@ -1400,7 +1425,7 @@ private:
                     if (m_stageReset.exchange(false)) {                 // car is standing at the start line: re-learn static load
                         for (int i = 0; i < 4; ++i) dsp.statRef[i] = Ema();
                         dsp.thumpL = dsp.thumpR = 0;
-                        dsp.impactEnv = 0; dsp.airT = 0; dsp.landWin = 0;
+                        dsp.impactEnv = 0; dsp.airT = 0; dsp.landWin = 0; dsp.totLow = 1.0f;
                     }
                     ParsePacket(eff, buf.data(), n, live, dsp, pdt);
                     if (live.carIndex >= 0 && live.carIndex != curSlot) { curSlot = live.carIndex; carForce = true; }
