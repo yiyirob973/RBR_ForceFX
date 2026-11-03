@@ -1,4 +1,4 @@
-name: Build RBR Trueforce Plugin
+name: Build RBR_ForceFX Plugin
 
 on:
   push:
@@ -22,10 +22,10 @@ jobs:
 
       - name: Compile 32-bit DLL
         run: |
-          cl /O2 /MT /EHsc /LD RBR_TrueforcePlugin.cpp /link /DEF:RbrTrueforce.def dinput8.lib dxguid.lib user32.lib ws2_32.lib /OUT:RBR_TrueforcePlugin.dll
+          cl /O2 /MT /EHsc /LD RBR_ForceFX.cpp /link /DEF:RBR_ForceFX.def dinput8.lib dxguid.lib user32.lib ws2_32.lib /OUT:RBR_ForceFX.dll
 
       - name: Upload Compiled DLL Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: RBR_TrueforcePlugin
-          path: RBR_TrueforcePlugin.dll
+          name: RBR_ForceFX
+          path: RBR_ForceFX.dll

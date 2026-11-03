@@ -1,6 +1,7 @@
-// RBR_TrueforcePlugin.cpp  (v5.2: safety limits, live gain, directional granular road, weight/load model, per-car profiles, landing impacts)
+// RBR_ForceFX.cpp  (v6: renamed from RBR_TrueforcePlugin, in-game settings menu for gains and frequencies.
+//   Earlier: safety limits, live gain, directional granular road, weight/load model, per-car profiles, landing impacts)
 //
-// Layers extra "Trueforce-like" vibration on top of Richard Burns Rally's own force feedback,
+// Layers extra ForceFX vibration on top of Richard Burns Rally's own force feedback,
 // driven by NGP's UDP telemetry (rbr.telemetry.data.TelemetryData.h, NGP 7.4.778, 664 bytes).
 //
 // HOW IT REACHES THE WHEEL
@@ -24,7 +25,7 @@
 //            front wheel lock-up (from the tyre segment counter vs car speed) makes it harsh.
 //
 // BUILD: 32-bit (RBR is x86), static CRT:
-//   cl /std:c++17 /EHsc /LD /MT /O2 RBR_TrueforcePlugin.cpp /Fe:RbrTrueforce.dll /link /DEF:RbrTrueforce.def
+//   cl /std:c++17 /EHsc /LD /MT /O2 RBR_ForceFX.cpp /Fe:RBR_ForceFX.dll /link /DEF:RBR_ForceFX.def
 // NGP: udpTelemetry=1, udpTelemetryEndpoints=127.0.0.1:6776,127.0.0.1:6777,127.0.0.1:6778
 // LIVE GAIN (while driving): Ctrl + Numpad+ / Numpad- change the overall vibration level in equal-loudness steps (x or / 0.85),
 //   Ctrl + Numpad* mutes / unmutes. Only active while RBR is the foreground window. The level can only go DOWN
@@ -32,11 +33,11 @@
 // SAFETY: hard compile-time ceilings (kHardTotalMax etc.), frequency floor, slow thermal derate,
 //   loopback-only UDP, fade-to-zero on shutdown, exception guard on the worker thread.
 // CAR IDENTITY: by name text (rallysimfans.ini slot -> Cars\Cars.ini CarName / RSFCarID), matched loosely against
-//   the Name= of each section in TrueforceCars.ini.
+//   the Name= of each section in ForceFXCars.ini.
 // WEIGHT: per-wheel strut load relative to the car's own static load drives road strength (loaded side transmits more),
-//   a compression/landing thump, quiet when airborne, and braking judder. TrueforceCars.ini gives each car index its own
+//   a compression/landing thump, quiet when airborne, and braking judder. ForceFXCars.ini gives each car index its own
 //   engine character (Preset=boxer4 ...) and WeightFeel.
-// FILES (next to the DLL): TrueforceRumble.ini (shipped defaults; written on first run if missing), TrueforceCars.ini
+// FILES (next to the DLL): ForceFX.ini (shipped defaults; written on first run if missing), ForceFXCars.ini
 //   (per-car profiles), .log, _loaded.txt, _packet.txt
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -108,7 +109,7 @@ void Logf(const char* fmt, ...) {
     va_list ap; va_start(ap, fmt);
     vsnprintf(b, sizeof(b), fmt, ap);
     va_end(ap);
-    FILE* f = fopen((g_dir + "TrueforceRumble.log").c_str(), "a");
+    FILE* f = fopen((g_dir + "ForceFX.log").c_str(), "a");
     if (f) { fprintf(f, "%s\n", b); fclose(f); }
 }
 
@@ -122,6 +123,9 @@ struct Config {
     int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 3000;
     int   impactMaxMag = 5000;       // landing / hard-hit layer (it gets priority inside TotalMaxMagnitude)
     float impactGain = 1.0f;         // landing sensitivity 0..2 (1 = normal, 0 = off)
+    float brakeHzScale = 1.0f;       // brake judder pitch multiplier 0.5..2 (menu)
+    float impactHzScale = 1.0f;      // landing hit pitch multiplier 0.5..2 (menu)
+    float priorityDuck = 0.85f;      // 0..1: how far lower-priority layers fall back while a higher one is active (landing > road > engine)
     int   totalMaxMag = 4000;        // all layers together are scaled down to this (hard ceiling kHardTotalMax)
     float sustainedLimit = 0.10f;    // thermal derate: long-term mean-square level (0.10 ~ 32% RMS-equivalent)
 
@@ -150,7 +154,7 @@ struct Config {
     float weightFeel = 1.2f;         // >1 heavier: stronger thump, slower decay, lower road pitch
     float lumpScale = 1.0f;          // idle lump / beat strength
     float unevenness = 0.0f;         // uneven firing (boxer, five-cylinder, V8 cross-plane)
-    int   carProfiles = 1;           // use TrueforceCars.ini
+    int   carProfiles = 1;           // use ForceFXCars.ini
     int   offCarIndex = 56;          // NGP Car.Index
 
     // braking
@@ -175,8 +179,42 @@ struct Config {
     std::string wheel = "SIMAGIC Alpha EVO Wheelbase";   // default from the shipped ini; the menu overwrites it
 };
 
-void SyncConfig(Config& c, const std::string& path, bool write) {
-    const char* S = "Trueforce";
+// Keeps every value inside its safe range. Used when the ini is read and after every menu edit.
+void ClampConfig(Config& c) {
+    c.cylinders = std::max(1, std::min(c.cylinders, 16));
+    c.engineMaxMag = std::max(0, std::min(c.engineMaxMag, 10000));
+    c.roadMaxMag = std::max(0, std::min(c.roadMaxMag, 10000));
+    c.brakeMaxMag = std::max(0, std::min(c.brakeMaxMag, 10000));
+    c.impactMaxMag = std::max(0, std::min(c.impactMaxMag, kHardTotalMax));
+    c.impactGain = clampf(c.impactGain, 0.0f, 2.0f);
+    c.brakeHzScale = clampf(c.brakeHzScale, 0.5f, 2.0f);
+    c.impactHzScale = clampf(c.impactHzScale, 0.5f, 2.0f);
+    c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
+    c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, kHardTotalMax));
+    c.userGain   = clampf(c.userGain,   0.0f, 1.0f);
+    c.roadGrain = clampf(c.roadGrain, 0.0f, 1.0f);
+    c.roadDirectional = clampf(c.roadDirectional, 0.0f, 1.0f);
+    c.engineGrit = clampf(c.engineGrit, 0.0f, 1.0f);
+    c.loadInfluence = clampf(c.loadInfluence, 0.0f, 1.0f);
+    c.thumpGain = clampf(c.thumpGain, 0.0f, 2.0f);
+    c.airborneFade = clampf(c.airborneFade, 0.0f, 1.0f);
+    c.weightFeel = clampf(c.weightFeel, 0.5f, 2.0f);
+    c.lumpScale = clampf(c.lumpScale, 0.0f, 2.0f);
+    c.unevenness = clampf(c.unevenness, 0.0f, 1.0f);
+    c.gainRatio  = clampf(c.gainRatio, 0.5f, 0.95f);
+    c.sustainedLimit = clampf(c.sustainedLimit, 0.02f, 0.20f);
+    c.engineMinHz = clampf(c.engineMinHz, kHardMinHz, kHardMaxHz);
+    c.engineMaxHz = clampf(c.engineMaxHz, kHardMinHz, kHardMaxHz);
+    c.roadMinHz = clampf(c.roadMinHz, 20.0f, 150.0f);
+    c.roadMaxHz = clampf(c.roadMaxHz, c.roadMinHz + 5.0f, 150.0f);
+    if (c.engineMaxHz < c.engineMinHz + 5.0f) { c.engineMaxHz = std::min(c.engineMinHz + 5.0f, kHardMaxHz); c.engineMinHz = c.engineMaxHz - 5.0f; }
+    if (c.roughHigh < c.roughLow + 0.05f) c.roughHigh = c.roughLow + 0.05f;
+    if (c.maxSpeed < 1.0f) c.maxSpeed = 1.0f;
+    if (c.tyreCircumference < 0.5f) c.tyreCircumference = 1.95f;
+}
+
+void SyncConfig(Config& c, const std::string& path, bool write, const char* section = "ForceFX") {
+    const char* S = section;
     auto F = [&](const char* k, float& v) {
         char b[64];
         if (write) { snprintf(b, sizeof(b), "%g", v); WritePrivateProfileStringA(S, k, b, path.c_str()); }
@@ -191,6 +229,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     I("EngineMaxMagnitude", c.engineMaxMag); I("RoadMaxMagnitude", c.roadMaxMag);
     I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
     I("ImpactMaxMagnitude", c.impactMaxMag); F("ImpactGain", c.impactGain);
+    F("BrakeHzScale", c.brakeHzScale); F("ImpactHzScale", c.impactHzScale); F("PriorityDuck", c.priorityDuck);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
@@ -216,40 +255,12 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     if (write) WritePrivateProfileStringA(S, "Wheel", c.wheel.c_str(), path.c_str());
     else { GetPrivateProfileStringA(S, "Wheel", "", b, sizeof(b), path.c_str()); c.wheel = b; }
 
-    if (!write) {
-        c.cylinders = std::max(1, std::min(c.cylinders, 16));
-        c.engineMaxMag = std::max(0, std::min(c.engineMaxMag, 10000));
-        c.roadMaxMag = std::max(0, std::min(c.roadMaxMag, 10000));
-        c.brakeMaxMag = std::max(0, std::min(c.brakeMaxMag, 10000));
-        c.impactMaxMag = std::max(0, std::min(c.impactMaxMag, kHardTotalMax));
-        c.impactGain = clampf(c.impactGain, 0.0f, 2.0f);
-        c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, kHardTotalMax));
-        c.userGain   = clampf(c.userGain,   0.0f, 1.0f);
-        c.roadGrain = clampf(c.roadGrain, 0.0f, 1.0f);
-        c.roadDirectional = clampf(c.roadDirectional, 0.0f, 1.0f);
-        c.engineGrit = clampf(c.engineGrit, 0.0f, 1.0f);
-        c.loadInfluence = clampf(c.loadInfluence, 0.0f, 1.0f);
-        c.thumpGain = clampf(c.thumpGain, 0.0f, 2.0f);
-        c.airborneFade = clampf(c.airborneFade, 0.0f, 1.0f);
-        c.weightFeel = clampf(c.weightFeel, 0.5f, 2.0f);
-        c.lumpScale = clampf(c.lumpScale, 0.0f, 2.0f);
-        c.unevenness = clampf(c.unevenness, 0.0f, 1.0f);
-        c.gainRatio  = clampf(c.gainRatio, 0.5f, 0.95f);
-        c.sustainedLimit = clampf(c.sustainedLimit, 0.02f, 0.20f);
-        c.engineMinHz = clampf(c.engineMinHz, kHardMinHz, kHardMaxHz);
-        c.engineMaxHz = clampf(c.engineMaxHz, kHardMinHz, kHardMaxHz);
-        c.roadMinHz = clampf(c.roadMinHz, 20.0f, 150.0f);
-        c.roadMaxHz = clampf(c.roadMaxHz, c.roadMinHz + 5.0f, 150.0f);
-        if (c.engineMaxHz < c.engineMinHz + 5.0f) c.engineMaxHz = c.engineMinHz + 5.0f;
-        if (c.roughHigh < c.roughLow + 0.05f) c.roughHigh = c.roughLow + 0.05f;
-        if (c.maxSpeed < 1.0f) c.maxSpeed = 1.0f;
-        if (c.tyreCircumference < 0.5f) c.tyreCircumference = 1.95f;
-    }
+    if (!write) ClampConfig(c);
 }
 
 // ------------------------------------------------------------ per-car profiles
 // The car is identified by its NAME (plain text), the way RSF / RBR store it: rallysimfans.ini [cars] slot selects the
-// active slot, Cars\Cars.ini [Car0<slot>] holds CarName and RSFCarID. TrueforceCars.ini then holds any number of
+// active slot, Cars\Cars.ini [Car0<slot>] holds CarName and RSFCarID. ForceFXCars.ini then holds any number of
 // sections, each with Name= (and optionally Match=a,b  RSFCarID=  Index=), plus the settings for that car.
 // Names are compared loosely (case, punctuation, "Grp"/"Group" spelling, missing manufacturer words), see MatchScore.
 struct CarProfile {
@@ -275,7 +286,7 @@ const Preset kPresets[] = {
     { "v8",           8, 0.70f, 0.30f, 0.25f, 1.00f },
 };
 
-std::string CarsIniPath() { return g_dir + "TrueforceCars.ini"; }
+std::string CarsIniPath() { return g_dir + "ForceFXCars.ini"; }
 std::string LowerStr(std::string v) { for (char& ch : v) ch = (char)tolower((unsigned char)ch); return v; }
 std::string TrimStr(const std::string& v) {
     size_t a = 0, b = v.size();
@@ -390,7 +401,7 @@ struct CarDb {
             p.found = true;
             list.push_back(p);
         }
-        Logf("TrueforceCars.ini: %d car profiles", (int)list.size());
+        Logf("ForceFXCars.ini: %d car profiles", (int)list.size());
         return true;
     }
 
@@ -947,24 +958,24 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
         const float rawTot = d.totRatio;
         d.totLow = std::min(rawTot, d.totLow + (rawTot - d.totLow) * alphaFor(dt, 0.12f));
         const float jump = std::max(0.0f, rawTot - d.totLow);
-        const bool off = s.speed > 3.0f && rawTot < 0.35f;
+        const bool off = s.speed > 3.0f && rawTot < 0.45f;
 
         auto severity = [&](float peak, float air, float bump, float jmp) {
-            const float peakT = clamp01((peak - 1.3f) / 1.7f);
-            const float jumpT = clamp01((jmp - 0.35f) / 1.4f);
+            const float peakT = clamp01((peak - 1.15f) / 1.3f);
+            const float jumpT = clamp01((jmp - 0.25f) / 1.0f);
             const float airT2 = clamp01(air / 0.5f);
             const float bumpT = clamp01(bump);
             const float top = std::max(std::max(peakT, jumpT), std::max(0.85f * airT2, 0.7f * bumpT));
             const float sum = peakT + jumpT + airT2 + bumpT;
             float sev = clamp01(top + 0.15f * (sum - top));
-            if (air > 0.05f) sev = std::max(sev, 0.25f + 0.45f * airT2);    // anything that left the ground is always felt
+            if (air > 0.04f) sev = std::max(sev, 0.40f + 0.50f * airT2);    // anything that left the ground is always felt
             return sev;
         };
 
         if (off) {
             d.airT += dt;
         } else {
-            if (d.airT > 0.05f && d.landWin <= 0.0f) { d.landWin = 0.10f; d.landAir = d.airT; d.landPeak = 0; d.landBump = 0; d.landJump = 0; }
+            if (d.airT > 0.04f && d.landWin <= 0.0f) { d.landWin = 0.10f; d.landAir = d.airT; d.landPeak = 0; d.landBump = 0; d.landJump = 0; }
             d.airT = 0;
         }
         if (d.landWin > 0.0f) {                                   // refine the estimate while the suspension compresses
@@ -978,7 +989,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
                 d.landWin = 0.0f; d.imRefr = 0.15f;
                 Logf("landing: severity %.2f  (air %.2fs, peak load %.2f, load jump %.2f, heave %.2f)", d.impactEnv, d.landAir, d.landPeak, d.landJump, d.landBump);
             }
-        } else if (!off && d.imRefr <= 0.0f && jump > 0.35f && d.peakRw > 1.5f) {   // hard hit / bottoming out with no airtime
+        } else if (!off && d.imRefr <= 0.0f && jump > 0.25f && d.peakRw > 1.3f) {   // hard hit / bottoming out with no airtime
             const float sev = severity(d.peakRw, 0.0f, clamp01(d.bumpEnv), jump);
             if (sev > 0.12f) {
                 d.impactEnv = std::max(d.impactEnv, sev);
@@ -987,7 +998,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
             }
         }
         d.prevPeakRw = d.peakRw;
-        d.impactEnv *= std::exp(-dt / (0.16f * clampf(c.weightFeel, 0.5f, 2.0f)));
+        d.impactEnv *= std::exp(-dt / (0.32f * clampf(c.weightFeel, 0.5f, 2.0f)));
         if (d.impactEnv < 0.005f) d.impactEnv = 0.0f;
         s.impact = clamp01(d.impactEnv * c.impactGain);
     }
@@ -1106,12 +1117,13 @@ struct Synth {
         const float gB = smooth01(2.0f, 8.0f, s.speed);
         const float Ab = clamp01(std::pow(s.brake, 1.2f) * (0.3f + 0.7f * s.dive) * 0.6f + s.lock);
         hz[S_BRAKE] = s.lock > 0.1f ? clampf(38.0f + 25.0f * rnd(), 25.0f, 70.0f) : clampf(s.frontRev * 2.0f, 12.0f, 60.0f);
+        hz[S_BRAKE] *= c.brakeHzScale;
         float t4 = c.brakeMaxMag * Ab * gB * clampf(0.65f + 0.35f * s.loadF, 0.5f, 1.3f);   // more load on the fronts = more judder
 
         // ---------------- IMPACT: landing / hard-hit slap. Square wave, lower pitch for bigger hits and heavier cars.
         const float imp = clamp01(s.impact);
-        hz[S_IMPACT] = clampf((54.0f - 24.0f * imp) / std::sqrt(wf), 24.0f, 60.0f);
-        const float t5 = (float)std::min(c.impactMaxMag, kHardTotalMax) * std::pow(imp, 0.6f);   // concave: small hops still register, big ones saturate
+        hz[S_IMPACT] = clampf((74.0f - 26.0f * imp) / std::sqrt(wf), 34.0f, 80.0f) * (1.0f + 0.15f * rnd()) * c.impactHzScale;   // lock-up-like pitch and grit: low pitch alone is weak on most wheels
+        const float t5 = imp > 0.0f ? (float)std::min(c.impactMaxMag, kHardTotalMax) * (0.4f + 0.6f * std::pow(imp, 0.5f)) : 0.0f;   // concave: small hops still register, big ones saturate
 
         // attack / release: road is deliberately fast (sharpness), engine is rounder
         auto follow = [&](int i, float target, float up, float down) {
@@ -1127,8 +1139,18 @@ struct Synth {
 
         // The impact layer has priority inside the total ceiling: the other layers duck to make room for it.
         const float impM = std::min(std::fabs(sm[S_IMPACT]), (float)kHardTotalMax);   // the hit may use its own ceiling (<= hard max), not just the shared one
+        // Priority: landing (highest) > road > engine (lowest). A lower layer falls back while a higher one is active,
+        // so the strongest cue is the one you actually feel. Brake is only pushed back by a landing.
+        const float pI = c.impactMaxMag > 0 ? clamp01(impM / (float)c.impactMaxMag) : 0.0f;
+        const float pR = c.roadMaxMag > 0 ? clamp01(std::max(std::fabs(sm[S_ROAD]), std::fabs(sm[S_ROADR])) / (float)c.roadMaxMag) : 0.0f;
+        const float dk = clampf(c.priorityDuck, 0.0f, 1.0f);
+        float duck[S_COUNT];
+        duck[S_IMPACT] = 1.0f;
+        duck[S_ROAD] = duck[S_ROADR] = 1.0f - dk * pI;
+        duck[S_ENG1] = duck[S_ENG2] = (1.0f - dk * pI) * (1.0f - dk * pR);
+        duck[S_BRAKE] = 1.0f - 0.6f * dk * pI;
         float sumO = 0;
-        for (int i = 0; i < S_COUNT; ++i) if (i != S_IMPACT) sumO += std::fabs(sm[i]);
+        for (int i = 0; i < S_COUNT; ++i) if (i != S_IMPACT) sumO += std::fabs(sm[i]) * duck[i];
         const float room = std::max(0.0f, (float)c.totalMaxMag - impM);   // others duck fully when the hit fills the ceiling
         const float scale = sumO > room && sumO > 0.0f ? room / sumO : 1.0f;
         const float sum = sumO * scale + impM;
@@ -1142,7 +1164,7 @@ struct Synth {
 
         const float g = ug * derate;
         for (int i = 0; i < S_COUNT; ++i) {
-            float m = (i == S_IMPACT ? impM : sm[i] * scale) * g;
+            float m = (i == S_IMPACT ? impM : sm[i] * duck[i] * scale) * g;
             if (!std::isfinite(m)) { m = 0.0f; sm[i] = 0.0f; }          // never let a NaN latch into the filters
             mag[i] = std::max(0, std::min((int)m, kHardTotalMax));
         }
@@ -1152,7 +1174,7 @@ struct Synth {
 // ----------------------------------------------------------------- plugin
 struct DeviceInfo { GUID guid; char name[MAX_PATH]; };
 
-class TrueforcePlugin : public IPlugin {
+class ForceFXPlugin : public IPlugin {
 private:
     IRBRGame* game_;
     LPDIRECTINPUT8A m_pDI = nullptr;
@@ -1176,6 +1198,7 @@ private:
     std::atomic<bool>  m_muted{false};
     std::atomic<float> m_dHeat{1.0f};      // shown in the menu: 1 = no derate
     std::atomic<int>   m_dCar{-1};
+    std::atomic<int>   m_cfgRev{0};         // bumped by the menu whenever m_cfg changes
     std::atomic<float> m_dStat{0}, m_dLoadL{1}, m_dLoadR{1}, m_dAir{0};
     std::atomic<bool>  m_stageReset{false};
     std::atomic<bool>  m_carRescan{false};
@@ -1197,7 +1220,7 @@ private:
 
     // ------------------------------------------------------------ devices
     static BOOL CALLBACK EnumCb(LPCDIDEVICEINSTANCEA di, LPVOID ref) {
-        auto* self = static_cast<TrueforcePlugin*>(ref);
+        auto* self = static_cast<ForceFXPlugin*>(ref);
         DeviceInfo info{};
         info.guid = di->guidInstance;
         lstrcpynA(info.name, di->tszProductName, MAX_PATH);
@@ -1232,7 +1255,7 @@ private:
 
         const DeviceInfo& dev = m_devices[m_sel];
         m_cfg.wheel = dev.name;
-        WritePrivateProfileStringA("Trueforce", "Wheel", dev.name, m_iniPath.c_str());
+        WritePrivateProfileStringA("ForceFX", "Wheel", dev.name, m_iniPath.c_str());
 
         if (!GameDeviceTap::I().Install(m_pDI, dev.guid)) {
             SetStatus("Could not hook DirectInput (see log)");
@@ -1243,7 +1266,7 @@ private:
         m_packets = 0;
         m_pktLen = 0;
         m_run = true;
-        m_thread = std::thread(&TrueforcePlugin::Loop, this);
+        m_thread = std::thread(&ForceFXPlugin::Loop, this);
         SetStatus("Waiting for RBR to use %s ...", dev.name);
     }
 
@@ -1257,7 +1280,7 @@ private:
     }
 
     void DumpPacket(const uint8_t* b, int n) {
-        FILE* f = fopen((g_dir + "TrueforceRumble_packet.txt").c_str(), "w");
+        FILE* f = fopen((g_dir + "ForceFX_packet.txt").c_str(), "w");
         if (!f) return;
         fprintf(f, "packet length = %d bytes\noffset  float32          raw hex     raw uint32\n", n);
         for (int i = 0; i + 4 <= n; i += 4) {
@@ -1304,14 +1327,14 @@ private:
     static void BeepAsync(int hz) { std::thread([hz] { Beep((DWORD)hz, 50); }).detach(); }
 
     // Called from the worker thread every cycle. Edge-triggered, with a shortSet auto-repeat for held keys.
-    void PollHotkeys(Clock::time_point now) {
+    void PollHotkeys(Clock::time_point now, const Config& cf) {
         static bool up = false, dn = false, mu = false;
         static Clock::time_point nextRepeat{};
-        if (!RbrHasFocus() || (m_cfg.keyModifier && !KeyDown(m_cfg.keyModifier))) { up = dn = mu = false; return; }
-        const bool bu = KeyDown(m_cfg.keyGainUp), bd = KeyDown(m_cfg.keyGainDown), bm = KeyDown(m_cfg.keyMute);
+        if (!RbrHasFocus() || (cf.keyModifier && !KeyDown(cf.keyModifier))) { up = dn = mu = false; return; }
+        const bool bu = KeyDown(cf.keyGainUp), bd = KeyDown(cf.keyGainDown), bm = KeyDown(cf.keyMute);
         bool changed = false;
         float g = m_userGain.load();
-        const float r = m_cfg.gainRatio;
+        const float r = cf.gainRatio;
         if (bu && (!up || now >= nextRepeat)) { g = g < 0.02f ? 0.05f : g / r; changed = true; }
         if (bd && (!dn || now >= nextRepeat)) { g = g * r; if (g < 0.03f) g = 0.0f; changed = true; }
         if (changed) {
@@ -1321,13 +1344,13 @@ private:
             m_userGain = g;
             m_muted = false;
             char b[32]; snprintf(b, sizeof(b), "%g", g);
-            WritePrivateProfileStringA("Trueforce", "UserGain", b, m_iniPath.c_str());
-            if (m_cfg.gainBeep) BeepAsync(300 + (int)(g * 900.0f));          // pitch tells you the level
+            WritePrivateProfileStringA("ForceFX", "UserGain", b, m_iniPath.c_str());
+            if (cf.gainBeep) BeepAsync(300 + (int)(g * 900.0f));          // pitch tells you the level
             Logf("Live gain -> %.0f%%", g * 100.0f);
         }
         if (bm && !mu) {
             m_muted = !m_muted;
-            if (m_cfg.gainBeep) BeepAsync(m_muted ? 200 : 700);
+            if (cf.gainBeep) BeepAsync(m_muted ? 200 : 700);
             Logf("Vibration %s", m_muted ? "MUTED" : "unmuted");
         }
         up = bu; dn = bd; mu = bm;
@@ -1340,6 +1363,9 @@ private:
     }
 
     void LoopImpl() {
+        Config base;                           // private copy of m_cfg: the menu edits m_cfg on the UI thread
+        { std::lock_guard<std::mutex> lk(m_mtx); base = m_cfg; }
+        int seenRev = m_cfgRev.load();
         WSADATA wsa;
         bool wsaOk = WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
         SOCKET sock = INVALID_SOCKET;
@@ -1348,10 +1374,10 @@ private:
             if (sock != INVALID_SOCKET) {
                 sockaddr_in a{};
                 a.sin_family = AF_INET;
-                a.sin_port = htons((u_short)m_cfg.udpPort);
+                a.sin_port = htons((u_short)base.udpPort);
                 a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // telemetry is local only
                 if (bind(sock, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
-                    Logf("UDP bind to port %d failed (WSA %d). Another app on that port?", m_cfg.udpPort, WSAGetLastError());
+                    Logf("UDP bind to port %d failed (WSA %d). Another app on that port?", base.udpPort, WSAGetLastError());
                     closesocket(sock); sock = INVALID_SOCKET;
                 } else {
                     DWORD to = 20;
@@ -1367,7 +1393,7 @@ private:
         Dsp dsp;
         Synth synth;
         Signals live, sig;
-        Config eff = m_cfg;                    // m_cfg + the active car profile
+        Config eff = base;                     // base + the active car profile
         CarDb carDb;
         CarProfile prof;
         int curSlot = -2;                      // telemetry Car.Index
@@ -1383,9 +1409,9 @@ private:
 
         // Which car is this? The name text comes from RSF / RBR (see ResolveCarIdentity). Polled continuously instead of
         // only on a few events, because the car is changed in the menus, where no telemetry flows, and RSF may write its
-        // files a moment after the stage loads. A changed identity, or an edited TrueforceCars.ini, reloads the profile.
+        // files a moment after the stage loads. A changed identity, or an edited ForceFXCars.ini, reloads the profile.
         auto pollCar = [&]() {
-            const bool reloaded = m_cfg.carProfiles ? carDb.Reload() : false;
+            const bool reloaded = base.carProfiles ? carDb.Reload() : false;
             const CarIdent id = ResolveCarIdentity(curSlot);
             if (id.name.empty() && id.rsfId < 0 && (curSlot < 0 || !curKey.empty())) return;   // nothing readable right now: keep the current car
             char kb[320]; snprintf(kb, sizeof(kb), "%s|%d|%d", id.name.c_str(), id.rsfId, curSlot);
@@ -1394,14 +1420,14 @@ private:
             curKey = kb;
             prof = CarProfile();
             float score = 0;
-            if (m_cfg.carProfiles)
+            if (base.carProfiles)
                 if (const CarProfile* m = carDb.Match(id.name, id.rsfId, curSlot, score)) prof = *m;
-            ApplyProfile(m_cfg, prof, eff);
+            ApplyProfile(base, prof, eff);
             if (!sameCar) { dsp = Dsp(); synth.rpmPeak = 0; }           // a different car: forget what the last one taught us
             char lab[200];
             if (prof.found) snprintf(lab, sizeof(lab), "-> %s%s%s (match %.2f)", prof.name.empty() ? prof.section.c_str() : prof.name.c_str(),
                                      prof.preset.empty() ? "" : ", ", prof.preset.c_str(), score);
-            else snprintf(lab, sizeof(lab), "-> no profile in TrueforceCars.ini");
+            else snprintf(lab, sizeof(lab), "-> no profile in ForceFXCars.ini");
             { std::lock_guard<std::mutex> lk(m_mtx);
               m_carName = id.name.empty() ? "(name unknown)" : id.name;
               m_carPreset = lab; }
@@ -1416,7 +1442,7 @@ private:
 
             if (haveSock) {
                 int n = recvfrom(sock, (char*)buf.data(), (int)buf.size(), 0, nullptr, nullptr);
-                if (n >= m_cfg.minPacket) {
+                if (n >= base.minPacket) {
                     m_packets++;
                     got = true;
                     float pdt = std::chrono::duration<float>(now - lastPkt).count();
@@ -1440,6 +1466,11 @@ private:
                 Sleep(10);
             }
 
+            if (m_cfgRev.load() != seenRev) {                  // the menu changed a gain or frequency: pick it up now
+                seenRev = m_cfgRev.load();
+                { std::lock_guard<std::mutex> lk(m_mtx); base = m_cfg; }
+                ApplyProfile(base, prof, eff);
+            }
             if (m_carRescan.exchange(false)) carForce = true;
             if (carForce || now >= nextCarPoll) {
                 carForce = false;
@@ -1466,7 +1497,7 @@ private:
             m_dDive = sig.dive; m_dLock = sig.lock;
             m_dStat = sig.staticLoad; m_dLoadL = sig.loadL; m_dLoadR = sig.loadR; m_dAir = sig.airborne;
 
-            PollHotkeys(now);
+            PollHotkeys(now, base);
             const bool testNow = m_test.load();
             if (testNow && !prevTest) testT0 = t;
             prevTest = testNow;
@@ -1476,7 +1507,7 @@ private:
 
             int mag[S_COUNT]; float hz[S_COUNT];
             synth.Run(eff, sig, t, dt, live_gain, mag, hz);
-            m_dHeat = synth.heat > m_cfg.sustainedLimit ? std::sqrt(m_cfg.sustainedLimit / synth.heat) : 1.0f;
+            m_dHeat = synth.heat > base.sustainedLimit ? std::sqrt(base.sustainedLimit / synth.heat) : 1.0f;
             DWORD per[S_COUNT];
             for (int i = 0; i < S_COUNT; ++i) {
                 hz[i] = std::isfinite(hz[i]) ? clampf(hz[i], kHardMinHz, kHardMaxHz) : kHardMinHz;
@@ -1539,99 +1570,124 @@ private:
         if (wsaOk) WSACleanup();
     }
 
-public:
-    explicit TrueforcePlugin(IRBRGame* game) : game_(game) {
-        g_dir = pluginDirectory();
-        m_iniPath = g_dir + "TrueforceRumble.ini";
-        std::memset(m_pkt, 0, sizeof(m_pkt));
-        for (int i = 0; i < S_COUNT; ++i) { m_mag[i] = 0; m_hz[i] = 0; }
-        bool exists = GetFileAttributesA(m_iniPath.c_str()) != INVALID_FILE_ATTRIBUTES;
-        if (!exists) SyncConfig(m_cfg, m_iniPath, true);     // write a template with every key
-        SyncConfig(m_cfg, m_iniPath, false);
-        m_userGain = m_cfg.userGain;
+    // ------------------------------------------------------------ in-game settings menu (UI thread only)
+    // One row per adjustable value. Edits go to m_cfg under the mutex, the worker thread picks them up through
+    // m_cfgRev (so the wheel changes immediately, also in TEST mode), and the changed keys are written to ForceFX.ini.
+    // Every edit passes through ClampConfig(), so the menu can never leave the safe ranges (hard ceilings included).
+    struct MenuRow {
+        const char* label; const char* key;
+        int Config::* ip; float Config::* fp;     // exactly one of the two is set
+        float lo, hi, step;
+        char fmt;                                 // 'g' magnitude, '%' percent, 'H' Hz, 'x' multiplier
+        bool live;                                // the live level: mirrored into m_userGain
+    };
+    std::vector<MenuRow> m_rows;
+    int  m_cursor = 0, m_top = 0, m_view = 0;     // m_view 0 = settings, 1 = raw packet diagnostics
+    bool m_resetArmed = false;
 
-        SetStatus("Pick the wheel with Left/Right, press Select");
-        EnumerateDevices();
+    void BuildRows() {
+        const float M = (float)kHardTotalMax;
+        m_rows = {
+            // gains
+            {"Live level (Ctrl+Num+/- in game)", "UserGain",           nullptr, &Config::userGain,      0.0f,  1.0f, 0.05f, '%', true },
+            {"Total ceiling",                    "TotalMaxMagnitude",  &Config::totalMaxMag, nullptr,   500.0f, M,    100.0f, 'g', false},
+            {"Engine gain",                      "EngineMaxMagnitude", &Config::engineMaxMag, nullptr,  0.0f,   M,    100.0f, 'g', false},
+            {"Road gain",                        "RoadMaxMagnitude",   &Config::roadMaxMag,   nullptr,  0.0f,   M,    100.0f, 'g', false},
+            {"Brake gain",                       "BrakeMaxMagnitude",  &Config::brakeMaxMag,  nullptr,  0.0f,   M,    100.0f, 'g', false},
+            {"Landing gain (ceiling)",           "ImpactMaxMagnitude", &Config::impactMaxMag, nullptr,  0.0f,   M,    100.0f, 'g', false},
+            {"Landing sensitivity",              "ImpactGain",         nullptr, &Config::impactGain,    0.0f,  2.0f, 0.05f, 'x', false},
+            {"Landing thump (road)",             "ThumpGain",          nullptr, &Config::thumpGain,     0.0f,  2.0f, 0.05f, 'x', false},
+            {"Priority ducking",                 "PriorityDuck",       nullptr, &Config::priorityDuck,  0.0f,  1.0f, 0.05f, '%', false},
+            // frequencies
+            {"Engine min frequency",             "EngineMinHz",        nullptr, &Config::engineMinHz,   kHardMinHz, kHardMaxHz - 5.0f, 2.0f, 'H', false},
+            {"Engine max frequency",             "EngineMaxHz",        nullptr, &Config::engineMaxHz,   kHardMinHz, kHardMaxHz, 2.0f, 'H', false},
+            {"Road min frequency",               "RoadMinHz",          nullptr, &Config::roadMinHz,     20.0f, kHardMaxHz - 5.0f, 2.0f, 'H', false},
+            {"Road max frequency",               "RoadMaxHz",          nullptr, &Config::roadMaxHz,     25.0f, kHardMaxHz, 2.0f, 'H', false},
+            {"Brake pitch",                      "BrakeHzScale",       nullptr, &Config::brakeHzScale,  0.5f,  2.0f, 0.05f, 'x', false},
+            {"Landing pitch",                    "ImpactHzScale",      nullptr, &Config::impactHzScale, 0.5f,  2.0f, 0.05f, 'x', false},
+        };
+    }
 
-        if (!m_cfg.wheel.empty()) {
-            std::string want = lower(m_cfg.wheel);
-            for (int i = 0; i < (int)m_devices.size(); ++i) {
-                if (lower(m_devices[i].name).find(want) != std::string::npos) {
-                    m_sel = i;
-                    if (m_cfg.autoConnect) Connect();
-                    break;
-                }
-            }
+    float RowValue(const MenuRow& r) const {
+        if (r.live) return m_userGain.load();
+        return r.ip ? (float)(m_cfg.*r.ip) : m_cfg.*r.fp;
+    }
+
+    void RowText(const MenuRow& r, char* out, size_t n) const {
+        const float v = RowValue(r);
+        switch (r.fmt) {
+            case 'g': snprintf(out, n, "%d", (int)std::lround(v)); break;
+            case '%': snprintf(out, n, "%.0f%%", v * 100.0f); break;
+            case 'H': snprintf(out, n, "%.0f Hz", v); break;
+            default:  snprintf(out, n, "x%.2f", v); break;
         }
     }
 
-    ~TrueforcePlugin() {
-        Disconnect();
-        GameDeviceTap::I().Remove();       // restore the vtable before our DLL goes away
-        if (m_pDI) { m_pDI->Release(); m_pDI = nullptr; }
+    void SaveRow(const MenuRow& r) {
+        char b[32]; snprintf(b, sizeof(b), "%g", (double)RowValue(r));
+        WritePrivateProfileStringA("ForceFX", r.key, b, m_iniPath.c_str());
     }
 
-    const char* GetName() override { return "Trueforce Rumble"; }
+    // dir = +1 / -1. Clamps, applies live, and writes every row the edit changed (a frequency can push its partner).
+    void AdjustRow(int ri, int dir) {
+        std::vector<float> before;
+        for (const MenuRow& r : m_rows) before.push_back(RowValue(r));
+        const MenuRow& r = m_rows[ri];
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            float v = clampf(RowValue(r) + (float)dir * r.step, r.lo, r.hi);
+            v = std::round(v * 1000.0f) / 1000.0f;                                  // no 0.35000002 drift from repeated steps
+            if (r.ip) m_cfg.*r.ip = (int)std::lround(v); else m_cfg.*r.fp = v;
+            if (r.live) { m_userGain = v; m_muted = false; }
+            ClampConfig(m_cfg);
+        }
+        m_cfgRev++;
+        for (size_t i = 0; i < m_rows.size(); ++i)
+            if (RowValue(m_rows[i]) != before[i]) SaveRow(m_rows[i]);
+        Logf("Menu: %s -> %g", r.key, (double)RowValue(r));
+    }
 
-    void DrawFrontEndPage() override {
-        if (!game_) return;
+    void ResetRows() {
+        const Config def{};
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            for (const MenuRow& r : m_rows) {
+                if (r.ip) m_cfg.*r.ip = def.*r.ip; else m_cfg.*r.fp = def.*r.fp;
+                if (r.live) { m_userGain = def.*r.fp; m_muted = false; }
+            }
+            ClampConfig(m_cfg);
+        }
+        m_cfgRev++;
+        for (const MenuRow& r : m_rows) SaveRow(r);
+        Logf("Menu: gains and frequencies reset to the built-in defaults");
+    }
+
+    void DrawRawPage() {
         float y = 50.0f;
         game_->SetFont(IRBRGame::FONT_BIG);
         game_->SetMenuColor(IRBRGame::MENU_HEADING);
-        game_->WriteText(70.0f, y, "Trueforce Rumble Settings");
+        game_->WriteText(70.0f, y, "ForceFX Diagnostics");
         y += 28.0f;
-
         game_->SetFont(IRBRGame::FONT_SMALL);
         game_->SetMenuColor(IRBRGame::MENU_TEXT);
         char buf[300];
         auto line = [&](const char* txt) { game_->WriteText(70.0f, y, txt); y += 19.0f; };
-
-        snprintf(buf, sizeof(buf), "FFB devices: %d   (Left/Right = choose, Select = connect / toggle TEST)", (int)m_devices.size());
-        line(buf);
-        if (!m_devices.empty()) {
-            snprintf(buf, sizeof(buf), "> [%d/%d] %s%s", m_sel + 1, (int)m_devices.size(), m_devices[m_sel].name,
-                     m_sel == m_connectedIdx ? "  (connected)" : "");
-            game_->SetMenuColor(IRBRGame::MENU_SELECTION);
-            line(buf);
-            game_->SetMenuColor(IRBRGame::MENU_TEXT);
-        } else {
-            line("> [no force feedback devices detected]");
-        }
-
-        std::string st;
-        { std::lock_guard<std::mutex> lk(m_mtx); st = m_status; }
-        snprintf(buf, sizeof(buf), "Status: %s", st.c_str());
-        line(buf);
-
-        static const char* const kPhase[] = {"engine sweep", "gravel", "rough / dirt", "hard braking + lock-up", "landing hits"};
-        snprintf(buf, sizeof(buf), "UDP packets: %lld (port %d)   TEST: %s", (long long)m_packets.load(), m_cfg.udpPort,
-                 m_test ? kPhase[std::max(0, std::min(m_testPhase.load(), 4))] : "off");
-        line(buf);
-
+        line("Up/Down = scroll the raw packet, Select / Left / Right = back to the settings");
         snprintf(buf, sizeof(buf), "rpm %.0f  speed %.1f m/s  throttle %.2f  brake %.2f",
                  m_dRpm.load(), m_dSpeed.load(), m_dThr.load(), m_dBrk.load());
         line(buf);
         snprintf(buf, sizeof(buf), "texture %.2f (front roughness %.2f)  bump %.2f  dive %.2f  lock %.2f",
                  m_dTex.load(), m_dRough.load(), m_dBump.load(), m_dDive.load(), m_dLock.load());
         line(buf);
-        { std::string nm, pr; { std::lock_guard<std::mutex> lk(m_mtx); nm = m_carName; pr = m_carPreset; }
-          snprintf(buf, sizeof(buf), "car slot %d: %s %s   static load %.0f   load L %.2f R %.2f   airborne %.2f",
-                   m_dCar.load(), nm.empty() ? "waiting for telemetry" : nm.c_str(), pr.c_str(),
-                   m_dStat.load(), m_dLoadL.load(), m_dLoadR.load(), m_dAir.load());
-          line(buf); }
-        snprintf(buf, sizeof(buf), "live gain %.0f%%%s   thermal derate x%.2f   (Ctrl + Num+ / Num- / Num* in game)",
-                 m_userGain.load() * 100.0f, m_muted ? " MUTED" : "", m_dHeat.load());
-        line(buf);
-        snprintf(buf, sizeof(buf), "engine %.0f@%.0fHz  lump %.0f@%.0fHz  road L %.0f R %.0f  brake %.0f@%.0fHz  impact %.0f",
-                 m_mag[S_ENG1].load(), m_hz[S_ENG1].load(), m_mag[S_ENG2].load(), m_hz[S_ENG2].load(),
-                 m_mag[S_ROAD].load(), m_mag[S_ROADR].load(), m_mag[S_BRAKE].load(), m_hz[S_BRAKE].load(), m_mag[S_IMPACT].load());
+        snprintf(buf, sizeof(buf), "static load %.0f   load L %.2f R %.2f   airborne %.2f   thermal derate x%.2f",
+                 m_dStat.load(), m_dLoadL.load(), m_dLoadR.load(), m_dAir.load(), m_dHeat.load());
         line(buf);
         y += 6.0f;
 
         uint8_t pkt[2048]; int len;
         { std::lock_guard<std::mutex> lk(m_mtx); len = m_pktLen; std::memcpy(pkt, m_pkt, sizeof(pkt)); }
-        line("Raw packet floats (Up/Down scroll):");
-        for (int row = 0; row < 4; ++row) {
+        line("Raw packet floats:");
+        for (int row = 0; row < 12; ++row) {
             int base = m_tableBase + row * 16;
             char ln[200]; int p = snprintf(ln, sizeof(ln), "0x%03X ", base);
             for (int c = 0; c < 4; ++c) {
@@ -1647,18 +1703,164 @@ public:
         }
     }
 
+public:
+    explicit ForceFXPlugin(IRBRGame* game) : game_(game) {
+        g_dir = pluginDirectory();
+        m_iniPath = g_dir + "ForceFX.ini";
+        std::memset(m_pkt, 0, sizeof(m_pkt));
+        for (int i = 0; i < S_COUNT; ++i) { m_mag[i] = 0; m_hz[i] = 0; }
+        auto fileExists = [](const std::string& f) { return GetFileAttributesA(f.c_str()) != INVALID_FILE_ATTRIBUTES; };
+        bool exists = fileExists(m_iniPath);
+        { // one-time migration from the pre-rename names (RBR_TrueforcePlugin): keep the user's tuning and car profiles
+          const std::string oldIni = g_dir + "TrueforceRumble.ini", oldCars = g_dir + "TrueforceCars.ini";
+          if (!exists && fileExists(oldIni)) {
+              SyncConfig(m_cfg, oldIni, false, "Trueforce");
+              Logf("Migrated settings from TrueforceRumble.ini");
+          }
+          if (!fileExists(CarsIniPath()) && fileExists(oldCars) && CopyFileA(oldCars.c_str(), CarsIniPath().c_str(), TRUE))
+              Logf("Copied car profiles from TrueforceCars.ini");
+        }
+        if (!exists) SyncConfig(m_cfg, m_iniPath, true);     // write a template with every key
+        SyncConfig(m_cfg, m_iniPath, false);
+        m_userGain = m_cfg.userGain;
+
+        BuildRows();
+        SetStatus("Pick the wheel with Left/Right, press Select");
+        EnumerateDevices();
+
+        if (!m_cfg.wheel.empty()) {
+            std::string want = lower(m_cfg.wheel);
+            for (int i = 0; i < (int)m_devices.size(); ++i) {
+                if (lower(m_devices[i].name).find(want) != std::string::npos) {
+                    m_sel = i;
+                    if (m_cfg.autoConnect) Connect();
+                    break;
+                }
+            }
+        }
+    }
+
+    ~ForceFXPlugin() {
+        Disconnect();
+        GameDeviceTap::I().Remove();       // restore the vtable before our DLL goes away
+        if (m_pDI) { m_pDI->Release(); m_pDI = nullptr; }
+    }
+
+    const char* GetName() override { return "ForceFX"; }
+
+    void DrawFrontEndPage() override {
+        if (!game_) return;
+        if (m_view == 1) { DrawRawPage(); return; }
+
+        const int nVal = (int)m_rows.size();
+        const int total = nVal + 4;                 // device, test, values..., diagnostics, reset
+        const int iView = 2 + nVal, iReset = iView + 1;
+        constexpr int kVisible = 10;
+        if (m_cursor < m_top) m_top = m_cursor;
+        if (m_cursor >= m_top + kVisible) m_top = m_cursor - kVisible + 1;
+        m_top = std::max(0, std::min(m_top, total - kVisible));
+
+        float y = 40.0f;
+        game_->SetFont(IRBRGame::FONT_BIG);
+        game_->SetMenuColor(IRBRGame::MENU_HEADING);
+        game_->WriteText(70.0f, y, "ForceFX Settings");
+        y += 28.0f;
+
+        game_->SetFont(IRBRGame::FONT_SMALL);
+        game_->SetMenuColor(IRBRGame::MENU_TEXT);
+        char buf[300];
+        auto line = [&](const char* txt) { game_->WriteText(70.0f, y, txt); y += 19.0f; };
+
+        std::string st;
+        { std::lock_guard<std::mutex> lk(m_mtx); st = m_status; }
+        snprintf(buf, sizeof(buf), "Status: %s", st.c_str());
+        line(buf);
+        static const char* const kPhase[] = {"engine sweep", "gravel", "rough / dirt", "hard braking + lock-up", "landing hits"};
+        snprintf(buf, sizeof(buf), "UDP packets: %lld (port %d)   live gain %.0f%%%s   derate x%.2f",
+                 (long long)m_packets.load(), m_cfg.udpPort, m_userGain.load() * 100.0f, m_muted ? " MUTED" : "", m_dHeat.load());
+        line(buf);
+        { std::string nm, pr; { std::lock_guard<std::mutex> lk(m_mtx); nm = m_carName; pr = m_carPreset; }
+          snprintf(buf, sizeof(buf), "car slot %d: %s %s", m_dCar.load(), nm.empty() ? "waiting for telemetry" : nm.c_str(), pr.c_str());
+          line(buf); }
+        snprintf(buf, sizeof(buf), "now: engine %.0f@%.0fHz  lump %.0f  road L %.0f R %.0f  brake %.0f@%.0fHz  landing %.0f",
+                 m_mag[S_ENG1].load(), m_hz[S_ENG1].load(), m_mag[S_ENG2].load(),
+                 m_mag[S_ROAD].load(), m_mag[S_ROADR].load(), m_mag[S_BRAKE].load(), m_hz[S_BRAKE].load(), m_mag[S_IMPACT].load());
+        line(buf);
+        y += 6.0f;
+
+        for (int i = m_top; i < std::min(total, m_top + kVisible); ++i) {
+            const bool sel = (i == m_cursor);
+            char label[120], value[160];
+            if (i == 0) {
+                snprintf(label, sizeof(label), "Wheel (Select = connect)");
+                if (m_devices.empty()) snprintf(value, sizeof(value), "[no force feedback devices]");
+                else snprintf(value, sizeof(value), "%s%s", m_devices[m_sel].name, m_sel == m_connectedIdx ? " (connected)" : "");
+            } else if (i == 1) {
+                snprintf(label, sizeof(label), "TEST vibration (Select)");
+                snprintf(value, sizeof(value), "%s", m_test ? kPhase[std::max(0, std::min(m_testPhase.load(), 4))] : "off");
+            } else if (i == iView) {
+                snprintf(label, sizeof(label), "Diagnostics / raw packet");
+                snprintf(value, sizeof(value), "Select to open");
+            } else if (i == iReset) {
+                snprintf(label, sizeof(label), "Reset gains and frequencies");
+                snprintf(value, sizeof(value), "%s", m_resetArmed ? "Select again to confirm" : "Select to reset");
+            } else {
+                const MenuRow& r = m_rows[i - 2];
+                snprintf(label, sizeof(label), "%s", r.label);
+                char v[64]; RowText(r, v, sizeof(v));
+                snprintf(value, sizeof(value), sel ? "< %s >" : "%s", v);
+            }
+            game_->SetMenuColor(sel ? IRBRGame::MENU_SELECTION : IRBRGame::MENU_TEXT);
+            snprintf(buf, sizeof(buf), "%s%s", sel ? "> " : "  ", label);
+            game_->WriteText(70.0f, y, buf);
+            game_->WriteText(330.0f, y, value);
+            y += 19.0f;
+        }
+        game_->SetMenuColor(IRBRGame::MENU_TEXT);
+        y += 4.0f;
+        snprintf(buf, sizeof(buf), "Up/Down = choose (%d/%d)   Left/Right = change   changes apply instantly and are saved to ForceFX.ini",
+                 m_cursor + 1, total);
+        line(buf);
+        line("Car profiles scale the engine and road gains on top of these values.");
+    }
+
     void DrawResultsUI() override {}
 
     void HandleFrontEndEvents(char, bool bUp, bool bDown, bool bLeft, bool bRight, bool bSelect) override {
-        if (bUp)   m_tableBase = std::max(0, m_tableBase - 64);
-        if (bDown) m_tableBase = std::min(2048 - 64, m_tableBase + 64);
-        if (m_devices.empty()) return;
+        if (m_view == 1) {
+            if (bUp)   m_tableBase = std::max(0, m_tableBase - 64);
+            if (bDown) m_tableBase = std::min(2048 - 64, m_tableBase + 64);
+            if (bSelect || bLeft || bRight) m_view = 0;
+            return;
+        }
+        const int nVal = (int)m_rows.size();
+        const int total = nVal + 4;
+        const int iView = 2 + nVal, iReset = iView + 1;
+        if (bUp)   { m_cursor = (m_cursor + total - 1) % total; m_resetArmed = false; }
+        if (bDown) { m_cursor = (m_cursor + 1) % total;         m_resetArmed = false; }
+        const int dir = (bRight ? 1 : 0) - (bLeft ? 1 : 0);
 
-        if (bLeft)  { m_sel = (m_sel - 1 + (int)m_devices.size()) % (int)m_devices.size(); }
-        if (bRight) { m_sel = (m_sel + 1) % (int)m_devices.size(); }
-        if (bSelect) {
-            if (m_connectedIdx == m_sel && m_run) m_test = !m_test;   // already connected: toggle synthetic TEST vibration
-            else Connect();
+        if (m_cursor == 0) {
+            if (m_devices.empty()) return;
+            if (dir) m_sel = (m_sel + dir + (int)m_devices.size()) % (int)m_devices.size();
+            if (bSelect) {
+                if (m_connectedIdx == m_sel && m_run) m_test = !m_test;   // already connected: toggle synthetic TEST vibration
+                else Connect();
+            }
+        } else if (m_cursor == 1) {
+            if (bSelect || dir) {
+                if (m_connectedIdx >= 0 && m_run) m_test = !m_test;
+                else SetStatus("Connect to the wheel first (Select on the Wheel row)");
+            }
+        } else if (m_cursor == iView) {
+            if (bSelect) m_view = 1;
+        } else if (m_cursor == iReset) {
+            if (bSelect) {
+                if (m_resetArmed) { ResetRows(); m_resetArmed = false; }
+                else m_resetArmed = true;
+            }
+        } else if (dir) {
+            AdjustRow(m_cursor - 2, dir);
         }
     }
 
@@ -1674,9 +1876,9 @@ extern "C" __declspec(dllexport) IPlugin* RBR_CreatePlugin(IRBRGame* pGame) {
     // Proof-of-life: if this file never appears next to the DLL, RBR did not call the plugin.
     try {
         g_dir = pluginDirectory();
-        FILE* f = fopen((g_dir + "TrueforceRumble_loaded.txt").c_str(), "w");
+        FILE* f = fopen((g_dir + "ForceFX_loaded.txt").c_str(), "w");
         if (f) { fprintf(f, "RBR_CreatePlugin was called by RBR.\n"); fclose(f); }
     } catch (...) {}
-    try { return new TrueforcePlugin(pGame); }
+    try { return new ForceFXPlugin(pGame); }
     catch (...) { return nullptr; }
 }
