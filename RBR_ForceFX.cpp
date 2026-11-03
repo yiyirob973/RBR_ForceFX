@@ -125,6 +125,7 @@ struct Config {
     float impactGain = 1.0f;         // landing sensitivity 0..2 (1 = normal, 0 = off)
     float brakeHzScale = 1.0f;       // brake judder pitch multiplier 0.5..2 (menu)
     float impactHzScale = 1.0f;      // landing hit pitch multiplier 0.5..2 (menu)
+    float landingJolt = 0.6f;        // 0..1: share of the landing budget played as a one-direction kick instead of a buzz (menu)
     float priorityDuck = 0.85f;      // 0..1: how far lower-priority layers fall back while a higher one is active (landing > road > engine)
     int   totalMaxMag = 4000;        // all layers together are scaled down to this (hard ceiling kHardTotalMax)
     float sustainedLimit = 0.10f;    // thermal derate: long-term mean-square level (0.10 ~ 32% RMS-equivalent)
@@ -190,6 +191,7 @@ void ClampConfig(Config& c) {
     c.brakeHzScale = clampf(c.brakeHzScale, 0.5f, 2.0f);
     c.impactHzScale = clampf(c.impactHzScale, 0.5f, 2.0f);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
+    c.landingJolt = clampf(c.landingJolt, 0.0f, 1.0f);
     c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, kHardTotalMax));
     c.userGain   = clampf(c.userGain,   0.0f, 1.0f);
     c.roadGrain = clampf(c.roadGrain, 0.0f, 1.0f);
@@ -229,7 +231,7 @@ void SyncConfig(Config& c, const std::string& path, bool write, const char* sect
     I("EngineMaxMagnitude", c.engineMaxMag); I("RoadMaxMagnitude", c.roadMaxMag);
     I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
     I("ImpactMaxMagnitude", c.impactMaxMag); F("ImpactGain", c.impactGain);
-    F("BrakeHzScale", c.brakeHzScale); F("ImpactHzScale", c.impactHzScale); F("PriorityDuck", c.priorityDuck);
+    F("BrakeHzScale", c.brakeHzScale); F("ImpactHzScale", c.impactHzScale); F("PriorityDuck", c.priorityDuck); F("LandingJolt", c.landingJolt);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
@@ -678,8 +680,8 @@ BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
     return DIENUM_CONTINUE;
 }
 
-enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD, S_ROADR, S_BRAKE, S_IMPACT, S_COUNT };   // S_ROAD = sawtooth-up (sharp edge toward negative/left), S_ROADR = sawtooth-down
-const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-A", "road-B", "brake", "impact"};
+enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD, S_ROADR, S_BRAKE, S_IMPACT, S_JOLT, S_COUNT };   // S_JOLT = one-direction constant-force kick (signed magnitude)   // S_ROAD = sawtooth-up (sharp edge toward negative/left), S_ROADR = sawtooth-down
+const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-A", "road-B", "brake", "impact", "jolt"};
 
 class FFLayer {
 public:
@@ -698,7 +700,7 @@ public:
         if (axisId == 0xFFFFFFFF) return E_NOTIMPL;      // no force feedback actuator
         m_axisId = axisId;
 
-        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown, &GUID_Sine, &GUID_Square };
+        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown, &GUID_Sine, &GUID_Square, &GUID_ConstantForce };
         HRESULT firstErr = DI_OK;
         int ok = 0;
         for (int i = 0; i < S_COUNT; ++i) {
@@ -756,6 +758,7 @@ private:
     HRESULT Make(int slot, const GUID& g) {
         DIPERIODIC per{};
         per.dwPeriod = 20000;
+        DICONSTANTFORCE cf{};
         LONG dir = 0;
         DIEFFECT e{};
         e.dwSize = sizeof(DIEFFECT);
@@ -766,14 +769,23 @@ private:
         e.cAxes = 1;
         e.rgdwAxes = &m_axisId;
         e.rglDirection = &dir;
-        e.cbTypeSpecificParams = sizeof(per);
-        e.lpvTypeSpecificParams = &per;
+        if (slot == S_JOLT) { e.cbTypeSpecificParams = sizeof(cf);  e.lpvTypeSpecificParams = &cf; }
+        else                { e.cbTypeSpecificParams = sizeof(per); e.lpvTypeSpecificParams = &per; }
         return m_dev->CreateEffect(g, &e, &m_fx[slot], NULL);
     }
 
     HRESULT Update(int slot, int mag, DWORD period) {
         DIEFFECT e{};
         e.dwSize = sizeof(DIEFFECT);
+        if (slot == S_JOLT) {                                   // signed constant force: no period
+            mag = std::max(-10000, std::min(mag, 10000));
+            if (std::abs(mag - m_lastMag[slot]) < kMagDeadband && !(mag == 0 && m_lastMag[slot] != 0) && m_lastPer[slot] != 0) return DI_OK;
+            DICONSTANTFORCE cf{}; cf.lMagnitude = mag;
+            e.cbTypeSpecificParams = sizeof(cf); e.lpvTypeSpecificParams = &cf;
+            HRESULT hr = m_fx[slot]->SetParameters(&e, DIEP_TYPESPECIFICPARAMS | DIEP_NORESTART);
+            if (SUCCEEDED(hr)) { m_lastMag[slot] = mag; m_lastPer[slot] = 1; }
+            return hr;
+        }
         mag = std::max(0, std::min(mag, 10000));
         bool magChanged = std::abs(mag - m_lastMag[slot]) >= kMagDeadband || (mag == 0 && m_lastMag[slot] != 0);
         bool perChanged = m_lastPer[slot] == 0 ||
@@ -1032,6 +1044,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 struct Synth {
     float sm[S_COUNT] = {};
     float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
+    float jSign = 1.0f, impPrev = 0.0f;   // direction of the current landing kick
     float roadJit[2] = {1.0f, 1.0f}, ampJit[2] = {1.0f, 1.0f}, engJit = 1.0f, engHzJit = 1.0f, unevPhase = 0;
     double nextJit = 0;
 
@@ -1123,7 +1136,18 @@ struct Synth {
         // ---------------- IMPACT: landing / hard-hit slap. Square wave, lower pitch for bigger hits and heavier cars.
         const float imp = clamp01(s.impact);
         hz[S_IMPACT] = clampf((74.0f - 26.0f * imp) / std::sqrt(wf), 34.0f, 80.0f) * (1.0f + 0.15f * rnd()) * c.impactHzScale;   // lock-up-like pitch and grit: low pitch alone is weak on most wheels
-        const float t5 = imp > 0.0f ? (float)std::min(c.impactMaxMag, kHardTotalMax) * (0.4f + 0.6f * std::pow(imp, 0.5f)) : 0.0f;   // concave: small hops still register, big ones saturate
+        // A symmetric buzz alone is weak on a direct-drive wheel, so part of the landing budget is a one-direction
+        // force pulse (the kick) and the rest the buzz. The two together never exceed the landing ceiling.
+        const float Lmax = (float)std::min(c.impactMaxMag, kHardTotalMax);
+        const float jf = clamp01(c.landingJolt);
+        const float t5 = imp > 0.0f ? Lmax * (0.4f + 0.6f * std::pow(imp, 0.5f)) * (1.0f - jf) : 0.0f;
+        if (imp > 0.05f && impPrev <= 0.05f) {                                       // a new landing: pick the kick direction
+            if (std::fabs(s.loadL - s.loadR) > 0.05f) jSign = (s.loadL > s.loadR ? -1.0f : 1.0f) * (c.roadSideInvert ? -1.0f : 1.0f);
+            else jSign = -jSign;                                                     // symmetric: alternate sides
+        }
+        impPrev = imp;
+        const float tj = Lmax * jf * imp * imp;
+        hz[S_JOLT] = 50.0f;   // concave: small hops still register, big ones saturate
 
         // attack / release: road is deliberately fast (sharpness), engine is rounder
         auto follow = [&](int i, float target, float up, float down) {
@@ -1135,22 +1159,24 @@ struct Synth {
         follow(S_ROAD,  tRoadA, 0.55f, roadDown);
         follow(S_ROADR, tRoadB, 0.55f, roadDown);
         follow(S_BRAKE, t4, 0.50f, 0.20f);
-        follow(S_IMPACT, t5, 1.00f, 0.50f);                                        // instant attack: a landing must hit, not swell
+        follow(S_IMPACT, t5, 1.00f, 0.50f);
+        follow(S_JOLT, tj, 1.00f, 0.60f);                                        // instant attack: a landing must hit, not swell
 
         // The impact layer has priority inside the total ceiling: the other layers duck to make room for it.
-        const float impM = std::min(std::fabs(sm[S_IMPACT]), (float)kHardTotalMax);   // the hit may use its own ceiling (<= hard max), not just the shared one
+        const float jM = std::min(std::fabs(sm[S_JOLT]), (float)kHardTotalMax);
+        const float impM = std::min(std::fabs(sm[S_IMPACT]) + jM, (float)kHardTotalMax);   // buzz + kick share one landing budget   // the hit may use its own ceiling (<= hard max), not just the shared one
         // Priority: landing (highest) > road > engine (lowest). A lower layer falls back while a higher one is active,
         // so the strongest cue is the one you actually feel. Brake is only pushed back by a landing.
         const float pI = c.impactMaxMag > 0 ? clamp01(impM / (float)c.impactMaxMag) : 0.0f;
         const float pR = c.roadMaxMag > 0 ? clamp01(std::max(std::fabs(sm[S_ROAD]), std::fabs(sm[S_ROADR])) / (float)c.roadMaxMag) : 0.0f;
         const float dk = clampf(c.priorityDuck, 0.0f, 1.0f);
         float duck[S_COUNT];
-        duck[S_IMPACT] = 1.0f;
+        duck[S_IMPACT] = duck[S_JOLT] = 1.0f;
         duck[S_ROAD] = duck[S_ROADR] = 1.0f - dk * pI;
         duck[S_ENG1] = duck[S_ENG2] = (1.0f - dk * pI) * (1.0f - dk * pR);
         duck[S_BRAKE] = 1.0f - 0.6f * dk * pI;
         float sumO = 0;
-        for (int i = 0; i < S_COUNT; ++i) if (i != S_IMPACT) sumO += std::fabs(sm[i]) * duck[i];
+        for (int i = 0; i < S_COUNT; ++i) if (i != S_IMPACT && i != S_JOLT) sumO += std::fabs(sm[i]) * duck[i];
         const float room = std::max(0.0f, (float)c.totalMaxMag - impM);   // others duck fully when the hit fills the ceiling
         const float scale = sumO > room && sumO > 0.0f ? room / sumO : 1.0f;
         const float sum = sumO * scale + impM;
@@ -1164,9 +1190,10 @@ struct Synth {
 
         const float g = ug * derate;
         for (int i = 0; i < S_COUNT; ++i) {
-            float m = (i == S_IMPACT ? impM : sm[i] * duck[i] * scale) * g;
+            float m = (i == S_IMPACT ? std::max(0.0f, impM - jM) : i == S_JOLT ? jM : sm[i] * duck[i] * scale) * g;
             if (!std::isfinite(m)) { m = 0.0f; sm[i] = 0.0f; }          // never let a NaN latch into the filters
             mag[i] = std::max(0, std::min((int)m, kHardTotalMax));
+            if (i == S_JOLT) mag[i] = (int)jSign * mag[i];               // signed: the kick pushes one way
         }
     }
 };
@@ -1596,6 +1623,7 @@ private:
             {"Brake gain",                       "BrakeMaxMagnitude",  &Config::brakeMaxMag,  nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Landing gain (ceiling)",           "ImpactMaxMagnitude", &Config::impactMaxMag, nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Landing sensitivity",              "ImpactGain",         nullptr, &Config::impactGain,    0.0f,  2.0f, 0.05f, 'x', false},
+            {"Landing kick (jolt)",              "LandingJolt",        nullptr, &Config::landingJolt,   0.0f,  1.0f, 0.05f, '%', false},
             {"Landing thump (road)",             "ThumpGain",          nullptr, &Config::thumpGain,     0.0f,  2.0f, 0.05f, 'x', false},
             {"Priority ducking",                 "PriorityDuck",       nullptr, &Config::priorityDuck,  0.0f,  1.0f, 0.05f, '%', false},
             // frequencies
@@ -1662,16 +1690,23 @@ private:
         Logf("Menu: gains and frequencies reset to the built-in defaults");
     }
 
+    // RBR's WriteText is printf-like: a literal % must be doubled or it eats the next argument
+    void WriteSafe(float x, float y, const char* t) {
+        std::string e;
+        for (; *t; ++t) { e += *t; if (*t == '%') e += '%'; }
+        game_->WriteText(x, y, e.c_str());
+    }
+
     void DrawRawPage() {
         float y = 50.0f;
         game_->SetFont(IRBRGame::FONT_BIG);
         game_->SetMenuColor(IRBRGame::MENU_HEADING);
-        game_->WriteText(70.0f, y, "ForceFX Diagnostics");
+        WriteSafe(70.0f, y, "ForceFX Diagnostics");
         y += 28.0f;
         game_->SetFont(IRBRGame::FONT_SMALL);
         game_->SetMenuColor(IRBRGame::MENU_TEXT);
         char buf[300];
-        auto line = [&](const char* txt) { game_->WriteText(70.0f, y, txt); y += 19.0f; };
+        auto line = [&](const char* txt) { WriteSafe(70.0f, y, txt); y += 19.0f; };
         line("Up/Down = scroll the raw packet, Select / Left / Right = back to the settings");
         snprintf(buf, sizeof(buf), "rpm %.0f  speed %.1f m/s  throttle %.2f  brake %.2f",
                  m_dRpm.load(), m_dSpeed.load(), m_dThr.load(), m_dBrk.load());
@@ -1699,7 +1734,7 @@ private:
                     p += snprintf(ln + p, sizeof(ln) - p, " %10s", "-");
                 }
             }
-            game_->WriteText(70.0f, y, ln); y += 17.0f;
+            WriteSafe(70.0f, y, ln); y += 17.0f;
         }
     }
 
@@ -1763,13 +1798,13 @@ public:
         float y = 40.0f;
         game_->SetFont(IRBRGame::FONT_BIG);
         game_->SetMenuColor(IRBRGame::MENU_HEADING);
-        game_->WriteText(70.0f, y, "ForceFX Settings");
+        WriteSafe(70.0f, y, "ForceFX Settings");
         y += 28.0f;
 
         game_->SetFont(IRBRGame::FONT_SMALL);
         game_->SetMenuColor(IRBRGame::MENU_TEXT);
         char buf[300];
-        auto line = [&](const char* txt) { game_->WriteText(70.0f, y, txt); y += 19.0f; };
+        auto line = [&](const char* txt) { WriteSafe(70.0f, y, txt); y += 19.0f; };
 
         std::string st;
         { std::lock_guard<std::mutex> lk(m_mtx); st = m_status; }
@@ -1794,7 +1829,7 @@ public:
             if (i == 0) {
                 snprintf(label, sizeof(label), "Wheel (Select = connect)");
                 if (m_devices.empty()) snprintf(value, sizeof(value), "[no force feedback devices]");
-                else snprintf(value, sizeof(value), "%s%s", m_devices[m_sel].name, m_sel == m_connectedIdx ? " (connected)" : "");
+                else snprintf(value, sizeof(value), "%s%s", m_sel == m_connectedIdx ? "[on] " : "", m_devices[m_sel].name);
             } else if (i == 1) {
                 snprintf(label, sizeof(label), "TEST vibration (Select)");
                 snprintf(value, sizeof(value), "%s", m_test ? kPhase[std::max(0, std::min(m_testPhase.load(), 4))] : "off");
@@ -1812,13 +1847,13 @@ public:
             }
             game_->SetMenuColor(sel ? IRBRGame::MENU_SELECTION : IRBRGame::MENU_TEXT);
             snprintf(buf, sizeof(buf), "%s%s", sel ? "> " : "  ", label);
-            game_->WriteText(70.0f, y, buf);
-            game_->WriteText(330.0f, y, value);
+            WriteSafe(70.0f, y, buf);
+            WriteSafe(330.0f, y, value);
             y += 19.0f;
         }
         game_->SetMenuColor(IRBRGame::MENU_TEXT);
         y += 4.0f;
-        snprintf(buf, sizeof(buf), "Up/Down = choose (%d/%d)   Left/Right = change   changes apply instantly and are saved to ForceFX.ini",
+        snprintf(buf, sizeof(buf), "Up/Down choose (%d/%d)  Left/Right change  (live, saved to ini)",
                  m_cursor + 1, total);
         line(buf);
         line("Car profiles scale the engine and road gains on top of these values.");
