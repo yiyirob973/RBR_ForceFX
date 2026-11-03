@@ -125,7 +125,7 @@ struct Config {
     float impactGain = 1.0f;         // landing sensitivity 0..2 (1 = normal, 0 = off)
     float brakeHzScale = 1.0f;       // brake judder pitch multiplier 0.5..2 (menu)
     float impactHzScale = 1.0f;      // landing hit pitch multiplier 0.5..2 (menu)
-    float landingJolt = 0.6f;        // 0..1: share of the landing budget played as a one-direction kick instead of a buzz (menu)
+    float landingJolt = 0.35f;        // 0..1: share of the landing budget played as a one-direction kick instead of a buzz (menu)
     float priorityDuck = 0.85f;      // 0..1: how far lower-priority layers fall back while a higher one is active (landing > road > engine)
     int   totalMaxMag = 4000;        // all layers together are scaled down to this (hard ceiling kHardTotalMax)
     float sustainedLimit = 0.10f;    // thermal derate: long-term mean-square level (0.10 ~ 32% RMS-equivalent)
@@ -700,7 +700,7 @@ public:
         if (axisId == 0xFFFFFFFF) return E_NOTIMPL;      // no force feedback actuator
         m_axisId = axisId;
 
-        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown, &GUID_Sine, &GUID_Square, &GUID_ConstantForce };
+        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown, &GUID_Sine, &GUID_Sine, &GUID_ConstantForce };   // impact buzz uses the same sine as brake/engine: some bases treat square effects much weaker
         HRESULT firstErr = DI_OK;
         int ok = 0;
         for (int i = 0; i < S_COUNT; ++i) {
@@ -1010,7 +1010,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
             }
         }
         d.prevPeakRw = d.peakRw;
-        d.impactEnv *= std::exp(-dt / (0.32f * clampf(c.weightFeel, 0.5f, 2.0f)));
+        d.impactEnv *= std::exp(-dt / (0.45f * clampf(c.weightFeel, 0.5f, 2.0f)));
         if (d.impactEnv < 0.005f) d.impactEnv = 0.0f;
         s.impact = clamp01(d.impactEnv * c.impactGain);
     }
@@ -1135,18 +1135,18 @@ struct Synth {
 
         // ---------------- IMPACT: landing / hard-hit slap. Square wave, lower pitch for bigger hits and heavier cars.
         const float imp = clamp01(s.impact);
-        hz[S_IMPACT] = clampf((74.0f - 26.0f * imp) / std::sqrt(wf), 34.0f, 80.0f) * (1.0f + 0.15f * rnd()) * c.impactHzScale;   // lock-up-like pitch and grit: low pitch alone is weak on most wheels
+        hz[S_IMPACT] = clampf((44.0f - 20.0f * imp) / std::sqrt(wf) * (1.0f + 0.25f * rnd()), 18.0f, 55.0f) * c.impactHzScale;   // low and gritty like the lock-up: a wheel is strongest at 20-40 Hz
         // A symmetric buzz alone is weak on a direct-drive wheel, so part of the landing budget is a one-direction
         // force pulse (the kick) and the rest the buzz. The two together never exceed the landing ceiling.
         const float Lmax = (float)std::min(c.impactMaxMag, kHardTotalMax);
         const float jf = clamp01(c.landingJolt);
-        const float t5 = imp > 0.0f ? Lmax * (0.4f + 0.6f * std::pow(imp, 0.5f)) * (1.0f - jf) : 0.0f;
+        const float t5 = imp > 0.0f ? Lmax * (0.6f + 0.4f * std::pow(imp, 0.5f)) * (1.0f - jf) : 0.0f;
         if (imp > 0.05f && impPrev <= 0.05f) {                                       // a new landing: pick the kick direction
             if (std::fabs(s.loadL - s.loadR) > 0.05f) jSign = (s.loadL > s.loadR ? -1.0f : 1.0f) * (c.roadSideInvert ? -1.0f : 1.0f);
             else jSign = -jSign;                                                     // symmetric: alternate sides
         }
         impPrev = imp;
-        const float tj = Lmax * jf * imp * imp;
+        const float tj = Lmax * jf * std::pow(imp, 1.5f);
         hz[S_JOLT] = 50.0f;   // concave: small hops still register, big ones saturate
 
         // attack / release: road is deliberately fast (sharpness), engine is rounder
@@ -1338,7 +1338,7 @@ private:
             m_testPhase = 4; s.rpm = 900; s.throttle = 0; s.speed = 0;
             const double lt = std::fmod(ph - 13.0, 1.5);
             const float big = std::fmod(ph - 13.0, 3.0) < 1.5 ? 1.0f : 0.5f;
-            s.impact = big * (float)std::exp(-lt / 0.19);
+            s.impact = big * (float)std::exp(-lt / 0.40);   // same ring-out as a real landing
         }
         if (m_testPhase != 2) s.texL = s.texR = s.texture;
     }
