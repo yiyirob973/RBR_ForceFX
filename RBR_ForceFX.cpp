@@ -126,7 +126,7 @@ struct Config {
     float brakeHzScale = 1.0f;       // brake judder pitch multiplier 0.5..2 (menu)
     float impactHzScale = 1.0f;      // landing hit pitch multiplier 0.5..2 (menu)
     float landingThresh = 1.0f;      // 0.5..3: how hard a no-airtime hit must be to count as a landing (higher = fewer false triggers)
-    float landingJolt = 0.35f;        // 0..1: share of the landing budget played as a one-direction kick instead of a buzz (menu)
+    float landingJolt = 0.80f;        // 0..1: share of the landing budget played as a one-direction kick instead of a buzz (menu)
     float priorityDuck = 0.85f;      // 0..1: how far lower-priority layers fall back while a higher one is active (landing > road > engine)
     int   totalMaxMag = 4000;        // all layers together are scaled down to this (hard ceiling kHardTotalMax)
     float sustainedLimit = 0.10f;    // thermal derate: long-term mean-square level (0.10 ~ 32% RMS-equivalent)
@@ -1046,7 +1046,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 struct Synth {
     float sm[S_COUNT] = {};
     float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
-    float jSign = 1.0f, impPrev = 0.0f;   // direction of the current landing kick
+    float jSign = 1.0f, impPrev = 0.0f, jAge = 5.0f;   // direction of the current landing kick
     float roadJit[2] = {1.0f, 1.0f}, ampJit[2] = {1.0f, 1.0f}, engJit = 1.0f, engHzJit = 1.0f, unevPhase = 0;
     double nextJit = 0;
 
@@ -1135,21 +1135,27 @@ struct Synth {
         hz[S_BRAKE] *= c.brakeHzScale;
         float t4 = c.brakeMaxMag * Ab * gB * clampf(0.65f + 0.35f * s.loadF, 0.5f, 1.3f);   // more load on the fronts = more judder
 
-        // ---------------- IMPACT: landing / hard-hit slap. Square wave, lower pitch for bigger hits and heavier cars.
+        // ---------------- IMPACT: landing / hard-hit THUMP, built from two parts:
+        //  * the kick: a constant-force pulse that pushes one way and rebounds once, like a damped spring (a clean
+        //    "thud-thump", not a vibration)
+        //  * a short, smooth, low-pitched body under it. No random pitch jitter: jitter is what makes the lock-up
+        //    feel like grinding, which is great for braking but wrong for a landing.
         const float imp = clamp01(s.impact);
-        hz[S_IMPACT] = clampf((44.0f - 20.0f * imp) / std::sqrt(wf) * (1.0f + 0.25f * rnd()), 18.0f, 55.0f) * c.impactHzScale;   // low and gritty like the lock-up: a wheel is strongest at 20-40 Hz
-        // A symmetric buzz alone is weak on a direct-drive wheel, so part of the landing budget is a one-direction
-        // force pulse (the kick) and the rest the buzz. The two together never exceed the landing ceiling.
         const float Lmax = (float)std::min(c.impactMaxMag, kHardTotalMax);
         const float jf = clamp01(c.landingJolt);
-        const float t5 = imp > 0.0f ? Lmax * std::pow(imp, 0.6f) * (1.0f - jf) : 0.0f;
         if (imp > 0.05f && impPrev <= 0.05f) {                                       // a new landing: pick the kick direction
+            jAge = 0.0f;
             if (std::fabs(s.loadL - s.loadR) > 0.05f) jSign = (s.loadL > s.loadR ? -1.0f : 1.0f) * (c.roadSideInvert ? -1.0f : 1.0f);
             else jSign = -jSign;                                                     // symmetric: alternate sides
         }
         impPrev = imp;
-        const float tj = Lmax * jf * std::pow(imp, 1.5f);
-        hz[S_JOLT] = 50.0f;   // concave: small hops still register, big ones saturate
+        jAge = std::min(jAge + dt, 5.0f);
+        hz[S_IMPACT] = clampf((26.0f - 10.0f * imp) / std::sqrt(wf), 12.0f, 30.0f) * c.impactHzScale;
+        const float body = imp > 0.0f ? Lmax * (1.0f - jf) * std::pow(imp, 1.2f) * (float)std::exp(-jAge / 0.18f) : 0.0f;
+        const float t5 = body;
+        const float kickHz = 8.0f / std::sqrt(wf);                                   // heavier car = slower, longer thump
+        const float tjs = jSign * Lmax * jf * imp * (float)std::exp(-jAge / 0.11f) * (float)std::cos(6.2831853f * kickHz * jAge);
+        hz[S_JOLT] = 50.0f;
 
         // attack / release: road is deliberately fast (sharpness), engine is rounder
         auto follow = [&](int i, float target, float up, float down) {
@@ -1162,7 +1168,7 @@ struct Synth {
         follow(S_ROADR, tRoadB, 0.55f, roadDown);
         follow(S_BRAKE, t4, 0.50f, 0.20f);
         follow(S_IMPACT, t5, 1.00f, 0.50f);
-        follow(S_JOLT, tj, 1.00f, 0.60f);                                        // instant attack: a landing must hit, not swell
+        sm[S_JOLT] = tjs;                                                        // signed and already shaped: no smoothing                                        // instant attack: a landing must hit, not swell
 
         // The impact layer has priority inside the total ceiling: the other layers duck to make room for it.
         const float jM = std::min(std::fabs(sm[S_JOLT]), (float)kHardTotalMax);
@@ -1195,7 +1201,7 @@ struct Synth {
             float m = (i == S_IMPACT ? std::max(0.0f, impM - jM) : i == S_JOLT ? jM : sm[i] * duck[i] * scale) * g;
             if (!std::isfinite(m)) { m = 0.0f; sm[i] = 0.0f; }          // never let a NaN latch into the filters
             mag[i] = std::max(0, std::min((int)m, kHardTotalMax));
-            if (i == S_JOLT) mag[i] = (int)jSign * mag[i];               // signed: the kick pushes one way
+            if (i == S_JOLT && sm[S_JOLT] < 0.0f) mag[i] = -mag[i];     // signed: push, then rebound
         }
     }
 };
