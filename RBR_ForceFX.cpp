@@ -120,11 +120,12 @@ struct Config {
     int   cylinders = 4;             // engine pulses per rev = cylinders / 2
 
     // per-layer ceilings (DirectInput units 0..10000), a fixed total ceiling, and one live level (userGain)
-    int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 3000;
+    int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 2000;
     int   impactMaxMag = 5000;       // landing / hard-hit layer (it gets priority inside TotalMaxMagnitude)
     float impactGain = 1.0f;         // landing sensitivity 0..2 (1 = normal, 0 = off)
     float brakeHzScale = 1.0f;       // brake judder pitch multiplier 0.5..2 (menu)
     float impactHzScale = 1.0f;      // landing hit pitch multiplier 0.5..2 (menu)
+    float airLevel = 0.45f;          // 0.2..0.8: total strut load (fraction of static) below which the car counts as airborne; raise it to catch smaller jumps
     float landingThresh = 1.0f;      // 0.5..3: how hard a no-airtime hit must be to count as a landing (higher = fewer false triggers)
     float landingJolt = 0.80f;        // 0..1: share of the landing budget played as a one-direction kick instead of a buzz (menu)
     float priorityDuck = 0.85f;      // 0..1: how far lower-priority layers fall back while a higher one is active (landing > road > engine)
@@ -194,6 +195,7 @@ void ClampConfig(Config& c) {
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
     c.landingJolt = clampf(c.landingJolt, 0.0f, 1.0f);
     c.landingThresh = clampf(c.landingThresh, 0.5f, 3.0f);
+    c.airLevel = clampf(c.airLevel, 0.2f, 0.8f);
     c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, kHardTotalMax));
     c.userGain   = clampf(c.userGain,   0.0f, 1.0f);
     c.roadGrain = clampf(c.roadGrain, 0.0f, 1.0f);
@@ -233,7 +235,7 @@ void SyncConfig(Config& c, const std::string& path, bool write, const char* sect
     I("EngineMaxMagnitude", c.engineMaxMag); I("RoadMaxMagnitude", c.roadMaxMag);
     I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
     I("ImpactMaxMagnitude", c.impactMaxMag); F("ImpactGain", c.impactGain);
-    F("BrakeHzScale", c.brakeHzScale); F("ImpactHzScale", c.impactHzScale); F("PriorityDuck", c.priorityDuck); F("LandingJolt", c.landingJolt); F("LandingThreshold", c.landingThresh);
+    F("BrakeHzScale", c.brakeHzScale); F("ImpactHzScale", c.impactHzScale); F("PriorityDuck", c.priorityDuck); F("LandingJolt", c.landingJolt); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
@@ -972,24 +974,28 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
         const float rawTot = d.totRatio;
         d.totLow = std::min(rawTot, d.totLow + (rawTot - d.totLow) * alphaFor(dt, 0.12f));
         const float jump = std::max(0.0f, rawTot - d.totLow);
-        const bool off = s.speed > 3.0f && rawTot < 0.35f;
+        const bool off = s.speed > 3.0f && rawTot < c.airLevel;
 
+        // Two tiers: a landing after real airtime (air > 0) is scored sensitively so every jump is felt; the no-airtime
+        // "hit" path (air == 0) keeps the strict scoring, because weight transfer from braking while cornering also
+        // moves strut loads and must not read as a landing.
         auto severity = [&](float peak, float air, float bump, float jmp) {
-            const float peakT = clamp01((peak - 1.3f) / 1.7f);
-            const float jumpT = clamp01((jmp - 0.35f) / 1.4f);
+            const bool sens = air > 0.0f;
+            const float peakT = clamp01((peak - (sens ? 1.15f : 1.3f)) / (sens ? 1.3f : 1.7f));
+            const float jumpT = clamp01((jmp - (sens ? 0.25f : 0.35f)) / (sens ? 1.0f : 1.4f));
             const float airT2 = clamp01(air / 0.5f);
             const float bumpT = clamp01(bump);
             const float top = std::max(std::max(peakT, jumpT), std::max(0.85f * airT2, 0.7f * bumpT));
             const float sum = peakT + jumpT + airT2 + bumpT;
             float sev = clamp01(top + 0.15f * (sum - top));
-            if (air > 0.05f) sev = std::max(sev, 0.25f + 0.45f * airT2);    // anything that left the ground is always felt
+            if (air > 0.04f) sev = std::max(sev, 0.40f + 0.50f * airT2);    // anything that left the ground is always felt
             return sev;
         };
 
         if (off) {
             d.airT += dt;
         } else {
-            if (d.airT > 0.05f && d.landWin <= 0.0f) { d.landWin = 0.10f; d.landAir = d.airT; d.landPeak = 0; d.landBump = 0; d.landJump = 0; }
+            if (d.airT > 0.04f && d.landWin <= 0.0f) { d.landWin = 0.10f; d.landAir = d.airT; d.landPeak = 0; d.landBump = 0; d.landJump = 0; }
             d.airT = 0;
         }
         if (d.landWin > 0.0f) {                                   // refine the estimate while the suspension compresses
@@ -1153,8 +1159,8 @@ struct Synth {
         hz[S_IMPACT] = clampf((26.0f - 10.0f * imp) / std::sqrt(wf), 12.0f, 30.0f) * c.impactHzScale;
         const float body = imp > 0.0f ? Lmax * (1.0f - jf) * std::pow(imp, 1.2f) * (float)std::exp(-jAge / 0.18f) : 0.0f;
         const float t5 = body;
-        const float kickHz = 8.0f / std::sqrt(wf);                                   // heavier car = slower, longer thump
-        const float tjs = jSign * Lmax * jf * imp * (float)std::exp(-jAge / 0.11f) * (float)std::cos(6.2831853f * kickHz * jAge);
+        const float kickHz = 7.0f / std::sqrt(wf);                                   // heavier car = slower, longer thump
+        const float tjs = jSign * Lmax * jf * std::pow(imp, 0.7f) * (float)std::exp(-jAge / 0.15f) * (float)std::cos(6.2831853f * kickHz * jAge);
         hz[S_JOLT] = 50.0f;
 
         // attack / release: road is deliberately fast (sharpness), engine is rounder
@@ -1631,6 +1637,7 @@ private:
             {"Brake gain",                       "BrakeMaxMagnitude",  &Config::brakeMaxMag,  nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Landing gain (ceiling)",           "ImpactMaxMagnitude", &Config::impactMaxMag, nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Landing sensitivity",              "ImpactGain",         nullptr, &Config::impactGain,    0.0f,  2.0f, 0.05f, 'x', false},
+            {"Airborne load level",              "LandingAirLevel",    nullptr, &Config::airLevel,      0.2f,  0.8f, 0.05f, 'x', false},
             {"Landing trigger level",            "LandingThreshold",   nullptr, &Config::landingThresh, 0.5f,  3.0f, 0.1f,  'x', false},
             {"Landing kick (jolt)",              "LandingJolt",        nullptr, &Config::landingJolt,   0.0f,  1.0f, 0.05f, '%', false},
             {"Landing thump (road)",             "ThumpGain",          nullptr, &Config::thumpGain,     0.0f,  2.0f, 0.05f, 'x', false},
