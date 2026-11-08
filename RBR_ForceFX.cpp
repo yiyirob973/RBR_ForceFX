@@ -77,6 +77,7 @@ typedef std::chrono::steady_clock Clock;
 
 // Hard ceilings: the .ini can never push past these, whatever it says.
 constexpr int   kHardTotalMax = 5000;    // sum of all layer magnitudes (0..10000 DirectInput units)
+constexpr int   kHardImpactMax = 8000;   // landing pulse only: lasts a fraction of a second, and the thermal derate still counts its energy
 constexpr float kHardMinHz    = 12.0f;   // below this a vibration becomes a visible wheel swing
 constexpr float kHardMaxHz    = 120.0f;
 constexpr int   kMagDeadband  = 60;      // skip USB updates for changes smaller than this
@@ -121,8 +122,8 @@ struct Config {
 
     // per-layer ceilings (DirectInput units 0..10000), a fixed total ceiling, and one live level (userGain)
     int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 2000;
-    int   impactMaxMag = 5000;       // landing / hard-hit layer (it gets priority inside TotalMaxMagnitude)
-    float impactGain = 1.0f;         // landing sensitivity 0..2 (1 = normal, 0 = off)
+    int   impactMaxMag = 8000;       // landing / hard-hit layer (it gets priority inside TotalMaxMagnitude)
+    float impactGain = 1.5f;         // landing sensitivity 0..3 (1 = old default, 0 = off)
     float brakeHzScale = 1.0f;       // brake judder pitch multiplier 0.5..2 (menu)
     float impactHzScale = 1.0f;      // landing hit pitch multiplier 0.5..2 (menu)
     float airLevel = 0.45f;          // 0.2..0.8: total strut load (fraction of static) below which the car counts as airborne; raise it to catch smaller jumps
@@ -188,8 +189,8 @@ void ClampConfig(Config& c) {
     c.engineMaxMag = std::max(0, std::min(c.engineMaxMag, 10000));
     c.roadMaxMag = std::max(0, std::min(c.roadMaxMag, 10000));
     c.brakeMaxMag = std::max(0, std::min(c.brakeMaxMag, 10000));
-    c.impactMaxMag = std::max(0, std::min(c.impactMaxMag, kHardTotalMax));
-    c.impactGain = clampf(c.impactGain, 0.0f, 2.0f);
+    c.impactMaxMag = std::max(0, std::min(c.impactMaxMag, kHardImpactMax));
+    c.impactGain = clampf(c.impactGain, 0.0f, 3.0f);
     c.brakeHzScale = clampf(c.brakeHzScale, 0.5f, 2.0f);
     c.impactHzScale = clampf(c.impactHzScale, 0.5f, 2.0f);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
@@ -988,7 +989,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
             const float top = std::max(std::max(peakT, jumpT), std::max(0.85f * airT2, 0.7f * bumpT));
             const float sum = peakT + jumpT + airT2 + bumpT;
             float sev = clamp01(top + 0.15f * (sum - top));
-            if (air > 0.04f) sev = std::max(sev, 0.40f + 0.50f * airT2);    // anything that left the ground is always felt
+            if (air > 0.04f) sev = std::max(sev, 0.55f + 0.45f * airT2);    // anything that left the ground is always felt
             return sev;
         };
 
@@ -1020,7 +1021,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
         d.prevPeakRw = d.peakRw;
         d.impactEnv *= std::exp(-dt / (0.30f * clampf(c.weightFeel, 0.5f, 2.0f)));
         if (d.impactEnv < 0.005f) d.impactEnv = 0.0f;
-        s.impact = clamp01(d.impactEnv * c.impactGain);
+        s.impact = clamp01(d.impactEnv * c.impactGain);   // impactGain > 1 lets mid-size hits reach full strength
     }
 
     // ---- braking: front load transfer ("dive") and front wheel lock-up
@@ -1147,7 +1148,7 @@ struct Synth {
         //  * a short, smooth, low-pitched body under it. No random pitch jitter: jitter is what makes the lock-up
         //    feel like grinding, which is great for braking but wrong for a landing.
         const float imp = clamp01(s.impact);
-        const float Lmax = (float)std::min(c.impactMaxMag, kHardTotalMax);
+        const float Lmax = (float)std::min(c.impactMaxMag, kHardImpactMax);
         const float jf = clamp01(c.landingJolt);
         if (imp > 0.05f && impPrev <= 0.05f) {                                       // a new landing: pick the kick direction
             jAge = 0.0f;
@@ -1157,10 +1158,16 @@ struct Synth {
         impPrev = imp;
         jAge = std::min(jAge + dt, 5.0f);
         hz[S_IMPACT] = clampf((26.0f - 10.0f * imp) / std::sqrt(wf), 12.0f, 30.0f) * c.impactHzScale;
-        const float body = imp > 0.0f ? Lmax * (1.0f - jf) * std::pow(imp, 1.2f) * (float)std::exp(-jAge / 0.18f) : 0.0f;
+        const float body = imp > 0.0f ? Lmax * (1.0f - jf) * std::pow(imp, 0.8f) * (float)std::exp(-jAge / 0.22f) : 0.0f;
         const float t5 = body;
-        const float kickHz = 7.0f / std::sqrt(wf);                                   // heavier car = slower, longer thump
-        const float tjs = jSign * Lmax * jf * std::pow(imp, 0.7f) * (float)std::exp(-jAge / 0.15f) * (float)std::cos(6.2831853f * kickHz * jAge);
+        // The kick is a slam: full strength from the first update, held ~45 ms, then a fast decay and one
+        // opposite rebound. (The old cosine was already back at zero after ~36 ms, which felt like a tick.)
+        const float ts = std::sqrt(wf);                                              // heavier car = slower, longer thump
+        const float hold = 0.045f * ts, dec = 0.09f * ts;
+        const float slam = jAge < hold ? 1.0f : (float)std::exp(-(jAge - hold) / dec);
+        const float rb = (jAge - 0.17f * ts) / (0.045f * ts);
+        const float rebound = 0.45f * (float)std::exp(-rb * rb);
+        const float tjs = jSign * Lmax * jf * std::pow(imp, 0.5f) * (slam - rebound);
         hz[S_JOLT] = 50.0f;
 
         // attack / release: road is deliberately fast (sharpness), engine is rounder
@@ -1177,8 +1184,8 @@ struct Synth {
         sm[S_JOLT] = tjs;                                                        // signed and already shaped: no smoothing                                        // instant attack: a landing must hit, not swell
 
         // The impact layer has priority inside the total ceiling: the other layers duck to make room for it.
-        const float jM = std::min(std::fabs(sm[S_JOLT]), (float)kHardTotalMax);
-        const float impM = std::min(std::fabs(sm[S_IMPACT]) + jM, (float)kHardTotalMax);   // buzz + kick share one landing budget   // the hit may use its own ceiling (<= hard max), not just the shared one
+        const float jM = std::min(std::fabs(sm[S_JOLT]), (float)kHardImpactMax);
+        const float impM = std::min(std::fabs(sm[S_IMPACT]) + jM, (float)kHardImpactMax);   // buzz + kick share one landing budget   // the hit may use its own ceiling (<= hard max), not just the shared one
         // Priority: landing (highest) > road > engine (lowest). A lower layer falls back while a higher one is active,
         // so the strongest cue is the one you actually feel. Brake is only pushed back by a landing.
         const float pI = c.impactMaxMag > 0 ? clamp01(impM / (float)c.impactMaxMag) : 0.0f;
@@ -1198,7 +1205,7 @@ struct Synth {
         // Slow thermal derate on the level actually delivered to the wheel (live gain included): turning the
         // live gain down therefore relieves the derate instead of stacking with it.
         const float ug = clampf(userGain, 0.0f, 1.0f);
-        const float lvl = std::min(sum * scale, (float)kHardTotalMax) / 10000.0f * ug;
+        const float lvl = std::min(sum, (float)kHardImpactMax) / 10000.0f * ug;   // sum already includes the duck scale
         heat += (lvl * lvl - heat) * alphaFor(dt, 20.0f);
         const float derate = heat > c.sustainedLimit ? std::sqrt(c.sustainedLimit / heat) : 1.0f;
 
@@ -1206,7 +1213,7 @@ struct Synth {
         for (int i = 0; i < S_COUNT; ++i) {
             float m = (i == S_IMPACT ? std::max(0.0f, impM - jM) : i == S_JOLT ? jM : sm[i] * duck[i] * scale) * g;
             if (!std::isfinite(m)) { m = 0.0f; sm[i] = 0.0f; }          // never let a NaN latch into the filters
-            mag[i] = std::max(0, std::min((int)m, kHardTotalMax));
+            mag[i] = std::max(0, std::min((int)m, (i == S_IMPACT || i == S_JOLT) ? kHardImpactMax : kHardTotalMax));
             if (i == S_JOLT && sm[S_JOLT] < 0.0f) mag[i] = -mag[i];     // signed: push, then rebound
         }
     }
@@ -1635,8 +1642,8 @@ private:
             {"Engine gain",                      "EngineMaxMagnitude", &Config::engineMaxMag, nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Road gain",                        "RoadMaxMagnitude",   &Config::roadMaxMag,   nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Brake gain",                       "BrakeMaxMagnitude",  &Config::brakeMaxMag,  nullptr,  0.0f,   M,    100.0f, 'g', false},
-            {"Landing gain (ceiling)",           "ImpactMaxMagnitude", &Config::impactMaxMag, nullptr,  0.0f,   M,    100.0f, 'g', false},
-            {"Landing sensitivity",              "ImpactGain",         nullptr, &Config::impactGain,    0.0f,  2.0f, 0.05f, 'x', false},
+            {"Landing gain (ceiling)",           "ImpactMaxMagnitude", &Config::impactMaxMag, nullptr,  0.0f,   (float)kHardImpactMax, 100.0f, 'g', false},
+            {"Landing sensitivity",              "ImpactGain",         nullptr, &Config::impactGain,    0.0f,  3.0f, 0.05f, 'x', false},
             {"Airborne load level",              "LandingAirLevel",    nullptr, &Config::airLevel,      0.2f,  0.8f, 0.05f, 'x', false},
             {"Landing trigger level",            "LandingThreshold",   nullptr, &Config::landingThresh, 0.5f,  3.0f, 0.1f,  'x', false},
             {"Landing kick (jolt)",              "LandingJolt",        nullptr, &Config::landingJolt,   0.0f,  1.0f, 0.05f, '%', false},
@@ -1711,6 +1718,51 @@ private:
         std::string e;
         for (; *t; ++t) { e += *t; if (*t == '%') e += '%'; }
         game_->WriteText(x, y, e.c_str());
+    }
+
+    // One-line description of what each setting does, shown under the list for the highlighted row.
+    static const char* TipFor(const char* key) {
+        struct T { const char* k; const char* t; };
+        static const T tips[] = {
+            {"UserGain",           "Overall level for every added effect. Only lowers output; also on Numpad +/- while driving."},
+            {"TotalMaxMagnitude",  "Cap on engine, road and brake combined. Lower it if the wheel feels too busy or too strong."},
+            {"EngineMaxMagnitude", "Strength of the engine vibration. It has the lowest priority and gives way to road and landings."},
+            {"RoadMaxMagnitude",   "Strength of surface texture and bumps. Higher feels rougher on gravel, dirt and kerbs."},
+            {"BrakeMaxMagnitude",  "Strength of the braking judder and front-wheel lock-up shake."},
+            {"ImpactMaxMagnitude", "Peak strength of the landing hit. Landings are short, so this may go above the total ceiling."},
+            {"ImpactGain",         "How hard landings and big hits are scored. Higher = even small jumps hit at full strength."},
+            {"LandingAirLevel",    "How light the car must get to count as airborne. Higher catches smaller hops and crests."},
+            {"LandingThreshold",   "How hard a hit without airtime must be to count. Raise it if braking or weight shifts trigger it."},
+            {"LandingJolt",        "Landing mix: high = one hard shove (a slam), low = a short low-pitched buzz instead."},
+            {"ThumpGain",          "Extra thump added to the road layer on landings and heavy compressions."},
+            {"PriorityDuck",       "How much engine and road fade back while a higher-priority effect plays. 0 = no ducking."},
+            {"EngineMinHz",        "Engine vibration pitch at idle. Lower is deeper and slower."},
+            {"EngineMaxHz",        "Engine vibration pitch at the rev limit. The rev limit comes from telemetry."},
+            {"RoadMinHz",          "Road vibration pitch at low speed on smooth ground."},
+            {"RoadMaxHz",          "Road vibration pitch at high speed or on rough ground. Higher feels sharper and finer."},
+            {"BrakeHzScale",       "Pitch of the braking judder. Below 1 = slower and coarser, above 1 = faster and finer."},
+            {"ImpactHzScale",      "Pitch of the landing buzz. Below 1 = deeper and heavier, above 1 = sharper."},
+        };
+        for (const T& t : tips) if (std::strcmp(t.k, key) == 0) return t.t;
+        return "";
+    }
+
+    // Splits text over several screen lines at spaces.
+    void DrawWrapped(const char* text, float x, float& y, size_t maxChars) {
+        std::string rest(text);
+        while (!rest.empty()) {
+            std::string ln;
+            if (rest.size() <= maxChars) { ln = rest; rest.clear(); }
+            else {
+                size_t cut = rest.rfind(' ', maxChars);
+                if (cut == std::string::npos || cut == 0) cut = maxChars;
+                ln = rest.substr(0, cut);
+                rest = rest.substr(cut);
+                while (!rest.empty() && rest[0] == ' ') rest.erase(0, 1);
+            }
+            WriteSafe(x, y, ln.c_str());
+            y += 19.0f;
+        }
     }
 
     void DrawRawPage() {
@@ -1872,6 +1924,18 @@ public:
         snprintf(buf, sizeof(buf), "Up/Down choose (%d/%d)  Left/Right change  (live, saved to ini)",
                  m_cursor + 1, total);
         line(buf);
+        {   // tooltip for the highlighted row
+            const char* tip = "";
+            if (m_cursor == 0) tip = "Choose your wheel with Left/Right, then Select to connect. The name is saved for next time.";
+            else if (m_cursor == 1) tip = "Plays a built-in demo of engine, gravel, dirt, braking and landing hits so you can tune without driving.";
+            else if (m_cursor == iView) tip = "Live telemetry values and raw packet bytes. Useful for troubleshooting with no effects.";
+            else if (m_cursor == iReset) tip = "Restores the gains and frequencies on this page to the built-in defaults. Select twice to confirm.";
+            else tip = TipFor(m_rows[m_cursor - 2].key);
+            game_->SetMenuColor(IRBRGame::MENU_HEADING);
+            y += 4.0f;
+            DrawWrapped(tip, 70.0f, y, 88);
+            game_->SetMenuColor(IRBRGame::MENU_TEXT);
+        }
         line("Car profiles scale the engine and road gains on top of these values.");
     }
 
