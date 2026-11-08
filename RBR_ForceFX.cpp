@@ -128,6 +128,7 @@ struct Config {
     float impactHzScale = 1.0f;      // landing hit pitch multiplier 0.5..2 (menu)
     float airLevel = 0.45f;          // 0.2..0.8: total strut load (fraction of static) below which the car counts as airborne; raise it to catch smaller jumps
     float landingThresh = 1.0f;      // 0.5..3: how hard a no-airtime hit must be to count as a landing (higher = fewer false triggers)
+    float bumpKick = 1.0f;           // 0..2: strength of the left-right kick fired by ordinary bumps (0 = landings only)
     float landingJolt = 0.80f;        // 0..1: share of the landing budget played as a one-direction kick instead of a buzz (menu)
     float priorityDuck = 0.85f;      // 0..1: how far lower-priority layers fall back while a higher one is active (landing > road > engine)
     int   totalMaxMag = 4000;        // all layers together are scaled down to this (hard ceiling kHardTotalMax)
@@ -195,6 +196,7 @@ void ClampConfig(Config& c) {
     c.impactHzScale = clampf(c.impactHzScale, 0.5f, 2.0f);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
     c.landingJolt = clampf(c.landingJolt, 0.0f, 1.0f);
+    c.bumpKick = clampf(c.bumpKick, 0.0f, 2.0f);
     c.landingThresh = clampf(c.landingThresh, 0.5f, 3.0f);
     c.airLevel = clampf(c.airLevel, 0.2f, 0.8f);
     c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, kHardTotalMax));
@@ -236,7 +238,7 @@ void SyncConfig(Config& c, const std::string& path, bool write, const char* sect
     I("EngineMaxMagnitude", c.engineMaxMag); I("RoadMaxMagnitude", c.roadMaxMag);
     I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
     I("ImpactMaxMagnitude", c.impactMaxMag); F("ImpactGain", c.impactGain);
-    F("BrakeHzScale", c.brakeHzScale); F("ImpactHzScale", c.impactHzScale); F("PriorityDuck", c.priorityDuck); F("LandingJolt", c.landingJolt); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
+    F("BrakeHzScale", c.brakeHzScale); F("ImpactHzScale", c.impactHzScale); F("PriorityDuck", c.priorityDuck); F("LandingJolt", c.landingJolt); F("BumpKick", c.bumpKick); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
@@ -842,6 +844,9 @@ struct Signals {
     float airborne = 0;   // 0 = wheels loaded, 1 = off the ground
     float thumpL = 0, thumpR = 0;   // compression / landing envelope per side
     float impact = 0;     // landing / hard-hit severity envelope 0..1 (instant attack, decays)
+    unsigned evtSeq = 0;  // bumped for every landing / hit / bump event; the synth fires one left-right kick per event
+    float evtSev = 0;     // severity of the current event 0..1 (refined upward while a landing is still compressing)
+    float evtDir = -1;    // first-stroke direction of the current event: -1 = left, +1 = right
     float staticLoad = 0; // learned static strut load, all four wheels (units of the telemetry)
 };
 
@@ -863,6 +868,7 @@ struct Dsp {
     // landing / impact detector (works on raw, unsmoothed load so the spike is not averaged away)
     float peakRw = 0, prevPeakRw = 0, totRatio = 1;
     float airT = 0, landWin = 0, landAir = 0, landPeak = 0, landBump = 0, landJump = 0, imRefr = 0, impactEnv = 0;
+    unsigned evtSeq = 0; float evtSev = 0, evtDir = -1, rawL = 1, rawR = 1, bumpRefr = 0, bumpPrevSig = 0;
     float totLow = 1.0f;   // running minimum of total strut load (relative): a sudden rise above it = something hit the car
 };
 
@@ -937,6 +943,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
             d.thumpL = std::max(clamp01((rl  - 1.7f) / 1.2f), d.thumpL * eDecay);
             d.thumpR = std::max(clamp01((rr2 - 1.7f) / 1.2f), d.thumpR * eDecay);
             s.thumpL = d.thumpL; s.thumpR = d.thumpR;
+            d.rawL = rl; d.rawR = rr2;
         }
     }
 
@@ -993,10 +1000,23 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
             return sev;
         };
 
+        // Every landing, hit and bump fires ONE event: a hard kick to one side, then back the other way. The first
+        // side follows which side took the load. The synth plays the kick; here we only count and score events.
+        auto fire = [&](float sev) {
+            ++d.evtSeq; d.evtSev = sev;
+            const float diff = d.rawL - d.rawR;
+            if (std::fabs(diff) > 0.05f) d.evtDir = diff > 0.0f ? -1.0f : 1.0f;   // loaded left tyre: wheel snaps left first
+            else d.evtDir = -d.evtDir;                                           // symmetric: alternate
+        };
+        d.bumpRefr = std::max(0.0f, d.bumpRefr - dt);
+
         if (off) {
             d.airT += dt;
         } else {
-            if (d.airT > 0.04f && d.landWin <= 0.0f) { d.landWin = 0.10f; d.landAir = d.airT; d.landPeak = 0; d.landBump = 0; d.landJump = 0; }
+            if (d.airT > 0.04f && d.landWin <= 0.0f) {
+                d.landWin = 0.10f; d.landAir = d.airT; d.landPeak = 0; d.landBump = 0; d.landJump = 0;
+                fire(severity(0.0f, d.landAir, 0.0f, 0.0f));
+            }
             d.airT = 0;
         }
         if (d.landWin > 0.0f) {                                   // refine the estimate while the suspension compresses
@@ -1005,6 +1025,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
             d.landJump = std::max(d.landJump, jump);
             const float sev = severity(d.landPeak, d.landAir, d.landBump, d.landJump);
             d.impactEnv = std::max(d.impactEnv, sev);
+            d.evtSev = std::max(d.evtSev, sev);
             d.landWin -= dt;
             if (d.landWin <= 0.0f) {
                 d.landWin = 0.0f; d.imRefr = 0.15f;
@@ -1014,14 +1035,29 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
             const float sev = severity(d.peakRw, 0.0f, clamp01(d.bumpEnv), jump);
             if (sev > 0.12f) {
                 d.impactEnv = std::max(d.impactEnv, sev);
-                d.imRefr = 0.15f;
+                d.imRefr = 0.15f; d.bumpRefr = 0.10f;
+                fire(sev);
                 Logf("hit: severity %.2f  (peak load %.2f, load jump %.2f, heave %.2f)", sev, d.peakRw, jump, clamp01(d.bumpEnv));
             }
+        } else if (!off && c.bumpKick > 0.0f && d.bumpRefr <= 0.0f && s.speed > 3.0f) {
+            // ordinary bump: a fresh heave / tyre-load spike, scored small, same left-right kick
+            const float sig = std::max(clamp01(d.bumpEnv), 0.8f * std::max(s.thumpL, s.thumpR));
+            const float thr = 0.30f * c.landingThresh;
+            if (sig > thr && sig > d.bumpPrevSig + 0.03f) {
+                const float sev = clamp01((0.12f + 0.55f * clamp01((sig - thr) / 0.6f)) * c.bumpKick);
+                d.impactEnv = std::max(d.impactEnv, sev);
+                d.bumpRefr = 0.09f;
+                fire(sev);
+            }
+            d.bumpPrevSig = sig;
+        } else {
+            d.bumpPrevSig = std::max(clamp01(d.bumpEnv), 0.8f * std::max(s.thumpL, s.thumpR));
         }
         d.prevPeakRw = d.peakRw;
         d.impactEnv *= std::exp(-dt / (0.30f * clampf(c.weightFeel, 0.5f, 2.0f)));
         if (d.impactEnv < 0.005f) d.impactEnv = 0.0f;
         s.impact = clamp01(d.impactEnv * c.impactGain);   // impactGain > 1 lets mid-size hits reach full strength
+        s.evtSeq = d.evtSeq; s.evtSev = clamp01(d.evtSev * c.impactGain); s.evtDir = d.evtDir * (c.roadSideInvert ? -1.0f : 1.0f);
     }
 
     // ---- braking: front load transfer ("dive") and front wheel lock-up
@@ -1053,7 +1089,8 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 struct Synth {
     float sm[S_COUNT] = {};
     float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
-    float jSign = 1.0f, impPrev = 0.0f, jAge = 5.0f;   // direction of the current landing kick
+    float jSign = 1.0f, jAge = 5.0f, kickAmp = 0.0f;   // direction, age and strength of the current kick
+    unsigned seenEvt = 0;
     float roadJit[2] = {1.0f, 1.0f}, ampJit[2] = {1.0f, 1.0f}, engJit = 1.0f, engHzJit = 1.0f, unevPhase = 0;
     double nextJit = 0;
 
@@ -1150,24 +1187,27 @@ struct Synth {
         const float imp = clamp01(s.impact);
         const float Lmax = (float)std::min(c.impactMaxMag, kHardImpactMax);
         const float jf = clamp01(c.landingJolt);
-        if (imp > 0.05f && impPrev <= 0.05f) {                                       // a new landing: pick the kick direction
-            jAge = 0.0f;
-            if (std::fabs(s.loadL - s.loadR) > 0.05f) jSign = (s.loadL > s.loadR ? -1.0f : 1.0f) * (c.roadSideInvert ? -1.0f : 1.0f);
-            else jSign = -jSign;                                                     // symmetric: alternate sides
+        if (s.evtSeq != seenEvt) {                                                   // new landing / hit / bump: restart the kick
+            seenEvt = s.evtSeq;
+            jAge = 0.0f; kickAmp = s.evtSev; jSign = s.evtDir;
         }
-        impPrev = imp;
+        if (jAge < 0.08f) kickAmp = std::max(kickAmp, s.evtSev);                     // a landing is scored over its first ~100 ms
         jAge = std::min(jAge + dt, 5.0f);
         hz[S_IMPACT] = clampf((26.0f - 10.0f * imp) / std::sqrt(wf), 12.0f, 30.0f) * c.impactHzScale;
         const float body = imp > 0.0f ? Lmax * (1.0f - jf) * std::pow(imp, 0.8f) * (float)std::exp(-jAge / 0.22f) : 0.0f;
         const float t5 = body;
-        // The kick is a slam: full strength from the first update, held ~45 ms, then a fast decay and one
-        // opposite rebound. (The old cosine was already back at zero after ~36 ms, which felt like a tick.)
+        // The kick: a hard shove one way, then an almost equally hard shove back, then a smaller ring-out.
+        // Piecewise-linear shape in units of time (scaled by car weight); ~15 ms ramps instead of instant reversals.
         const float ts = std::sqrt(wf);                                              // heavier car = slower, longer thump
-        const float hold = 0.045f * ts, dec = 0.09f * ts;
-        const float slam = jAge < hold ? 1.0f : (float)std::exp(-(jAge - hold) / dec);
-        const float rb = (jAge - 0.17f * ts) / (0.045f * ts);
-        const float rebound = 0.45f * (float)std::exp(-rb * rb);
-        const float tjs = jSign * Lmax * jf * std::pow(imp, 0.5f) * (slam - rebound);
+        static const float kT[] = {0.000f, 0.055f, 0.070f, 0.140f, 0.155f, 0.210f, 0.225f, 0.290f, 0.305f};
+        static const float kV[] = {1.00f,  1.00f, -0.95f, -0.95f,  0.50f,  0.50f, -0.22f, -0.22f,  0.00f};
+        float wave = 0.0f;
+        { const float u = jAge / ts;
+          if (u < kT[8]) {
+              int k = 0; while (k < 7 && u >= kT[k + 1]) ++k;
+              wave = kV[k] + (kV[k + 1] - kV[k]) * clamp01((u - kT[k]) / (kT[k + 1] - kT[k]));
+          } }
+        const float tjs = jSign * Lmax * jf * std::pow(clamp01(kickAmp), 0.7f) * wave;
         hz[S_JOLT] = 50.0f;
 
         // attack / release: road is deliberately fast (sharpness), engine is rounder
@@ -1360,6 +1400,10 @@ private:
             const double lt = std::fmod(ph - 13.0, 1.5);
             const float big = std::fmod(ph - 13.0, 3.0) < 1.5 ? 1.0f : 0.5f;
             s.impact = big * (float)std::exp(-lt / 0.40);   // same ring-out as a real landing
+            static double prevLt = 99.0; static unsigned seq = 0; static float dir = -1.0f;
+            if (lt < prevLt) { ++seq; dir = -dir; }                                  // a new hit: left-right, then right-left
+            prevLt = lt;
+            s.evtSeq = seq; s.evtSev = big; s.evtDir = dir;
         }
         if (m_testPhase != 2) s.texL = s.texR = s.texture;
     }
@@ -1647,6 +1691,7 @@ private:
             {"Airborne load level",              "LandingAirLevel",    nullptr, &Config::airLevel,      0.2f,  0.8f, 0.05f, 'x', false},
             {"Landing trigger level",            "LandingThreshold",   nullptr, &Config::landingThresh, 0.5f,  3.0f, 0.1f,  'x', false},
             {"Landing kick (jolt)",              "LandingJolt",        nullptr, &Config::landingJolt,   0.0f,  1.0f, 0.05f, '%', false},
+            {"Bump kick",                        "BumpKick",           nullptr, &Config::bumpKick,      0.0f,  2.0f, 0.05f, 'x', false},
             {"Landing thump (road)",             "ThumpGain",          nullptr, &Config::thumpGain,     0.0f,  2.0f, 0.05f, 'x', false},
             {"Priority ducking",                 "PriorityDuck",       nullptr, &Config::priorityDuck,  0.0f,  1.0f, 0.05f, '%', false},
             // frequencies
@@ -1733,7 +1778,8 @@ private:
             {"ImpactGain",         "How hard landings and big hits are scored. Higher = even small jumps hit at full strength."},
             {"LandingAirLevel",    "How light the car must get to count as airborne. Higher catches smaller hops and crests."},
             {"LandingThreshold",   "How hard a hit without airtime must be to count. Raise it if braking or weight shifts trigger it."},
-            {"LandingJolt",        "Landing mix: high = one hard shove (a slam), low = a short low-pitched buzz instead."},
+            {"LandingJolt",        "Landing mix: high = hard left-right kick, low = a short low-pitched buzz instead."},
+            {"BumpKick",           "Strength of the left-right kick on ordinary bumps. 0 = landings only. Lower it if gravel feels too banging."},
             {"ThumpGain",          "Extra thump added to the road layer on landings and heavy compressions."},
             {"PriorityDuck",       "How much engine and road fade back while a higher-priority effect plays. 0 = no ducking."},
             {"EngineMinHz",        "Engine vibration pitch at idle. Lower is deeper and slower."},
