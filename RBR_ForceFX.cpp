@@ -129,7 +129,7 @@ struct Config {
     float airLevel = 0.45f;          // 0.2..0.8: total strut load (fraction of static) below which the car counts as airborne; raise it to catch smaller jumps
     float landingThresh = 1.0f;      // 0.5..3: how hard a no-airtime hit must be to count as a landing (higher = fewer false triggers)
     int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandKick = 1, fxLandBody = 1, fxBumpKick = 1;
-    int   fxKickMode = 2;            // kick delivery: 2 = SYNTH (signed waveform computed in software, sent as constant force), 1 = BURST (periodic effect restarted per event), 0 = PUSH (slow constant-force shove)   // 1 = effect on, 0 = off (menu switches, for diagnosing)
+    int   fxKickMode = 3;            // kick delivery: 3 = SAW (sawtooth pair, direction from the waveform edge), 2 = SYNTH (signed waveform computed in software, sent as constant force), 1 = BURST (periodic effect restarted per event), 0 = PUSH (slow constant-force shove)   // 1 = effect on, 0 = off (menu switches, for diagnosing)
     float bumpKick = 1.0f;           // 0..2: strength of the left-right kick fired by ordinary bumps (0 = landings only)
     float landingJolt = 0.90f;        // 0..1: share of the landing budget played as a one-direction kick instead of a buzz (menu)
     float priorityDuck = 0.85f;      // 0..1: how far lower-priority layers fall back while a higher one is active (landing > road > engine)
@@ -200,7 +200,7 @@ void ClampConfig(Config& c) {
     c.landingJolt = clampf(c.landingJolt, 0.0f, 1.0f);
     c.bumpKick = clampf(c.bumpKick, 0.0f, 2.0f);
     c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0;
-    c.fxKickMode = std::max(0, std::min(c.fxKickMode, 2));
+    c.fxKickMode = std::max(0, std::min(c.fxKickMode, 3));
     c.fxLandKick = c.fxLandKick ? 1 : 0; c.fxLandBody = c.fxLandBody ? 1 : 0; c.fxBumpKick = c.fxBumpKick ? 1 : 0;
     c.landingThresh = clampf(c.landingThresh, 0.5f, 3.0f);
     c.airLevel = clampf(c.airLevel, 0.2f, 0.8f);
@@ -694,8 +694,8 @@ BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
     return DIENUM_CONTINUE;
 }
 
-enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD, S_ROADR, S_BRAKE, S_IMPACT, S_JOLT, S_KICK, S_COUNT };   // S_KICK = periodic burst kick, restarted at each event so its first stroke has a chosen direction   // S_JOLT = one-direction constant-force kick (signed magnitude)   // S_ROAD = sawtooth-up (sharp edge toward negative/left), S_ROADR = sawtooth-down
-const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-A", "road-B", "brake", "impact", "jolt", "kick"};
+enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD, S_ROADR, S_BRAKE, S_IMPACT, S_JOLT, S_KICK, S_KICKA, S_KICKB, S_COUNT };   // S_KICKA/B = sawtooth pair for the SAW kick: direction comes from the waveform's sharp edge, not from phase or sign   // S_KICK = periodic burst kick, restarted at each event so its first stroke has a chosen direction   // S_JOLT = one-direction constant-force kick (signed magnitude)   // S_ROAD = sawtooth-up (sharp edge toward negative/left), S_ROADR = sawtooth-down
+const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-A", "road-B", "brake", "impact", "jolt", "kick", "kickA", "kickB"};
 
 class FFLayer {
 public:
@@ -714,7 +714,7 @@ public:
         if (axisId == 0xFFFFFFFF) return E_NOTIMPL;      // no force feedback actuator
         m_axisId = axisId;
 
-        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown, &GUID_Sine, &GUID_Sine, &GUID_ConstantForce, &GUID_Sine };   // impact buzz uses the same sine as brake/engine: some bases treat square effects much weaker
+        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown, &GUID_Sine, &GUID_Sine, &GUID_ConstantForce, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown };   // impact buzz uses the same sine as brake/engine: some bases treat square effects much weaker
         HRESULT firstErr = DI_OK;
         int ok = 0;
         for (int i = 0; i < S_COUNT; ++i) {
@@ -1267,12 +1267,29 @@ struct Synth {
         follow(S_ROADR, c.fxRoad ? tRoadB : 0.0f, 0.55f, roadDown);
         follow(S_BRAKE, c.fxBrake ? t4 : 0.0f, 0.50f, 0.20f);
         follow(S_IMPACT, t5, 1.00f, 0.50f);
+        // SAW: direction is carried by the waveform itself. Sawtooth-up has its sharp edge toward negative (left), sawtooth-down
+        // toward positive (right), and those edges are produced by the wheel's own effect engine at full speed. We only switch
+        // which of the two is audible, one period at a time: left-edge, right-edge, left-edge ... (or right first), fading out.
+        float tSawA = 0.0f, tSawB = 0.0f;
+        if (kickOn && c.fxKickMode == 3) {
+            static const float kW[] = {1.00f, 0.90f, 0.55f, 0.30f, 0.15f};
+            const float per = 1.0f / hzK;
+            const int w = (int)(jAge / per);
+            if (w < 5) {
+                const float amp = kAmpl * kW[w];
+                const bool firstIsA = jSign < 0.0f;                       // A = sharp edge to the left
+                const bool useA = ((w & 1) == 0) ? firstIsA : !firstIsA;
+                if (useA) tSawA = amp; else tSawB = amp;
+            }
+        }
+        hz[S_KICKA] = hz[S_KICKB] = hzK;
+        sm[S_KICKA] = tSawA; sm[S_KICKB] = tSawB;
         sm[S_KICK] = tkick;
         sm[S_JOLT] = tjs;                                                        // signed and already shaped: no smoothing                                        // instant attack: a landing must hit, not swell
 
         // The impact layer has priority inside the total ceiling: the other layers duck to make room for it.
         const float jJ = std::min(std::fabs(sm[S_JOLT]), (float)kHardImpactMax);
-        const float jK = std::min(sm[S_KICK], (float)kHardImpactMax);
+        const float jK = std::min(sm[S_KICK] + sm[S_KICKA] + sm[S_KICKB], (float)kHardImpactMax);
         const float jM = std::min(jJ + jK, (float)kHardImpactMax);
         const float impM = std::min(std::fabs(sm[S_IMPACT]) + jM, (float)kHardImpactMax);   // buzz + kick share one landing budget   // the hit may use its own ceiling (<= hard max), not just the shared one
         // Priority: landing (highest) > road > engine (lowest). A lower layer falls back while a higher one is active,
@@ -1281,12 +1298,12 @@ struct Synth {
         const float pR = c.roadMaxMag > 0 ? clamp01(std::max(std::fabs(sm[S_ROAD]), std::fabs(sm[S_ROADR])) / (float)c.roadMaxMag) : 0.0f;
         const float dk = clampf(c.priorityDuck, 0.0f, 1.0f);
         float duck[S_COUNT];
-        duck[S_IMPACT] = duck[S_JOLT] = duck[S_KICK] = 1.0f;
+        duck[S_IMPACT] = duck[S_JOLT] = duck[S_KICK] = duck[S_KICKA] = duck[S_KICKB] = 1.0f;
         duck[S_ROAD] = duck[S_ROADR] = 1.0f - dk * pI;
         duck[S_ENG1] = duck[S_ENG2] = (1.0f - dk * pI) * (1.0f - dk * pR);
         duck[S_BRAKE] = 1.0f - 0.6f * dk * pI;
         float sumO = 0;
-        for (int i = 0; i < S_COUNT; ++i) if (i != S_IMPACT && i != S_JOLT && i != S_KICK) sumO += std::fabs(sm[i]) * duck[i];
+        for (int i = 0; i < S_COUNT; ++i) if (i != S_IMPACT && i != S_JOLT && i != S_KICK && i != S_KICKA && i != S_KICKB) sumO += std::fabs(sm[i]) * duck[i];
         const float room = std::max(0.0f, (float)c.totalMaxMag - impM);   // others duck fully when the hit fills the ceiling
         const float scale = sumO > room && sumO > 0.0f ? room / sumO : 1.0f;
         const float sum = sumO * scale + impM;
@@ -1302,10 +1319,10 @@ struct Synth {
         lastDerate = derate;
         const float gk = ug * clampf(std::sqrt(derate), 0.70f + 0.15f * ov, 1.0f);   // a 0.3 s kick is not what heats the motor: it gets a softer derate (never below 70%)
         for (int i = 0; i < S_COUNT; ++i) {
-            float m = (i == S_IMPACT ? std::max(0.0f, impM - jM) * gk : i == S_JOLT ? jJ * gk : i == S_KICK ? jK * gk : sm[i] * duck[i] * scale * g);
+            float m = (i == S_IMPACT ? std::max(0.0f, impM - jM) * gk : i == S_JOLT ? jJ * gk : (i == S_KICK || i == S_KICKA || i == S_KICKB) ? sm[i] * gk : sm[i] * duck[i] * scale * g);
             if (!std::isfinite(m)) { m = 0.0f; sm[i] = 0.0f; }          // never let a NaN latch into the filters
-            mag[i] = std::max(0, std::min((int)m, (i == S_IMPACT || i == S_JOLT || i == S_KICK) ? kHardImpactMax : kHardTotalMax));
-            if (i == S_JOLT || i == S_KICK) kickPk = std::max(kickPk, (float)mag[i]);
+            mag[i] = std::max(0, std::min((int)m, (i == S_IMPACT || i == S_JOLT || i == S_KICK || i == S_KICKA || i == S_KICKB) ? kHardImpactMax : kHardTotalMax));
+            if (i == S_JOLT || i == S_KICK || i == S_KICKA || i == S_KICKB) kickPk = std::max(kickPk, (float)mag[i]);
             if (i == S_JOLT && sm[S_JOLT] < 0.0f) mag[i] = -mag[i];     // signed: push, then rebound
         }
     }
@@ -1742,7 +1759,7 @@ private:
             {"Effect: Braking",                  "EnableBrake",        &Config::fxBrake,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Landing kick L-R",         "EnableLandingKick",  &Config::fxLandKick,   nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Landing buzz",             "EnableLandingBody",  &Config::fxLandBody,   nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
-            {"Kick delivery",                    "KickMode",           &Config::fxKickMode,   nullptr,  0.0f,   2.0f, 1.0f, 'k', false},
+            {"Kick delivery",                    "KickMode",           &Config::fxKickMode,   nullptr,  0.0f,   3.0f, 1.0f, 'k', false},
             {"Effect: Bump kick L-R",            "EnableBumpKick",     &Config::fxBumpKick,   nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             // gains
             {"Live level (Numpad +/- in game)", "UserGain",           nullptr, &Config::userGain,      0.0f,  1.0f, 0.05f, '%', true },
@@ -1779,7 +1796,7 @@ private:
             case 'g': snprintf(out, n, "%d", (int)std::lround(v)); break;
             case '%': snprintf(out, n, "%.0f%%", v * 100.0f); break;
             case 'H': snprintf(out, n, "%.0f Hz", v); break;
-            case 'k': snprintf(out, n, "%s", v >= 1.5f ? "SYNTH" : v >= 0.5f ? "BURST" : "PUSH"); break;
+            case 'k': snprintf(out, n, "%s", v >= 2.5f ? "SAW" : v >= 1.5f ? "SYNTH" : v >= 0.5f ? "BURST" : "PUSH"); break;
             case 'p': snprintf(out, n, "%.0f%%", v / 100.0f); break;
             case 'o': snprintf(out, n, "%s", v >= 0.5f ? "ON" : "OFF"); break;
             default:  snprintf(out, n, "x%.2f", v); break;
@@ -1836,7 +1853,7 @@ private:
     static const char* TipFor(const char* key) {
         struct T { const char* k; const char* t; };
         static const T tips[] = {
-            {"KickMode",           "SYNTH = signed left-right waveform computed in software (default). BURST = periodic effect. PUSH = slow shove."},
+            {"KickMode",           "SAW = left/right sawtooth edges from the wheel's own effect engine (default). SYNTH, BURST, PUSH = alternatives."},
             {"EnableEngine",       "Switch the engine vibration on or off. Left/Right or Select toggles it. For diagnosing."},
             {"EnableRoad",         "Switch road texture and surface vibration on or off. For diagnosing."},
             {"EnableBrake",        "Switch braking judder and lock-up shake on or off. For diagnosing."},
@@ -2097,7 +2114,7 @@ public:
         } else if (dir) {
             AdjustRow(m_cursor - 2, dir);
         } else if (bSelect && (m_rows[m_cursor - 2].fmt == 'o' || m_rows[m_cursor - 2].fmt == 'k')) {                      // Select flips an ON/OFF switch
-            AdjustRow(m_cursor - 2, m_rows[m_cursor - 2].fmt == 'k' ? (RowValue(m_rows[m_cursor - 2]) >= 1.5f ? -2 : 1) : (RowValue(m_rows[m_cursor - 2]) >= 0.5f ? -1 : 1));
+            AdjustRow(m_cursor - 2, m_rows[m_cursor - 2].fmt == 'k' ? (RowValue(m_rows[m_cursor - 2]) >= 2.5f ? -3 : 1) : (RowValue(m_rows[m_cursor - 2]) >= 0.5f ? -1 : 1));
         }
     }
 
