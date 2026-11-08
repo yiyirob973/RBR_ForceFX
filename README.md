@@ -21,7 +21,7 @@ The result is a more detailed and immersive wheel experience, with a focus on ro
 - Road and tyre feedback with side-aware vibration and texture variation
 - Engine vibration tuned across the rev range
 - Brake judder and front-lock cues
-- Landing/thump effects and impact response
+- Landing boost: a detected landing or hard hit scales up RBR's own steering force (no extra effect is layered on top)
 - Load-sensitive suspension and weight feel adjustments
 - Per-car profiles matched by car name
 - In-game settings menu in RBR for live tuning

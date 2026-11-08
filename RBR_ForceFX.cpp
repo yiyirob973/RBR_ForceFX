@@ -19,8 +19,8 @@
 //            (high-passed strut force / mean load, as in RbrSurfaceAudio) and damper piston velocity.
 //            Symmetric vibration only: RBR's own steering force is never overridden.
 //            Smooth tarmac = nothing, gravel = grit, rough / dirt / kerbs = violent and sharp.
-//   IMPACT   square burst on landings / hard compressions: instant attack, short decay, symmetric (zero-mean). Own layer with
-//            its own ceiling (ImpactMaxMagnitude); while it plays the other layers duck so the hit is not diluted.
+//   LANDING  no effect of its own: a detected landing / hard hit boosts RBR's own steering force (a hook on its
+//            constant-force updates multiplies it and adds a minimum push in the direction RBR already pushes).
 //   BRAKE    sine: front-end judder under braking, grows with brake pedal and front load transfer (dive);
 //            front wheel lock-up (from the tyre segment counter vs car speed) makes it harsh.
 //
@@ -77,7 +77,6 @@ typedef std::chrono::steady_clock Clock;
 
 // Hard ceilings: the .ini can never push past these, whatever it says.
 constexpr int   kHardTotalMax = 5000;    // sum of all layer magnitudes (0..10000 DirectInput units)
-constexpr int   kHardImpactMax = 10000;   // landing pulse only: lasts a fraction of a second, and the thermal derate still counts its energy
 constexpr float kHardMinHz    = 12.0f;   // below this a vibration becomes a visible wheel swing
 constexpr float kHardMaxHz    = 120.0f;
 constexpr int   kMagDeadband  = 60;      // skip USB updates for changes smaller than this
@@ -122,16 +121,13 @@ struct Config {
 
     // per-layer ceilings (DirectInput units 0..10000), a fixed total ceiling, and one live level (userGain)
     int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 2000;
-    int   impactMaxMag = 8800;       // landing / hard-hit layer (it gets priority inside TotalMaxMagnitude)
     float impactGain = 1.5f;         // landing sensitivity 0..3 (1 = old default, 0 = off)
     float brakeHzScale = 1.0f;       // brake judder pitch multiplier 0.5..2 (menu)
-    float impactHzScale = 1.0f;      // landing hit pitch multiplier 0.5..2 (menu)
     float airLevel = 0.45f;          // 0.2..0.8: total strut load (fraction of static) below which the car counts as airborne; raise it to catch smaller jumps
     float landingThresh = 1.0f;      // 0.5..3: how hard a no-airtime hit must be to count as a landing (higher = fewer false triggers)
-    int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandKick = 1, fxLandBody = 1, fxBumpKick = 1;
-    int   fxKickMode = 3;            // kick delivery: 3 = SAW (sawtooth pair, direction from the waveform edge), 2 = SYNTH (signed waveform computed in software, sent as constant force), 1 = BURST (periodic effect restarted per event), 0 = PUSH (slow constant-force shove)   // 1 = effect on, 0 = off (menu switches, for diagnosing)
-    float bumpKick = 1.0f;           // 0..2: strength of the left-right kick fired by ordinary bumps (0 = landings only)
-    float landingJolt = 0.90f;        // 0..1: share of the landing budget played as a one-direction kick instead of a buzz (menu)
+    int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandBoost = 1;   // 1 = effect on, 0 = off (menu switches, for diagnosing)
+    float landingBoost = 2.0f;       // 0..4: extra RBR steering torque at the moment of a full-severity landing (2 = +200%)
+    float landingAdd = 0.30f;        // 0..1: minimum extra push (share of full torque) in the direction RBR is already pushing
     float priorityDuck = 0.85f;      // 0..1: how far lower-priority layers fall back while a higher one is active (landing > road > engine)
     int   totalMaxMag = 4000;        // all layers together are scaled down to this (hard ceiling kHardTotalMax)
     float sustainedLimit = 0.10f;    // thermal derate: long-term mean-square level (0.10 ~ 32% RMS-equivalent)
@@ -192,16 +188,12 @@ void ClampConfig(Config& c) {
     c.engineMaxMag = std::max(0, std::min(c.engineMaxMag, 10000));
     c.roadMaxMag = std::max(0, std::min(c.roadMaxMag, 10000));
     c.brakeMaxMag = std::max(0, std::min(c.brakeMaxMag, 10000));
-    c.impactMaxMag = std::max(0, std::min(c.impactMaxMag, kHardImpactMax));
-    c.impactGain = clampf(c.impactGain, 0.0f, 3.0f);
+        c.impactGain = clampf(c.impactGain, 0.0f, 3.0f);
     c.brakeHzScale = clampf(c.brakeHzScale, 0.5f, 2.0f);
-    c.impactHzScale = clampf(c.impactHzScale, 0.5f, 2.0f);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
-    c.landingJolt = clampf(c.landingJolt, 0.0f, 1.0f);
-    c.bumpKick = clampf(c.bumpKick, 0.0f, 2.0f);
-    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0;
-    c.fxKickMode = std::max(0, std::min(c.fxKickMode, 3));
-    c.fxLandKick = c.fxLandKick ? 1 : 0; c.fxLandBody = c.fxLandBody ? 1 : 0; c.fxBumpKick = c.fxBumpKick ? 1 : 0;
+    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0;
+    c.landingBoost = clampf(c.landingBoost, 0.0f, 4.0f);
+    c.landingAdd = clampf(c.landingAdd, 0.0f, 1.0f);
     c.landingThresh = clampf(c.landingThresh, 0.5f, 3.0f);
     c.airLevel = clampf(c.airLevel, 0.2f, 0.8f);
     c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, kHardTotalMax));
@@ -242,10 +234,10 @@ void SyncConfig(Config& c, const std::string& path, bool write, const char* sect
     I("UdpPort", c.udpPort);  I("MinPacketBytes", c.minPacket);  I("Cylinders", c.cylinders);
     I("EngineMaxMagnitude", c.engineMaxMag); I("RoadMaxMagnitude", c.roadMaxMag);
     I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
-    I("ImpactMaxMagnitude", c.impactMaxMag); F("ImpactGain", c.impactGain);
-    F("BrakeHzScale", c.brakeHzScale); F("ImpactHzScale", c.impactHzScale); F("PriorityDuck", c.priorityDuck); F("LandingJolt", c.landingJolt); F("BumpKick", c.bumpKick);
+    F("ImpactGain", c.impactGain);
+    F("BrakeHzScale", c.brakeHzScale); F("PriorityDuck", c.priorityDuck);
     I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("EnableBrake", c.fxBrake);
-    I("EnableLandingKick", c.fxLandKick); I("EnableLandingBody", c.fxLandBody); I("EnableBumpKick", c.fxBumpKick); I("KickMode", c.fxKickMode); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
+    I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
@@ -675,6 +667,7 @@ void GameDeviceTap::Remove() {
     ReleaseCaptured();
     bool clean = Tap<0>::Unpatch();
     clean = Tap<1>::Unpatch() && clean;
+    clean = EffectTap::Unpatch() && clean;
     if (!clean) {
         // Somebody chained their hook after ours; unloading would leave a pointer into freed code. Pin the DLL.
         HMODULE h = nullptr;
@@ -683,6 +676,73 @@ void GameDeviceTap::Remove() {
     }
     m_installed = false;
 }
+
+// ------------------------------------------------ landing boost on RBR's own force
+// RBR drives the wheel with its own DirectInput constant-force effect. Instead of adding effects on top of it, a detected
+// landing scales that force on its way to the wheel: every SetParameters call RBR makes on a constant-force effect is
+// multiplied by g_boostMul, plus a minimum extra push (g_boostAdd, share of full torque) in the direction RBR is already
+// pushing. Our own effects are periodic, so they never pass through this path.
+std::atomic<float> g_boostMul{1.0f}, g_boostAdd{0.0f};
+std::atomic<int>   g_rbrSeen{0}, g_rbrRaw{0}, g_rbrOut{0};      // diagnostics: RBR constant-force updates seen, last in / out
+typedef HRESULT (WINAPI *PFN_SetParams)(IDirectInputEffect*, LPCDIEFFECT, DWORD);
+enum { VT_FX_SETPARAMETERS = 6 };
+
+struct EffectTap {
+    static void** vtbl;
+    static void*  orig;
+    static HRESULT WINAPI HSetParameters(IDirectInputEffect* self, LPCDIEFFECT peff, DWORD flags) {
+        if (peff && (flags & DIEP_TYPESPECIFICPARAMS) && peff->cbTypeSpecificParams == sizeof(DICONSTANTFORCE) &&
+            peff->lpvTypeSpecificParams && peff->dwSize >= 48 && peff->dwSize <= 256) {
+            const LONG raw = static_cast<const DICONSTANTFORCE*>(peff->lpvTypeSpecificParams)->lMagnitude;
+            if (g_rbrSeen.fetch_add(1) == 0) Logf("Hook sees RBR's constant-force updates (first magnitude %ld)", (long)raw);
+            const float mul = g_boostMul.load(), add = g_boostAdd.load();
+            LONG out = raw;
+            if (mul != 1.0f || add > 0.0f) {
+                float f = (float)raw * mul;
+                if (raw > 0) f += add * 10000.0f; else if (raw < 0) f -= add * 10000.0f;
+                out = (LONG)clampf(f, -10000.0f, 10000.0f);
+            }
+            g_rbrRaw = (int)raw; g_rbrOut = (int)out;
+            if (out != raw) {
+                DICONSTANTFORCE cf{}; cf.lMagnitude = out;
+                uint8_t buf[256];
+                std::memcpy(buf, peff, peff->dwSize);
+                reinterpret_cast<DIEFFECT*>(buf)->lpvTypeSpecificParams = &cf;
+                return ((PFN_SetParams)orig)(self, reinterpret_cast<LPCDIEFFECT>(buf), flags);
+            }
+        }
+        return ((PFN_SetParams)orig)(self, peff, flags);
+    }
+    // vt = vtable of any effect created on RBR's device (RBR's own effects share the class)
+    static bool Patch(void** vt) {
+        if (vtbl == vt) return true;
+        if (vtbl) return false;
+        DWORD old;
+        if (!VirtualProtect(&vt[VT_FX_SETPARAMETERS], sizeof(void*), PAGE_READWRITE, &old)) return false;
+        orig = vt[VT_FX_SETPARAMETERS];
+        vt[VT_FX_SETPARAMETERS] = (void*)&HSetParameters;
+        VirtualProtect(&vt[VT_FX_SETPARAMETERS], sizeof(void*), old, &old);
+        vtbl = vt;
+        Logf("Effect hook installed");
+        return true;
+    }
+    static bool Unpatch() {
+        g_boostMul = 1.0f; g_boostAdd = 0.0f;
+        if (!vtbl) return true;
+        bool clean = vtbl[VT_FX_SETPARAMETERS] == (void*)&HSetParameters;
+        if (clean) {
+            DWORD old;
+            if (orig && VirtualProtect(&vtbl[VT_FX_SETPARAMETERS], sizeof(void*), PAGE_READWRITE, &old)) {
+                vtbl[VT_FX_SETPARAMETERS] = orig;
+                VirtualProtect(&vtbl[VT_FX_SETPARAMETERS], sizeof(void*), old, &old);
+            }
+            vtbl = nullptr;
+        }
+        return clean;
+    }
+};
+void** EffectTap::vtbl = nullptr;
+void*  EffectTap::orig = nullptr;
 
 // ----------------------------------------------------------- effect layer
 BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
@@ -694,8 +754,8 @@ BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
     return DIENUM_CONTINUE;
 }
 
-enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD, S_ROADR, S_BRAKE, S_IMPACT, S_JOLT, S_KICK, S_KICKA, S_KICKB, S_COUNT };   // S_KICKA/B = sawtooth pair for the SAW kick: direction comes from the waveform's sharp edge, not from phase or sign   // S_KICK = periodic burst kick, restarted at each event so its first stroke has a chosen direction   // S_JOLT = one-direction constant-force kick (signed magnitude)   // S_ROAD = sawtooth-up (sharp edge toward negative/left), S_ROADR = sawtooth-down
-const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-A", "road-B", "brake", "impact", "jolt", "kick", "kickA", "kickB"};
+enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD, S_ROADR, S_BRAKE, S_COUNT };   // S_ROAD = sawtooth-up (sharp edge toward negative/left), S_ROADR = sawtooth-down
+const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-A", "road-B", "brake"};
 
 class FFLayer {
 public:
@@ -714,7 +774,7 @@ public:
         if (axisId == 0xFFFFFFFF) return E_NOTIMPL;      // no force feedback actuator
         m_axisId = axisId;
 
-        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown, &GUID_Sine, &GUID_Sine, &GUID_ConstantForce, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown };   // impact buzz uses the same sine as brake/engine: some bases treat square effects much weaker
+        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown, &GUID_Sine };
         HRESULT firstErr = DI_OK;
         int ok = 0;
         for (int i = 0; i < S_COUNT; ++i) {
@@ -726,8 +786,9 @@ public:
             }
             m_lastMag[i] = -100000; m_lastPer[i] = 0;
         }
-        m_fail = 0; m_kickSeqApplied = m_kickSeq;
+        m_fail = 0;
         if (!ok) { Destroy(); return firstErr; }
+        for (int i = 0; i < S_COUNT; ++i) if (m_fx[i]) { EffectTap::Patch(*reinterpret_cast<void***>(m_fx[i])); break; }   // RBR's effects share this class
         Logf("Effects created: %d of %d", ok, (int)S_COUNT);
         return DI_OK;
     }
@@ -759,9 +820,6 @@ public:
         return true;
     }
     HRESULT LastHr() const { return m_lastHr; }
-    // The burst kick is restarted from its beginning whenever seq changes, starting at the given phase (hundredths of a degree).
-    void SetKick(unsigned seq, DWORD phase) { m_kickSeq = seq; m_kickPhase = phase; }
-
 private:
     IDirectInputDevice8A* m_dev = nullptr;
     IDirectInputEffect* m_fx[S_COUNT] = {};
@@ -770,14 +828,11 @@ private:
     DWORD m_axisId = 0;
     int m_fail = 0;
     HRESULT m_lastHr = DI_OK;
-    unsigned m_kickSeq = 0, m_kickSeqApplied = 0;
-    DWORD m_kickPhase = 0;
 
     HRESULT Make(int slot, const GUID& g) {
         DIPERIODIC per{};
         per.dwPeriod = 20000;
-        DICONSTANTFORCE cf{};
-        LONG dir = (slot == S_JOLT) ? 1 : 0;      // constant force needs a non-zero direction on some drivers
+        LONG dir = 0;
         DIEFFECT e{};
         e.dwSize = sizeof(DIEFFECT);
         e.dwFlags = DIEFF_CARTESIAN | DIEFF_OBJECTIDS;   // axis by object id: independent of RBR's data format
@@ -787,35 +842,23 @@ private:
         e.cAxes = 1;
         e.rgdwAxes = &m_axisId;
         e.rglDirection = &dir;
-        if (slot == S_JOLT) { e.cbTypeSpecificParams = sizeof(cf);  e.lpvTypeSpecificParams = &cf; }
-        else                { e.cbTypeSpecificParams = sizeof(per); e.lpvTypeSpecificParams = &per; }
+        e.cbTypeSpecificParams = sizeof(per); e.lpvTypeSpecificParams = &per;
         return m_dev->CreateEffect(g, &e, &m_fx[slot], NULL);
     }
 
     HRESULT Update(int slot, int mag, DWORD period) {
         DIEFFECT e{};
         e.dwSize = sizeof(DIEFFECT);
-        if (slot == S_JOLT) {                                   // signed constant force: no period
-            mag = std::max(-10000, std::min(mag, 10000));
-            if (std::abs(mag - m_lastMag[slot]) < kMagDeadband && !(mag == 0 && m_lastMag[slot] != 0) && m_lastPer[slot] != 0) return DI_OK;
-            DICONSTANTFORCE cf{}; cf.lMagnitude = mag;
-            e.cbTypeSpecificParams = sizeof(cf); e.lpvTypeSpecificParams = &cf;
-            HRESULT hr = m_fx[slot]->SetParameters(&e, DIEP_TYPESPECIFICPARAMS | DIEP_NORESTART);
-            if (SUCCEEDED(hr)) { m_lastMag[slot] = mag; m_lastPer[slot] = 1; }
-            return hr;
-        }
         mag = std::max(0, std::min(mag, 10000));
-        const bool kickRestart = slot == S_KICK && m_kickSeq != m_kickSeqApplied;
-        bool magChanged = std::abs(mag - m_lastMag[slot]) >= kMagDeadband || (mag == 0 && m_lastMag[slot] != 0);
-        bool perChanged = m_lastPer[slot] == 0 ||
+        const bool magChanged = std::abs(mag - m_lastMag[slot]) >= kMagDeadband || (mag == 0 && m_lastMag[slot] != 0);
+        const bool perChanged = m_lastPer[slot] == 0 ||
             (period > m_lastPer[slot] ? period - m_lastPer[slot] : m_lastPer[slot] - period) * 100 > m_lastPer[slot] * 2;
-        if (!magChanged && !perChanged && !kickRestart) return DI_OK;
+        if (!magChanged && !perChanged) return DI_OK;
         DIPERIODIC p{};
-        p.dwMagnitude = (DWORD)mag; p.lOffset = 0; p.dwPhase = (slot == S_KICK) ? m_kickPhase : 0; p.dwPeriod = period;
+        p.dwMagnitude = (DWORD)mag; p.lOffset = 0; p.dwPhase = 0; p.dwPeriod = period;
         e.cbTypeSpecificParams = sizeof(p); e.lpvTypeSpecificParams = &p;
-        const DWORD flags = kickRestart ? (DIEP_TYPESPECIFICPARAMS | DIEP_START) : (DIEP_TYPESPECIFICPARAMS | DIEP_NORESTART);
-        HRESULT hr = m_fx[slot]->SetParameters(&e, flags);
-        if (SUCCEEDED(hr)) { m_lastMag[slot] = mag; m_lastPer[slot] = period; if (kickRestart) m_kickSeqApplied = m_kickSeq; }
+        HRESULT hr = m_fx[slot]->SetParameters(&e, DIEP_TYPESPECIFICPARAMS | DIEP_NORESTART);
+        if (SUCCEEDED(hr)) { m_lastMag[slot] = mag; m_lastPer[slot] = period; }
         return hr;
     }
 };
@@ -1015,14 +1058,8 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
             return sev;
         };
 
-        // Every landing, hit and bump fires ONE event: a hard kick to one side, then back the other way. The first
-        // side follows which side took the load. The synth plays the kick; here we only count and score events.
-        auto fire = [&](float sev, int isBump) {
-            ++d.evtSeq; d.evtSev = sev; d.evtBump = isBump;
-            const float diff = d.rawL - d.rawR;
-            if (std::fabs(diff) > 0.05f) d.evtDir = diff > 0.0f ? -1.0f : 1.0f;   // loaded left tyre: wheel snaps left first
-            else d.evtDir = -d.evtDir;                                           // symmetric: alternate
-        };
+        // Every landing and hard hit fires ONE event with a severity. The synth turns it into a boost of RBR's own force.
+        auto fire = [&](float sev, int isBump) { ++d.evtSeq; d.evtSev = sev; d.evtBump = isBump; };
         d.bumpRefr = std::max(0.0f, d.bumpRefr - dt);
 
         if (off) {
@@ -1054,19 +1091,6 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
                 fire(sev, 0);
                 Logf("hit: severity %.2f  (peak load %.2f, load jump %.2f, heave %.2f)", sev, d.peakRw, jump, clamp01(d.bumpEnv));
             }
-        } else if (!off && c.bumpKick > 0.0f && d.bumpRefr <= 0.0f && s.speed > 3.0f) {
-            // ordinary bump: a fresh heave / tyre-load spike, scored small, same left-right kick
-            const float sig = std::max(clamp01(d.bumpEnv), 0.8f * std::max(s.thumpL, s.thumpR));
-            const float thr = 0.30f * c.landingThresh;
-            if (sig > thr && sig > d.bumpPrevSig + 0.03f) {
-                const float sev = clamp01((0.12f + 0.55f * clamp01((sig - thr) / 0.6f)) * c.bumpKick);
-                d.impactEnv = std::max(d.impactEnv, sev);
-                d.bumpRefr = 0.09f;
-                fire(sev, 1);
-            }
-            d.bumpPrevSig = sig;
-        } else {
-            d.bumpPrevSig = std::max(clamp01(d.bumpEnv), 0.8f * std::max(s.thumpL, s.thumpR));
         }
         d.prevPeakRw = d.peakRw;
         d.impactEnv *= std::exp(-dt / (0.30f * clampf(c.weightFeel, 0.5f, 2.0f)));
@@ -1104,11 +1128,10 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 struct Synth {
     float sm[S_COUNT] = {};
     float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
-    float jSign = 1.0f, jAge = 5.0f, kickAmp = 0.0f;   // direction, age and strength of the current kick
+    float jAge = 5.0f, evAmp = 0.0f;                       // age and severity of the current landing event
     unsigned seenEvt = 0;
-    float kickDir = 1.0f;
-    int kickBump = 0; unsigned kickSeq = 0; DWORD kickPhase = 0;
-    float kickPk = 0.0f, lastDerate = 1.0f;   // peak kick output of the current event (for the menu and the log)
+    float boostMul = 1.0f, boostAdd = 0.0f;                // landing boost applied to RBR's own force (read by the worker)
+    float lastDerate = 1.0f;
     float roadJit[2] = {1.0f, 1.0f}, ampJit[2] = {1.0f, 1.0f}, engJit = 1.0f, engHzJit = 1.0f, unevPhase = 0;
     double nextJit = 0;
 
@@ -1197,63 +1220,19 @@ struct Synth {
         hz[S_BRAKE] *= c.brakeHzScale;
         float t4 = c.brakeMaxMag * Ab * gB * clampf(0.65f + 0.35f * s.loadF, 0.5f, 1.3f);   // more load on the fronts = more judder
 
-        // ---------------- IMPACT: landing / hard-hit THUMP, built from two parts:
-        //  * the kick: a constant-force pulse that pushes one way and rebounds once, like a damped spring (a clean
-        //    "thud-thump", not a vibration)
-        //  * a short, smooth, low-pitched body under it. No random pitch jitter: jitter is what makes the lock-up
-        //    feel like grinding, which is great for braking but wrong for a landing.
-        const float imp = clamp01(s.impact);
-        // Landing gain is a 0..100% control with headroom built in:
-        //   up to ~88%   torque rises to full scale (88% = "ideal", 85-90% is the sweet spot)
-        //   90% -> 100%  overdrive: more of the landing goes into the kick, mid-size landings count as bigger,
-        //                the kick rings out longer and the kick is derated less ("heavy" at 95%, "outrageous" at 100%)
-        const float gSet = clamp01((float)c.impactMaxMag / 10000.0f);
-        const float ov = smooth01(0.90f, 1.0f, gSet);
-        const float Lmax = 10000.0f * std::min(1.0f, gSet / 0.875f);
-        const float jf = clamp01(c.landingJolt) + (1.0f - clamp01(c.landingJolt)) * ov;
-        if (s.evtSeq != seenEvt) {                                                   // new landing / hit / bump: restart the kick
-            seenEvt = s.evtSeq;
-            jAge = 0.0f; kickAmp = s.evtSev; jSign = s.evtDir; kickPk = 0.0f; kickBump = s.evtBump; kickDir = jSign;
-            ++kickSeq; kickPhase = 0;     // always start at phase 0: many wheel drivers ignore the phase field, so direction is not left to it
+        // ---------------- LANDING: no effect of its own. A detected landing boosts RBR's own steering force (see EffectTap):
+        // a fast attack, a short hold, then a decay, scaled by the landing's severity and by the live level.
+        if (s.evtSeq != seenEvt) { seenEvt = s.evtSeq; jAge = 0.0f; evAmp = s.evtSev; }
+        if (jAge < 0.08f) evAmp = std::max(evAmp, s.evtSev);                         // a landing is scored over its first ~100 ms
+        jAge = std::min(jAge + dt, 5.0f);
+        {
+            const float ts = std::sqrt(wf);                                           // heavier car = longer boost
+            const float hold = 0.06f * ts, dec = 0.30f * ts;
+            const float env = jAge < hold ? 1.0f : (float)std::exp(-(jAge - hold) / dec);
+            const float lev = (c.fxLandBoost && jAge < 1.5f) ? clamp01(evAmp) * env * clampf(userGain, 0.0f, 1.0f) : 0.0f;
+            boostMul = 1.0f + c.landingBoost * lev;
+            boostAdd = c.landingAdd * lev;
         }
-        if (jAge < 0.08f) kickAmp = std::max(kickAmp, s.evtSev);                     // a landing is scored over its first ~100 ms
-        { const float prevAge = jAge; jAge = std::min(jAge + dt, 5.0f);
-          if (prevAge < 0.30f && jAge >= 0.30f && kickPk > 0.0f)
-              Logf("kick: severity %.2f  first stroke %s  peak output %.0f of 10000  derate x%.2f  live level %.2f", kickAmp, kickDir < 0.0f ? "LEFT" : "RIGHT", kickPk, lastDerate, userGain); }
-        hz[S_IMPACT] = clampf((26.0f - 10.0f * imp) / std::sqrt(wf), 12.0f, 30.0f) * c.impactHzScale;
-        const float body = imp > 0.0f ? Lmax * (1.0f - jf) * std::pow(imp, 0.8f) * (float)std::exp(-jAge / 0.22f) : 0.0f;
-        const float t5 = c.fxLandBody ? body : 0.0f;
-        // The kick: a hard shove one way, then an almost equally hard shove back, then a smaller ring-out.
-        // Piecewise-linear shape in units of time (scaled by car weight); ~15 ms ramps instead of instant reversals.
-        const float ts = std::sqrt(wf);                                              // heavier car = slower, longer thump
-        static const float kT[] = {0.000f, 0.055f, 0.070f, 0.140f, 0.155f, 0.210f, 0.225f, 0.290f, 0.305f};
-        static const float kV[] = {1.00f,  1.00f, -0.95f, -0.95f,  0.50f,  0.50f, -0.22f, -0.22f,  0.00f};
-        float wave = 0.0f;
-        { const float u = jAge / ts;
-          if (u < kT[8]) {
-              int k = 0; while (k < 7 && u >= kT[k + 1]) ++k;
-              wave = kV[k] + (kV[k + 1] - kV[k]) * clamp01((u - kT[k]) / (kT[k + 1] - kT[k]));
-          } }
-        const bool kickOn = kickBump ? c.fxBumpKick != 0 : c.fxLandKick != 0;
-        const float kAmpl = Lmax * jf * std::pow(clamp01(kickAmp * (1.0f + 0.5f * ov)), 0.7f - 0.3f * ov);
-        float tjs = (kickOn && c.fxKickMode == 0) ? jSign * kAmpl * wave : 0.0f;                 // PUSH: constant force
-        // BURST direction without relying on the driver's phase field: the sine always restarts at phase 0, whose first
-        // half-wave is positive (right). For a right-first kick we play from the start; for a left-first kick we hold the
-        // first (positive) half-wave at zero and let the sine's negative half-wave be the first stroke heard.
-        const float hzK = clampf(14.0f / ts, kHardMinHz, 20.0f);
-        const float lead = jSign < 0.0f ? 0.5f / hzK : 0.0f;
-        const float eAge = jAge - lead;
-        const float kenv = eAge < 0.03f ? 1.0f : (float)std::exp(-(eAge - 0.03f) / (0.11f * ts * (1.0f + 0.9f * ov)));      // BURST: periodic, full strength, fast decay
-        const float tkick = (kickOn && c.fxKickMode == 1 && eAge >= 0.0f && eAge < 0.45f + 0.35f * ov) ? kAmpl * kenv : 0.0f;
-        hz[S_KICK] = hzK;
-        // SYNTH: how games do it. The whole kick is one signed waveform computed here, sample by sample, and sent through the
-        // constant-force effect. The sign of every stroke is ours (left-first or right-first), nothing depends on a driver
-        // honouring a phase or direction field, and the damped sine has no net push to either side.
-        if (kickOn && c.fxKickMode == 2 && jAge < 0.45f + 0.35f * ov) {
-            const float envS = jAge < 0.03f ? 1.0f : (float)std::exp(-(jAge - 0.03f) / (0.11f * ts * (1.0f + 0.9f * ov)));
-            tjs = jSign * kAmpl * envS * (float)std::sin(6.2831853f * hzK * jAge);
-        }
-        hz[S_JOLT] = 50.0f;
 
         // attack / release: road is deliberately fast (sharpness), engine is rounder
         auto follow = [&](int i, float target, float up, float down) {
@@ -1266,64 +1245,31 @@ struct Synth {
         follow(S_ROAD,  c.fxRoad ? tRoadA : 0.0f, 0.55f, roadDown);
         follow(S_ROADR, c.fxRoad ? tRoadB : 0.0f, 0.55f, roadDown);
         follow(S_BRAKE, c.fxBrake ? t4 : 0.0f, 0.50f, 0.20f);
-        follow(S_IMPACT, t5, 1.00f, 0.50f);
-        // SAW: direction is carried by the waveform itself. Sawtooth-up has its sharp edge toward negative (left), sawtooth-down
-        // toward positive (right), and those edges are produced by the wheel's own effect engine at full speed. We only switch
-        // which of the two is audible, one period at a time: left-edge, right-edge, left-edge ... (or right first), fading out.
-        float tSawA = 0.0f, tSawB = 0.0f;
-        if (kickOn && c.fxKickMode == 3) {
-            static const float kW[] = {1.00f, 0.90f, 0.55f, 0.30f, 0.15f};
-            const float per = 1.0f / hzK;
-            const int w = (int)(jAge / per);
-            if (w < 5) {
-                const float amp = kAmpl * kW[w];
-                const bool firstIsA = jSign < 0.0f;                       // A = sharp edge to the left
-                const bool useA = ((w & 1) == 0) ? firstIsA : !firstIsA;
-                if (useA) tSawA = amp; else tSawB = amp;
-            }
-        }
-        hz[S_KICKA] = hz[S_KICKB] = hzK;
-        sm[S_KICKA] = tSawA; sm[S_KICKB] = tSawB;
-        sm[S_KICK] = tkick;
-        sm[S_JOLT] = tjs;                                                        // signed and already shaped: no smoothing                                        // instant attack: a landing must hit, not swell
-
-        // The impact layer has priority inside the total ceiling: the other layers duck to make room for it.
-        const float jJ = std::min(std::fabs(sm[S_JOLT]), (float)kHardImpactMax);
-        const float jK = std::min(sm[S_KICK] + sm[S_KICKA] + sm[S_KICKB], (float)kHardImpactMax);
-        const float jM = std::min(jJ + jK, (float)kHardImpactMax);
-        const float impM = std::min(std::fabs(sm[S_IMPACT]) + jM, (float)kHardImpactMax);   // buzz + kick share one landing budget   // the hit may use its own ceiling (<= hard max), not just the shared one
-        // Priority: landing (highest) > road > engine (lowest). A lower layer falls back while a higher one is active,
-        // so the strongest cue is the one you actually feel. Brake is only pushed back by a landing.
-        const float pI = Lmax > 0.0f ? clamp01(impM / Lmax) : 0.0f;
+        // Priority: road > engine. A lower layer falls back while a higher one is active.
         const float pR = c.roadMaxMag > 0 ? clamp01(std::max(std::fabs(sm[S_ROAD]), std::fabs(sm[S_ROADR])) / (float)c.roadMaxMag) : 0.0f;
         const float dk = clampf(c.priorityDuck, 0.0f, 1.0f);
         float duck[S_COUNT];
-        duck[S_IMPACT] = duck[S_JOLT] = duck[S_KICK] = duck[S_KICKA] = duck[S_KICKB] = 1.0f;
-        duck[S_ROAD] = duck[S_ROADR] = 1.0f - dk * pI;
-        duck[S_ENG1] = duck[S_ENG2] = (1.0f - dk * pI) * (1.0f - dk * pR);
-        duck[S_BRAKE] = 1.0f - 0.6f * dk * pI;
+        duck[S_ROAD] = duck[S_ROADR] = duck[S_BRAKE] = 1.0f;
+        duck[S_ENG1] = duck[S_ENG2] = 1.0f - dk * pR;
         float sumO = 0;
-        for (int i = 0; i < S_COUNT; ++i) if (i != S_IMPACT && i != S_JOLT && i != S_KICK && i != S_KICKA && i != S_KICKB) sumO += std::fabs(sm[i]) * duck[i];
-        const float room = std::max(0.0f, (float)c.totalMaxMag - impM);   // others duck fully when the hit fills the ceiling
+        for (int i = 0; i < S_COUNT; ++i) sumO += std::fabs(sm[i]) * duck[i];
+        const float room = (float)c.totalMaxMag;
         const float scale = sumO > room && sumO > 0.0f ? room / sumO : 1.0f;
-        const float sum = sumO * scale + impM;
+        const float sum = sumO * scale;
 
         // Slow thermal derate on the level actually delivered to the wheel (live gain included): turning the
         // live gain down therefore relieves the derate instead of stacking with it.
         const float ug = clampf(userGain, 0.0f, 1.0f);
-        const float lvl = std::min(sum, (float)kHardImpactMax) / 10000.0f * ug;   // sum already includes the duck scale
+        const float lvl = std::min(sum, (float)kHardTotalMax) / 10000.0f * ug;
         heat += (lvl * lvl - heat) * alphaFor(dt, 20.0f);
         const float derate = heat > c.sustainedLimit ? std::sqrt(c.sustainedLimit / heat) : 1.0f;
 
         const float g = ug * derate;
         lastDerate = derate;
-        const float gk = ug * clampf(std::sqrt(derate), 0.70f + 0.15f * ov, 1.0f);   // a 0.3 s kick is not what heats the motor: it gets a softer derate (never below 70%)
         for (int i = 0; i < S_COUNT; ++i) {
-            float m = (i == S_IMPACT ? std::max(0.0f, impM - jM) * gk : i == S_JOLT ? jJ * gk : (i == S_KICK || i == S_KICKA || i == S_KICKB) ? sm[i] * gk : sm[i] * duck[i] * scale * g);
+            float m = sm[i] * duck[i] * scale * g;
             if (!std::isfinite(m)) { m = 0.0f; sm[i] = 0.0f; }          // never let a NaN latch into the filters
-            mag[i] = std::max(0, std::min((int)m, (i == S_IMPACT || i == S_JOLT || i == S_KICK || i == S_KICKA || i == S_KICKB) ? kHardImpactMax : kHardTotalMax));
-            if (i == S_JOLT || i == S_KICK || i == S_KICKA || i == S_KICKB) kickPk = std::max(kickPk, (float)mag[i]);
-            if (i == S_JOLT && sm[S_JOLT] < 0.0f) mag[i] = -mag[i];     // signed: push, then rebound
+            mag[i] = std::max(0, std::min((int)m, kHardTotalMax));
         }
     }
 };
@@ -1353,8 +1299,7 @@ private:
     std::atomic<bool> m_ffActive{false};
     std::atomic<float> m_userGain{1.0f};   // live level 0..1, changed by hotkeys
     std::atomic<bool>  m_muted{false};
-    std::atomic<float> m_dKickDir{1.0f};
-    std::atomic<float> m_dKickPk{0.0f};    // peak kick output of the latest landing / bump, shown in the menu
+    std::atomic<float> m_dBoostMul{1.0f}, m_dBoostAdd{0.0f};   // current landing boost on RBR's force (menu diagnostics)
     std::atomic<float> m_dHeat{1.0f};      // shown in the menu: 1 = no derate
     std::atomic<int>   m_dCar{-1};
     std::atomic<int>   m_cfgRev{0};         // bumped by the menu whenever m_cfg changes
@@ -1454,7 +1399,7 @@ private:
     void TestSignals(double t, Signals& s) {
         s = Signals();
         s.speed = 25.0f; s.throttle = 1.0f;
-        double ph = std::fmod(t, 16.0);
+        double ph = std::fmod(t, 13.0);
         if (ph < 4.0) {                                   // 0 engine sweep
             m_testPhase = 0; s.rpm = (float)(1000.0 + 6500.0 * (ph / 4.0));
         } else if (ph < 7.0) {                            // 1 gravel
@@ -1463,18 +1408,9 @@ private:
             m_testPhase = 2; s.rpm = 4500; s.texture = 0.9f;
             const bool leftHit = std::fmod(ph - 7.0, 3.0) < 1.5;                      // 1.5 s left-side hits, then 1.5 s right-side
             s.texL = leftHit ? 0.9f : 0.15f; s.texR = leftHit ? 0.15f : 0.9f;
-        } else if (ph < 13.0) {                           // 3 hard braking, lock-up after 1.5 s
+        } else {                                          // 3 hard braking, lock-up after 1.5 s
             m_testPhase = 3; s.rpm = 3000; s.throttle = 0; s.brake = 1.0f; s.dive = 1.0f; s.frontRev = 15.0f;
             if (ph > 11.5) s.lock = 0.9f;
-        } else {                                          // 4 landing hits: a big one, then a medium one, every 1.5 s
-            m_testPhase = 4; s.rpm = 900; s.throttle = 0; s.speed = 0;
-            const double lt = std::fmod(ph - 13.0, 1.5);
-            const float big = std::fmod(ph - 13.0, 3.0) < 1.5 ? 1.0f : 0.5f;
-            s.impact = big * (float)std::exp(-lt / 0.40);   // same ring-out as a real landing
-            static double prevLt = 99.0; static unsigned seq = 0; static float dir = -1.0f;
-            if (lt < prevLt) { ++seq; dir = -dir; }                                  // a new hit: left-right, then right-left
-            prevLt = lt;
-            s.evtSeq = seq; s.evtSev = big; s.evtDir = dir; s.evtBump = 0;
         }
         if (m_testPhase != 2) s.texL = s.texR = s.texture;
     }
@@ -1670,7 +1606,9 @@ private:
 
             int mag[S_COUNT]; float hz[S_COUNT];
             synth.Run(eff, sig, t, dt, live_gain, mag, hz);
-            m_dKickPk = synth.kickPk; m_dKickDir = synth.kickDir;
+            // Landing boost: applied to RBR's own constant-force updates by EffectTap (not in test mode: no RBR force there)
+            g_boostMul = m_test ? 1.0f : synth.boostMul; g_boostAdd = m_test ? 0.0f : synth.boostAdd;
+            m_dBoostMul = synth.boostMul; m_dBoostAdd = synth.boostAdd;
             m_dHeat = synth.heat > base.sustainedLimit ? std::sqrt(base.sustainedLimit / synth.heat) : 1.0f;
             DWORD per[S_COUNT];
             for (int i = 0; i < S_COUNT; ++i) {
@@ -1713,7 +1651,6 @@ private:
                     continue;
                 }
                 if (GameDeviceTap::I().ConsumeReacquired()) ff.Restart();
-                ff.SetKick(synth.kickSeq, synth.kickPhase);
                 if (!ff.Push(mag, per)) {
                     Logf("Effects lost (0x%08X), recreating", (unsigned)ff.LastHr());
                     SetStatus("Effects lost (0x%08X), retrying", (unsigned)ff.LastHr());
@@ -1757,22 +1694,18 @@ private:
             {"Effect: Engine",                   "EnableEngine",       &Config::fxEngine,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Road texture",             "EnableRoad",         &Config::fxRoad,       nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Braking",                  "EnableBrake",        &Config::fxBrake,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
-            {"Effect: Landing kick L-R",         "EnableLandingKick",  &Config::fxLandKick,   nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
-            {"Effect: Landing buzz",             "EnableLandingBody",  &Config::fxLandBody,   nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
-            {"Kick delivery",                    "KickMode",           &Config::fxKickMode,   nullptr,  0.0f,   3.0f, 1.0f, 'k', false},
-            {"Effect: Bump kick L-R",            "EnableBumpKick",     &Config::fxBumpKick,   nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
+            {"Effect: Landing boost",            "EnableLandingBoost", &Config::fxLandBoost,  nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             // gains
             {"Live level (Numpad +/- in game)", "UserGain",           nullptr, &Config::userGain,      0.0f,  1.0f, 0.05f, '%', true },
             {"Total ceiling",                    "TotalMaxMagnitude",  &Config::totalMaxMag, nullptr,   500.0f, M,    100.0f, 'g', false},
             {"Engine gain",                      "EngineMaxMagnitude", &Config::engineMaxMag, nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Road gain",                        "RoadMaxMagnitude",   &Config::roadMaxMag,   nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Brake gain",                       "BrakeMaxMagnitude",  &Config::brakeMaxMag,  nullptr,  0.0f,   M,    100.0f, 'g', false},
-            {"Landing gain",                      "ImpactMaxMagnitude", &Config::impactMaxMag, nullptr,  0.0f,   (float)kHardImpactMax, 100.0f, 'p', false},
+            {"Landing boost (x RBR force)",      "LandingBoost",       nullptr, &Config::landingBoost,  0.0f,  4.0f, 0.1f,  '%', false},
+            {"Landing minimum push",             "LandingMinPush",     nullptr, &Config::landingAdd,    0.0f,  1.0f, 0.05f, '%', false},
             {"Landing sensitivity",              "ImpactGain",         nullptr, &Config::impactGain,    0.0f,  3.0f, 0.05f, 'x', false},
             {"Airborne load level",              "LandingAirLevel",    nullptr, &Config::airLevel,      0.2f,  0.8f, 0.05f, 'x', false},
             {"Landing trigger level",            "LandingThreshold",   nullptr, &Config::landingThresh, 0.5f,  3.0f, 0.1f,  'x', false},
-            {"Landing kick (jolt)",              "LandingJolt",        nullptr, &Config::landingJolt,   0.0f,  1.0f, 0.05f, '%', false},
-            {"Bump kick",                        "BumpKick",           nullptr, &Config::bumpKick,      0.0f,  2.0f, 0.05f, 'x', false},
             {"Landing thump (road)",             "ThumpGain",          nullptr, &Config::thumpGain,     0.0f,  2.0f, 0.05f, 'x', false},
             {"Priority ducking",                 "PriorityDuck",       nullptr, &Config::priorityDuck,  0.0f,  1.0f, 0.05f, '%', false},
             // frequencies
@@ -1781,7 +1714,6 @@ private:
             {"Road min frequency",               "RoadMinHz",          nullptr, &Config::roadMinHz,     20.0f, kHardMaxHz - 5.0f, 2.0f, 'H', false},
             {"Road max frequency",               "RoadMaxHz",          nullptr, &Config::roadMaxHz,     25.0f, kHardMaxHz, 2.0f, 'H', false},
             {"Brake pitch",                      "BrakeHzScale",       nullptr, &Config::brakeHzScale,  0.5f,  2.0f, 0.05f, 'x', false},
-            {"Landing pitch",                    "ImpactHzScale",      nullptr, &Config::impactHzScale, 0.5f,  2.0f, 0.05f, 'x', false},
         };
     }
 
@@ -1796,8 +1728,6 @@ private:
             case 'g': snprintf(out, n, "%d", (int)std::lround(v)); break;
             case '%': snprintf(out, n, "%.0f%%", v * 100.0f); break;
             case 'H': snprintf(out, n, "%.0f Hz", v); break;
-            case 'k': snprintf(out, n, "%s", v >= 2.5f ? "SAW" : v >= 1.5f ? "SYNTH" : v >= 0.5f ? "BURST" : "PUSH"); break;
-            case 'p': snprintf(out, n, "%.0f%%", v / 100.0f); break;
             case 'o': snprintf(out, n, "%s", v >= 0.5f ? "ON" : "OFF"); break;
             default:  snprintf(out, n, "x%.2f", v); break;
         }
@@ -1853,24 +1783,20 @@ private:
     static const char* TipFor(const char* key) {
         struct T { const char* k; const char* t; };
         static const T tips[] = {
-            {"KickMode",           "SAW = left/right sawtooth edges from the wheel's own effect engine (default). SYNTH, BURST, PUSH = alternatives."},
             {"EnableEngine",       "Switch the engine vibration on or off. Left/Right or Select toggles it. For diagnosing."},
             {"EnableRoad",         "Switch road texture and surface vibration on or off. For diagnosing."},
             {"EnableBrake",        "Switch braking judder and lock-up shake on or off. For diagnosing."},
-            {"EnableLandingKick",  "Switch the hard left-right kick on landings and hard hits on or off. For diagnosing."},
-            {"EnableLandingBody",  "Switch the short low-pitched buzz under a landing on or off. For diagnosing."},
-            {"EnableBumpKick",     "Switch the smaller left-right kick on ordinary bumps on or off. For diagnosing."},
+            {"EnableLandingBoost", "Switch the landing boost on or off. For diagnosing."},
             {"UserGain",           "Overall level for every added effect. Only lowers output; also on Numpad +/- while driving."},
             {"TotalMaxMagnitude",  "Cap on engine, road and brake combined. Lower it if the wheel feels too busy or too strong."},
             {"EngineMaxMagnitude", "Strength of the engine vibration. It has the lowest priority and gives way to road and landings."},
             {"RoadMaxMagnitude",   "Strength of surface texture and bumps. Higher feels rougher on gravel, dirt and kerbs."},
             {"BrakeMaxMagnitude",  "Strength of the braking judder and front-wheel lock-up shake."},
-            {"ImpactMaxMagnitude", "Landing strength. 85-90% is the sweet spot; 95% is heavy; 100% is outrageous (longer, harder kick)."},
-            {"ImpactGain",         "How hard landings and big hits are scored. Higher = even small jumps hit at full strength."},
+            {"ImpactGain",         "How hard landings and big hits are scored. Higher = even small jumps get the full boost."},
             {"LandingAirLevel",    "How light the car must get to count as airborne. Higher catches smaller hops and crests."},
             {"LandingThreshold",   "How hard a hit without airtime must be to count. Raise it if braking or weight shifts trigger it."},
-            {"LandingJolt",        "Landing mix: high = hard left-right kick, low = a short low-pitched buzz instead."},
-            {"BumpKick",           "Strength of the left-right kick on ordinary bumps. 0 = landings only. Lower it if gravel feels too banging."},
+            {"LandingBoost",       "On a landing, RBR's own steering force is multiplied by this much extra. 200% = three times its force at the peak."},
+            {"LandingMinPush",     "Minimum extra torque on a landing, in the direction RBR is already pushing. Helps when RBR's own force is small."},
             {"ThumpGain",          "Extra thump added to the road layer on landings and heavy compressions."},
             {"PriorityDuck",       "How much engine and road fade back while a higher-priority effect plays. 0 = no ducking."},
             {"EngineMinHz",        "Engine vibration pitch at idle. Lower is deeper and slower."},
@@ -1878,7 +1804,6 @@ private:
             {"RoadMinHz",          "Road vibration pitch at low speed on smooth ground."},
             {"RoadMaxHz",          "Road vibration pitch at high speed or on rough ground. Higher feels sharper and finer."},
             {"BrakeHzScale",       "Pitch of the braking judder. Below 1 = slower and coarser, above 1 = faster and finer."},
-            {"ImpactHzScale",      "Pitch of the landing buzz. Below 1 = deeper and heavier, above 1 = sharper."},
         };
         for (const T& t : tips) if (std::strcmp(t.k, key) == 0) return t.t;
         return "";
@@ -2015,16 +1940,19 @@ public:
         { std::lock_guard<std::mutex> lk(m_mtx); st = m_status; }
         snprintf(buf, sizeof(buf), "Status: %s", st.c_str());
         line(buf);
-        static const char* const kPhase[] = {"engine sweep", "gravel", "rough / dirt", "hard braking + lock-up", "landing hits"};
+        static const char* const kPhase[] = {"engine sweep", "gravel", "rough / dirt", "hard braking + lock-up"};
         snprintf(buf, sizeof(buf), "UDP packets: %lld (port %d)   live gain %.0f%%%s   derate x%.2f",
                  (long long)m_packets.load(), m_cfg.udpPort, m_userGain.load() * 100.0f, m_muted ? " MUTED" : "", m_dHeat.load());
         line(buf);
         { std::string nm, pr; { std::lock_guard<std::mutex> lk(m_mtx); nm = m_carName; pr = m_carPreset; }
           snprintf(buf, sizeof(buf), "car slot %d: %s %s", m_dCar.load(), nm.empty() ? "waiting for telemetry" : nm.c_str(), pr.c_str());
           line(buf); }
-        snprintf(buf, sizeof(buf), "now: engine %.0f@%.0fHz  lump %.0f  road L %.0f R %.0f  brake %.0f@%.0fHz  landing %.0f  last kick %s peak %.0f",
+        snprintf(buf, sizeof(buf), "now: engine %.0f@%.0fHz  lump %.0f  road L %.0f R %.0f  brake %.0f@%.0fHz",
                  m_mag[S_ENG1].load(), m_hz[S_ENG1].load(), m_mag[S_ENG2].load(),
-                 m_mag[S_ROAD].load(), m_mag[S_ROADR].load(), m_mag[S_BRAKE].load(), m_hz[S_BRAKE].load(), m_mag[S_IMPACT].load(), m_dKickDir.load() < 0.0f ? "L" : "R", m_dKickPk.load());
+                 m_mag[S_ROAD].load(), m_mag[S_ROADR].load(), m_mag[S_BRAKE].load(), m_hz[S_BRAKE].load());
+        line(buf);
+        snprintf(buf, sizeof(buf), "landing boost: x%.2f  +%.0f   RBR force updates seen %d  last in %d out %d",
+                 m_dBoostMul.load(), m_dBoostAdd.load() * 10000.0f, g_rbrSeen.load(), g_rbrRaw.load(), g_rbrOut.load());
         line(buf);
         y += 6.0f;
 
@@ -2037,7 +1965,7 @@ public:
                 else snprintf(value, sizeof(value), "%s%s", m_sel == m_connectedIdx ? "[on] " : "", m_devices[m_sel].name);
             } else if (i == 1) {
                 snprintf(label, sizeof(label), "TEST vibration (Select)");
-                snprintf(value, sizeof(value), "%s", m_test ? kPhase[std::max(0, std::min(m_testPhase.load(), 4))] : "off");
+                snprintf(value, sizeof(value), "%s", m_test ? kPhase[std::max(0, std::min(m_testPhase.load(), 3))] : "off");
             } else if (i == iView) {
                 snprintf(label, sizeof(label), "Diagnostics / raw packet");
                 snprintf(value, sizeof(value), "Select to open");
@@ -2064,7 +1992,7 @@ public:
         {   // tooltip for the highlighted row
             const char* tip = "";
             if (m_cursor == 0) tip = "Choose your wheel with Left/Right, then Select to connect. The name is saved for next time.";
-            else if (m_cursor == 1) tip = "Plays a built-in demo of engine, gravel, dirt, braking and landing hits so you can tune without driving.";
+            else if (m_cursor == 1) tip = "Built-in demo of engine, gravel, dirt and braking vibrations. Landings boost RBR's own force, so they are not part of the demo.";
             else if (m_cursor == iView) tip = "Live telemetry values and raw packet bytes. Useful for troubleshooting with no effects.";
             else if (m_cursor == iReset) tip = "Restores the gains and frequencies on this page to the built-in defaults. Select twice to confirm.";
             else tip = TipFor(m_rows[m_cursor - 2].key);
