@@ -1,68 +1,96 @@
 # RBR_ForceFX
-RBR_ForceFX: plugin for RBR with NGP7 that enhances FFB with additional effects (formerly RBR_ffb_aux / RBR_TrueforcePlugin)
 
+RBR_ForceFX is a community-developed force feedback enhancement plugin for Richard Burns Rally (RBR) using NGP telemetry. It adds extra vibration and impact detail on top of RBR's native steering force, making the wheel feel more alive without replacing the base sim's steering model.
 
-## v4: safety limits and live gain
+It is designed to improve the feedback from:
 
-- Hard ceilings in code: total output capped at 5000/10000, vibration frequencies 12-120 Hz, all gains 0..1. The `.ini` cannot exceed them.
-- Slow thermal derate (`SustainedLimit`): sustained heavy output is gradually reduced.
-- UDP telemetry listens on 127.0.0.1 only.
-- Effects settle to zero before release; worker-thread exceptions are contained; the DLL pins itself if another tool hooked DirectInput on top of it.
-- **Live gain while driving** (RBR must be the foreground window):
-  - `Ctrl` + `Numpad +` / `Numpad -`: overall vibration level up / down in equal-loudness steps (x or / `GainRatio`, default 0.85; beep pitch = level)
-  - `Ctrl` + `Numpad *`: mute / unmute
-  - The level can only reduce from the configured ceilings and is saved to `UserGain` in `ForceFX.ini`.
-  - Keys are Windows virtual-key codes in the `.ini` (`KeyGainUp`, `KeyGainDown`, `KeyMute`, `KeyModifier`, `GainRatio`, `GainBeep`); 0 disables a key.
-- Existing `ForceFX.ini` files keep their old values (clamped to the new ceilings). Delete it once to get the new, lower defaults.
-- Gain structure is now: per-layer `*MaxMagnitude` (the mix) -> `TotalMaxMagnitude` (fixed safety ceiling) -> `UserGain` (live level). `MasterGain` and the per-layer `*Gain` keys were removed because they duplicated these. The thermal derate measures the level actually delivered, including `UserGain`.
+- engine vibration and roughness
+- road surface feel and tyre load response
+- braking judder and lock-up cues
+- landing and impact events
+- per-car tuning profiles
 
-## v4.1: granular road, directional impacts, rougher high revs
+## Why use it?
 
-- **Road is now two zero-mean sawtooth effects with opposite sharp edges**, each fed by one side's tyre roughness. An impact on the left tyres snaps one way, on the right tyres the other. Because both waveforms average to zero, nothing is added to RBR's own force. `RoadDirectional` (0..1) blends between identical sides and fully separate sides; `RoadSideInvert=1` swaps the polarity if left/right feel backwards on your wheel.
-- **Granular road:** amplitude and pitch are re-randomised every ~12 ms per side, and the two sides are detuned so they never lock in phase. `RoadGrain` (0..1) sets how coarse it gets.
-- **Rougher high revs:** random firing-strength variation, a little pitch jitter, and the half-order effect turns into a detuned second oscillator (x1.37) at high revs, so it beats against the main one. `EngineGrit` (0..1) sets how much.
-- TEST mode phase 3 now alternates left-side and right-side hits every 1.5 s so you can check direction without driving.
+RBR already does a great job with steering force, but many sim racers want a richer sense of the car, the road, and the suspension. RBR_ForceFX adds layered effects that react to telemetry such as wheel load, tyre roughness, engine speed, suspension travel, and car identity.
 
-## v5: weight / suspension load, per-car profiles, shipped default inis
+The result is a more detailed and immersive wheel experience, with a focus on road feel, weight transfer, and more convincing landing impacts.
 
-- **Defaults** are now the tuned values (engine 1200, road 3000, brake 3000, total 4000, no hotkey modifier, auto-connect to the SIMAGIC Alpha EVO). `ForceFX.ini` and `ForceFXCars.ini` live in the repo as reference defaults to copy next to the DLL. The build does not use them, and the plugin writes `ForceFX.ini` itself on first run if it is missing. If you add a key in `SyncConfig`, add it to the repo ini by hand.
-- **Weight / load model** (relative to each car's own static load, so units don't matter; static load is re-learned at stage start):
-  - the more heavily loaded side transmits more road (`LoadInfluence`)
-  - compression and landing thump per side (`ThumpGain`), stronger and longer for a heavier car (`WeightFeel`)
-  - road and engine go quiet when the wheels leave the ground (`AirborneFade`)
-  - braking judder grows with the load on the front tyres
-- **Per-car profiles, matched by car name:** the plugin reads the car's name text the way RSF does (`rallysimfans.ini` `[cars] slot`, then `Cars\Cars.ini` `[Car0<slot>]` `CarName` / `RSFCarID`; vanilla installs fall back to the telemetry slot and the car's model file name). Each section in `ForceFXCars.ini` with a `Name=` is a profile; names are matched loosely (case, punctuation, `Grp`/`Group`, missing manufacturer words), but years, model numbers and roman numerals must agree. `Match=` adds aliases and `RSFCarID=` gives an exact match. Keys: `Preset` (inline4, inline4turbo, boxer4, inline5, v6, flat6, v8), `Cylinders`, `RpmMax`, `EngineScale`, `RoadScale`, `LumpScale`, `Grit`, `Unevenness`, `WeightFeel`. The file is re-read when it changes; the menu page and `ForceFX.log` show the detected name and the matched profile. A car change (or a new stage) resets the learned rev limit and load.
+## Features
 
-## v5.1: landing impacts, car switching fix, new defaults
+- Road and tyre feedback with side-aware vibration and texture variation
+- Engine vibration tuned across the rev range
+- Brake judder and front-lock cues
+- Landing/thump effects and impact response
+- Load-sensitive suspension and weight feel adjustments
+- Per-car profiles matched by car name
+- In-game settings menu in RBR for live tuning
+- Safety limits and thermal derating to protect the wheel and hardware
 
-- **Landings and hard hits** now have their own effect layer (`ImpactMaxMagnitude`, `ImpactGain`). A landing is detected from the raw strut load (not the smoothed one), the time the wheels were off the ground and the heave spike; the hit attacks instantly (square burst, 24-60 Hz, lower for bigger hits and heavier cars) and rings out over about 0.2 s. While it plays, the other layers duck so it is not diluted, and it stays inside `TotalMaxMagnitude` and the hard ceilings. It is symmetric (zero-mean), so it never pushes RBR's steering force. `ImpactGain` 0..2 sets sensitivity (0 = off). TEST mode phase 5 plays big and medium landing hits.
-- **Car switching fixed:** the car identity used to be checked only on a few events, so a car changed in the menus kept the old profile. It is now polled about once a second (also when telemetry returns after a pause, on stage start and when the slot changes), and `ForceFXCars.ini` edits are picked up live. A momentarily unreadable `Cars.ini` keeps the current car instead of dropping its profile.
-- Shipped `ForceFX.ini` / `ForceFXCars.ini` and the built-in defaults are now the tuned personal set.
+## Requirements
 
-## Note
+- Richard Burns Rally
+- NGP7 telemetry enabled and outputting data to the plugin
+- A DirectInput-compatible force feedback wheel
+- Windows
 
-This plugin enhances Richard Burns Rally's own force feedback; it never replaces or overrides it. All effects are zero-mean vibrations added to the wheel alongside RBR's steering force, the wheel's gain and autocenter are never touched, and RBR's force is unaffected when the plugin is muted or unloaded.
+## Installation
 
-## v5.2: landings rewritten
+1. Place the plugin files in the RBR plugins directory or the appropriate install location used by your RBR setup.
+2. Ensure the telemetry port configured in NGP matches the plugin's UDP port (`ForceFX.ini`).
+3. Launch RBR and open the plugin settings from:
+   - RBR main menu > Plugins > ForceFX
+4. Select your wheel and adjust settings as needed.
 
-- Landing detection no longer needs 0.1 s of full airtime. Severity now combines three cues with `max()` (peak strut load, how fast the total strut load jumped from its recent minimum, airtime + heave spike), so short hops, crest drops and bottoming out register too, and the severity is continuous: a small hop is a tap, a big jump is a full-strength hit.
-- The hit curve is more concave (`^0.6`) and `ImpactMaxMagnitude` default is 5000 (the hard ceiling). The hit may use its own ceiling; the other layers duck to make room.
-- Every detected landing / hit is written to `ForceFX.log` with its severity and the cues behind it. Existing `ForceFX.ini` files keep their old `ImpactMaxMagnitude`; set it to 5000 or delete the file.
+The repository includes:
 
-## v6: renamed to RBR_ForceFX, in-game settings menu
+- `RBR_ForceFX.dll`
+- `ForceFX.ini`
+- `ForceFXCars.ini`
 
-- **Renamed everywhere:** `RBR_ForceFX.cpp`, `RBR_ForceFX.def`, `RBR_ForceFX.dll`, `ForceFX.ini` (section `[ForceFX]`), `ForceFXCars.ini`, `ForceFX.log`, `ForceFX_loaded.txt`, `ForceFX_packet.txt`. The plugin is listed as "ForceFX" in RBR's plugin menu. On first start, if `ForceFX.ini` / `ForceFXCars.ini` do not exist but the old `TrueforceRumble.ini` / `TrueforceCars.ini` do, your settings and car profiles are carried over automatically. Delete the old `RBR_TrueforcePlugin.dll` from `Plugins` so only one copy loads.
-- **In-game settings menu** (RBR main menu > Plugins > ForceFX). Up/Down choose a row, Left/Right change it, Select acts on the Wheel / TEST / Diagnostics / Reset rows. Changes reach the wheel immediately (use the TEST row to hear them without driving) and are written to `ForceFX.ini` at once.
-  - Gains: live level, total ceiling, engine, road, brake and landing gain, landing sensitivity, landing thump.
-  - Frequencies: engine min/max Hz, road min/max Hz, brake pitch and landing pitch (multipliers, new keys `BrakeHzScale` and `ImpactHzScale`, default 1).
-  - Every edit goes through the same clamps as the ini (hard ceilings, 12-120 Hz), so the menu cannot exceed the safety limits. Car profiles still scale engine and road gain on top of the menu values.
-  - The old raw-packet view moved to the Diagnostics row.
+## Configuration
 
-- **Priority ducking:** landing/impact is the highest priority, road second, engine lowest. While a higher layer is active the lower ones fall back (road by the landing, engine by landing and road), so the strongest cue is the one you feel. `PriorityDuck` (menu: "Priority ducking", default 85%) sets how far they fall back, 0 = off. A brake judder is only pushed back by a landing.
-- **More sensitive landings:** lower thresholds for the airtime, load-spike and no-airtime hit detectors, a stronger curve for small hops and a slightly longer ring-out.
-- **Landing kick:** a landing used to be only a short symmetric buzz, which a direct-drive wheel hardly registers. It is now split into that buzz plus a one-direction constant-force pulse (a new "jolt" effect). `LandingJolt` (menu: "Landing kick", default 80%) is the share of the landing budget played as the kick; 0 = buzz only. The direction follows the more heavily loaded side (flipped by `RoadSideInvert`) and alternates when both sides are equal. Buzz and kick together never exceed `ImpactMaxMagnitude` or the hard ceiling. The buzz also got a higher, slightly jittered pitch, a 40% minimum strength and a longer ring-out. Lock-up is unchanged.
-- **Menu text fix:** RBR's text drawing treats `%` as a format character, which garbled the live-gain line; every menu string now escapes it.
-- **Landing buzz matched to the lock-up:** same sine waveform (square effects can be weak on some bases), lower and wider pitch (about 18-55 Hz, jittered), a 60% minimum strength, a longer ring-out (real landings and the TEST hits), and the kick share defaults to 35% so most of the budget is sustained buzz.
-- **Fewer false landings:** the lowered detection thresholds were also firing on weight transfer from braking while cornering, so the original thresholds are back, the 60% minimum strength is gone and the ring-out is shorter. New menu row "Landing trigger level" (`LandingThreshold`, default x1.0, 0.5-3.0): raise it if ordinary braking/cornering still triggers a landing, lower it if real jumps are missed. It gates the no-airtime hit detector; real airtime landings are not affected.
-- **Landing is now a thump, not a grind:** the lock-up-style jittery buzz is gone from landings. The kick is a damped push-and-rebound (constant force, about 8 Hz, a clean "thud-thump"), with a short smooth low-pitched body (12-30 Hz, no pitch jitter) underneath. `LandingJolt` (menu "Landing kick") now defaults to 80% and sets kick versus body; "Landing pitch" scales the body pitch. Brake and lock-up are unchanged.
-- **Jumps vs. weight transfer:** landings after real airtime are scored sensitively again (every jump is felt), while the no-airtime hit path stays strict so braking while cornering does not trigger landings. New menu row "Airborne load level" (`LandingAirLevel`, default x0.45, 0.2-0.8): the total strut load below which the car counts as airborne. Raise it if jumps are missed. The kick is a little longer and stronger for small and medium landings (about 7 Hz, 0.15 s). Default brake gain is now 2000.
+The main setup file is `ForceFX.ini`. It controls:
+
+- overall strength and safety ceilings
+- engine, road, brake, and impact gain
+- frequency ranges
+- landing sensitivity
+- live tuning level and hotkeys
+- telemetry offsets and connection settings
+
+The car-specific setup is in `ForceFXCars.ini`, which allows tuning by vehicle type and name.
+
+## In-game controls
+
+The plugin supports live adjustment from RBR while driving. Common features include:
+
+- live gain controls
+- menu-based tuning of strength and frequency settings
+- quick reset and diagnostics support
+
+The exact hotkeys and settings can be adjusted in `ForceFX.ini`.
+
+## Safety and design notes
+
+This plugin enhances RBR's existing force feedback; it does not replace or override the simulator's steering force. All added effects are zero-mean vibrations layered on top of the wheel's normal steering output.
+
+The plugin includes safety protections such as:
+
+- hard output ceilings
+- frequency bounds
+- gain clamping
+- thermal derating under sustained heavy load
+
+## Important note
+
+This project is intended for enthusiasts and advanced users. It relies on telemetry and uses aggressive vibration shaping, so calibration is often personal and may require tuning depending on wheel hardware, seating, and preference.
+
+## License and support
+
+This project is provided as-is for the community. Please use it responsibly and ensure your hardware and game setup are compatible before running it for long sessions.
+
+## Project status
+
+RBR_ForceFX is a feature-rich plugin designed for players who want a stronger and more detailed sense of road, engine, suspension, and impact events in Richard Burns Rally.
+
