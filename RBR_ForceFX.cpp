@@ -500,7 +500,32 @@ bool GetInstanceGuid(IDirectInputDevice8A* d, bool wide, GUID& g) {
     }
     return true;
 }
-
+struct EffectTap {
+    static void** vtbl;
+    static void*  orig;
+    static HRESULT WINAPI HSetParameters(IDirectInputEffect* self, LPCDIEFFECT peff, DWORD flags) {
+        if (peff && (flags & DIEP_TYPESPECIFICPARAMS) && peff->cbTypeSpecificParams == sizeof(DICONSTANTFORCE) &&
+            peff->lpvTypeSpecificParams && peff->dwSize >= 48 && peff->dwSize <= 256) {
+            const LONG raw = static_cast<const DICONSTANTFORCE*>(peff->lpvTypeSpecificParams)->lMagnitude;
+            if (g_rbrSeen.fetch_add(1) == 0) Logf("Hook sees RBR's constant-force updates (first magnitude %ld)", (long)raw);
+            const float mul = g_boostMul.load(), add = g_boostAdd.load();
+            LONG out = raw;
+            if (mul != 1.0f || add > 0.0f) {
+                float f = (float)raw * mul;
+                if (raw > 0) f += add * 10000.0f; else if (raw < 0) f -= add * 10000.0f;
+                out = (LONG)clampf(f, -10000.0f, 10000.0f);
+            }
+            g_rbrRaw = (int)raw; g_rbrOut = (int)out;
+            if (out != raw) {
+                DICONSTANTFORCE cf{}; cf.lMagnitude = out;
+                uint8_t buf[256];
+                std::memcpy(buf, peff, peff->dwSize);
+                reinterpret_cast<DIEFFECT*>(buf)->lpvTypeSpecificParams = &cf;
+                return ((PFN_SetParams)orig)(self, reinterpret_cast<LPCDIEFFECT>(buf), flags);
+            }
+        }
+        return ((PFN_SetParams)orig)(self, peff, flags);
+    }
 class GameDeviceTap {
 public:
     static GameDeviceTap& I() { static GameDeviceTap t; return t; }
@@ -687,32 +712,7 @@ std::atomic<int>   g_rbrSeen{0}, g_rbrRaw{0}, g_rbrOut{0};      // diagnostics: 
 typedef HRESULT (WINAPI *PFN_SetParams)(IDirectInputEffect*, LPCDIEFFECT, DWORD);
 enum { VT_FX_SETPARAMETERS = 6 };
 
-struct EffectTap {
-    static void** vtbl;
-    static void*  orig;
-    static HRESULT WINAPI HSetParameters(IDirectInputEffect* self, LPCDIEFFECT peff, DWORD flags) {
-        if (peff && (flags & DIEP_TYPESPECIFICPARAMS) && peff->cbTypeSpecificParams == sizeof(DICONSTANTFORCE) &&
-            peff->lpvTypeSpecificParams && peff->dwSize >= 48 && peff->dwSize <= 256) {
-            const LONG raw = static_cast<const DICONSTANTFORCE*>(peff->lpvTypeSpecificParams)->lMagnitude;
-            if (g_rbrSeen.fetch_add(1) == 0) Logf("Hook sees RBR's constant-force updates (first magnitude %ld)", (long)raw);
-            const float mul = g_boostMul.load(), add = g_boostAdd.load();
-            LONG out = raw;
-            if (mul != 1.0f || add > 0.0f) {
-                float f = (float)raw * mul;
-                if (raw > 0) f += add * 10000.0f; else if (raw < 0) f -= add * 10000.0f;
-                out = (LONG)clampf(f, -10000.0f, 10000.0f);
-            }
-            g_rbrRaw = (int)raw; g_rbrOut = (int)out;
-            if (out != raw) {
-                DICONSTANTFORCE cf{}; cf.lMagnitude = out;
-                uint8_t buf[256];
-                std::memcpy(buf, peff, peff->dwSize);
-                reinterpret_cast<DIEFFECT*>(buf)->lpvTypeSpecificParams = &cf;
-                return ((PFN_SetParams)orig)(self, reinterpret_cast<LPCDIEFFECT>(buf), flags);
-            }
-        }
-        return ((PFN_SetParams)orig)(self, peff, flags);
-    }
+
     // vt = vtable of any effect created on RBR's device (RBR's own effects share the class)
     static bool Patch(void** vt) {
         if (vtbl == vt) return true;
