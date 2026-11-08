@@ -771,7 +771,7 @@ private:
     int m_fail = 0;
     HRESULT m_lastHr = DI_OK;
     unsigned m_kickSeq = 0, m_kickSeqApplied = 0;
-    DWORD m_kickPhase = 9000;
+    DWORD m_kickPhase = 0;
 
     HRESULT Make(int slot, const GUID& g) {
         DIPERIODIC per{};
@@ -1106,7 +1106,7 @@ struct Synth {
     float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
     float jSign = 1.0f, jAge = 5.0f, kickAmp = 0.0f;   // direction, age and strength of the current kick
     unsigned seenEvt = 0;
-    int kickBump = 0; unsigned kickSeq = 0; DWORD kickPhase = 9000;
+    int kickBump = 0; unsigned kickSeq = 0; DWORD kickPhase = 0;
     float kickPk = 0.0f, lastDerate = 1.0f;   // peak kick output of the current event (for the menu and the log)
     float roadJit[2] = {1.0f, 1.0f}, ampJit[2] = {1.0f, 1.0f}, engJit = 1.0f, engHzJit = 1.0f, unevPhase = 0;
     double nextJit = 0;
@@ -1213,7 +1213,7 @@ struct Synth {
         if (s.evtSeq != seenEvt) {                                                   // new landing / hit / bump: restart the kick
             seenEvt = s.evtSeq;
             jAge = 0.0f; kickAmp = s.evtSev; jSign = s.evtDir; kickPk = 0.0f; kickBump = s.evtBump;
-            ++kickSeq; kickPhase = jSign < 0.0f ? 27000 : 9000;     // burst starts at a peak: 270 deg = negative (left) first, 90 deg = positive (right) first
+            ++kickSeq; kickPhase = 0;     // always start at phase 0: many wheel drivers ignore the phase field, so direction is not left to it
         }
         if (jAge < 0.08f) kickAmp = std::max(kickAmp, s.evtSev);                     // a landing is scored over its first ~100 ms
         { const float prevAge = jAge; jAge = std::min(jAge + dt, 5.0f);
@@ -1236,9 +1236,15 @@ struct Synth {
         const bool kickOn = kickBump ? c.fxBumpKick != 0 : c.fxLandKick != 0;
         const float kAmpl = Lmax * jf * std::pow(clamp01(kickAmp * (1.0f + 0.5f * ov)), 0.7f - 0.3f * ov);
         const float tjs = (kickOn && c.fxKickMode == 0) ? jSign * kAmpl * wave : 0.0f;                 // PUSH: constant force
-        const float kenv = jAge < 0.03f ? 1.0f : (float)std::exp(-(jAge - 0.03f) / (0.11f * ts * (1.0f + 0.9f * ov)));      // BURST: periodic, full strength, fast decay
-        const float tkick = (kickOn && c.fxKickMode == 1 && jAge < 0.45f + 0.35f * ov) ? kAmpl * kenv : 0.0f;
-        hz[S_KICK] = clampf(14.0f / ts, kHardMinHz, 20.0f);
+        // BURST direction without relying on the driver's phase field: the sine always restarts at phase 0, whose first
+        // half-wave is positive (right). For a right-first kick we play from the start; for a left-first kick we hold the
+        // first (positive) half-wave at zero and let the sine's negative half-wave be the first stroke heard.
+        const float hzK = clampf(14.0f / ts, kHardMinHz, 20.0f);
+        const float lead = jSign < 0.0f ? 0.5f / hzK : 0.0f;
+        const float eAge = jAge - lead;
+        const float kenv = eAge < 0.03f ? 1.0f : (float)std::exp(-(eAge - 0.03f) / (0.11f * ts * (1.0f + 0.9f * ov)));      // BURST: periodic, full strength, fast decay
+        const float tkick = (kickOn && c.fxKickMode == 1 && eAge >= 0.0f && eAge < 0.45f + 0.35f * ov) ? kAmpl * kenv : 0.0f;
+        hz[S_KICK] = hzK;
         hz[S_JOLT] = 50.0f;
 
         // attack / release: road is deliberately fast (sharpness), engine is rounder
@@ -1821,7 +1827,7 @@ private:
     static const char* TipFor(const char* key) {
         struct T { const char* k; const char* t; };
         static const T tips[] = {
-            {"KickMode",           "BURST = hard 14 Hz shake that starts left or right (best on most wheels). PUSH = constant-force shove."},
+            {"KickMode",           "BURST = hard ~13 Hz shake that starts left or right. PUSH = constant-force shove (try it if BURST pulls one way)."},
             {"EnableEngine",       "Switch the engine vibration on or off. Left/Right or Select toggles it. For diagnosing."},
             {"EnableRoad",         "Switch road texture and surface vibration on or off. For diagnosing."},
             {"EnableBrake",        "Switch braking judder and lock-up shake on or off. For diagnosing."},
