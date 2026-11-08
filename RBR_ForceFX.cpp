@@ -122,7 +122,7 @@ struct Config {
 
     // per-layer ceilings (DirectInput units 0..10000), a fixed total ceiling, and one live level (userGain)
     int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 2000;
-    int   impactMaxMag = 9000;       // landing / hard-hit layer (it gets priority inside TotalMaxMagnitude)
+    int   impactMaxMag = 8800;       // landing / hard-hit layer (it gets priority inside TotalMaxMagnitude)
     float impactGain = 1.5f;         // landing sensitivity 0..3 (1 = old default, 0 = off)
     float brakeHzScale = 1.0f;       // brake judder pitch multiplier 0.5..2 (menu)
     float impactHzScale = 1.0f;      // landing hit pitch multiplier 0.5..2 (menu)
@@ -1202,8 +1202,14 @@ struct Synth {
         //  * a short, smooth, low-pitched body under it. No random pitch jitter: jitter is what makes the lock-up
         //    feel like grinding, which is great for braking but wrong for a landing.
         const float imp = clamp01(s.impact);
-        const float Lmax = (float)std::min(c.impactMaxMag, kHardImpactMax);
-        const float jf = clamp01(c.landingJolt);
+        // Landing gain is a 0..100% control with headroom built in:
+        //   up to ~88%   torque rises to full scale (88% = "ideal", 85-90% is the sweet spot)
+        //   90% -> 100%  overdrive: more of the landing goes into the kick, mid-size landings count as bigger,
+        //                the kick rings out longer and the kick is derated less ("heavy" at 95%, "outrageous" at 100%)
+        const float gSet = clamp01((float)c.impactMaxMag / 10000.0f);
+        const float ov = smooth01(0.90f, 1.0f, gSet);
+        const float Lmax = 10000.0f * std::min(1.0f, gSet / 0.875f);
+        const float jf = clamp01(c.landingJolt) + (1.0f - clamp01(c.landingJolt)) * ov;
         if (s.evtSeq != seenEvt) {                                                   // new landing / hit / bump: restart the kick
             seenEvt = s.evtSeq;
             jAge = 0.0f; kickAmp = s.evtSev; jSign = s.evtDir; kickPk = 0.0f; kickBump = s.evtBump;
@@ -1228,10 +1234,10 @@ struct Synth {
               wave = kV[k] + (kV[k + 1] - kV[k]) * clamp01((u - kT[k]) / (kT[k + 1] - kT[k]));
           } }
         const bool kickOn = kickBump ? c.fxBumpKick != 0 : c.fxLandKick != 0;
-        const float kAmpl = Lmax * jf * std::pow(clamp01(kickAmp), 0.7f);
+        const float kAmpl = Lmax * jf * std::pow(clamp01(kickAmp * (1.0f + 0.5f * ov)), 0.7f - 0.3f * ov);
         const float tjs = (kickOn && c.fxKickMode == 0) ? jSign * kAmpl * wave : 0.0f;                 // PUSH: constant force
-        const float kenv = jAge < 0.03f ? 1.0f : (float)std::exp(-(jAge - 0.03f) / (0.11f * ts));      // BURST: periodic, full strength, fast decay
-        const float tkick = (kickOn && c.fxKickMode == 1 && jAge < 0.45f) ? kAmpl * kenv : 0.0f;
+        const float kenv = jAge < 0.03f ? 1.0f : (float)std::exp(-(jAge - 0.03f) / (0.11f * ts * (1.0f + 0.9f * ov)));      // BURST: periodic, full strength, fast decay
+        const float tkick = (kickOn && c.fxKickMode == 1 && jAge < 0.45f + 0.35f * ov) ? kAmpl * kenv : 0.0f;
         hz[S_KICK] = clampf(14.0f / ts, kHardMinHz, 20.0f);
         hz[S_JOLT] = 50.0f;
 
@@ -1257,7 +1263,7 @@ struct Synth {
         const float impM = std::min(std::fabs(sm[S_IMPACT]) + jM, (float)kHardImpactMax);   // buzz + kick share one landing budget   // the hit may use its own ceiling (<= hard max), not just the shared one
         // Priority: landing (highest) > road > engine (lowest). A lower layer falls back while a higher one is active,
         // so the strongest cue is the one you actually feel. Brake is only pushed back by a landing.
-        const float pI = c.impactMaxMag > 0 ? clamp01(impM / (float)c.impactMaxMag) : 0.0f;
+        const float pI = Lmax > 0.0f ? clamp01(impM / Lmax) : 0.0f;
         const float pR = c.roadMaxMag > 0 ? clamp01(std::max(std::fabs(sm[S_ROAD]), std::fabs(sm[S_ROADR])) / (float)c.roadMaxMag) : 0.0f;
         const float dk = clampf(c.priorityDuck, 0.0f, 1.0f);
         float duck[S_COUNT];
@@ -1280,7 +1286,7 @@ struct Synth {
 
         const float g = ug * derate;
         lastDerate = derate;
-        const float gk = ug * clampf(std::sqrt(derate), 0.70f, 1.0f);   // a 0.3 s kick is not what heats the motor: it gets a softer derate (never below 70%)
+        const float gk = ug * clampf(std::sqrt(derate), 0.70f + 0.15f * ov, 1.0f);   // a 0.3 s kick is not what heats the motor: it gets a softer derate (never below 70%)
         for (int i = 0; i < S_COUNT; ++i) {
             float m = (i == S_IMPACT ? std::max(0.0f, impM - jM) * gk : i == S_JOLT ? jJ * gk : i == S_KICK ? jK * gk : sm[i] * duck[i] * scale * g);
             if (!std::isfinite(m)) { m = 0.0f; sm[i] = 0.0f; }          // never let a NaN latch into the filters
@@ -1729,7 +1735,7 @@ private:
             {"Engine gain",                      "EngineMaxMagnitude", &Config::engineMaxMag, nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Road gain",                        "RoadMaxMagnitude",   &Config::roadMaxMag,   nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Brake gain",                       "BrakeMaxMagnitude",  &Config::brakeMaxMag,  nullptr,  0.0f,   M,    100.0f, 'g', false},
-            {"Landing gain (ceiling)",           "ImpactMaxMagnitude", &Config::impactMaxMag, nullptr,  0.0f,   (float)kHardImpactMax, 100.0f, 'g', false},
+            {"Landing gain",                      "ImpactMaxMagnitude", &Config::impactMaxMag, nullptr,  0.0f,   (float)kHardImpactMax, 100.0f, 'p', false},
             {"Landing sensitivity",              "ImpactGain",         nullptr, &Config::impactGain,    0.0f,  3.0f, 0.05f, 'x', false},
             {"Airborne load level",              "LandingAirLevel",    nullptr, &Config::airLevel,      0.2f,  0.8f, 0.05f, 'x', false},
             {"Landing trigger level",            "LandingThreshold",   nullptr, &Config::landingThresh, 0.5f,  3.0f, 0.1f,  'x', false},
@@ -1759,6 +1765,7 @@ private:
             case '%': snprintf(out, n, "%.0f%%", v * 100.0f); break;
             case 'H': snprintf(out, n, "%.0f Hz", v); break;
             case 'k': snprintf(out, n, "%s", v >= 0.5f ? "BURST" : "PUSH"); break;
+            case 'p': snprintf(out, n, "%.0f%%", v / 100.0f); break;
             case 'o': snprintf(out, n, "%s", v >= 0.5f ? "ON" : "OFF"); break;
             default:  snprintf(out, n, "x%.2f", v); break;
         }
@@ -1826,7 +1833,7 @@ private:
             {"EngineMaxMagnitude", "Strength of the engine vibration. It has the lowest priority and gives way to road and landings."},
             {"RoadMaxMagnitude",   "Strength of surface texture and bumps. Higher feels rougher on gravel, dirt and kerbs."},
             {"BrakeMaxMagnitude",  "Strength of the braking judder and front-wheel lock-up shake."},
-            {"ImpactMaxMagnitude", "Peak strength of the landing hit. Landings are short, so this may go above the total ceiling."},
+            {"ImpactMaxMagnitude", "Landing strength. 85-90% is the sweet spot; 95% is heavy; 100% is outrageous (longer, harder kick)."},
             {"ImpactGain",         "How hard landings and big hits are scored. Higher = even small jumps hit at full strength."},
             {"LandingAirLevel",    "How light the car must get to count as airborne. Higher catches smaller hops and crests."},
             {"LandingThreshold",   "How hard a hit without airtime must be to count. Raise it if braking or weight shifts trigger it."},
