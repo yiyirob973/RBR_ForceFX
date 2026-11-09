@@ -188,7 +188,7 @@ void ClampConfig(Config& c) {
     c.engineMaxMag = std::max(0, std::min(c.engineMaxMag, 10000));
     c.roadMaxMag = std::max(0, std::min(c.roadMaxMag, 10000));
     c.brakeMaxMag = std::max(0, std::min(c.brakeMaxMag, 10000));
-        c.impactGain = clampf(c.impactGain, 0.0f, 3.0f);
+    c.impactGain = clampf(c.impactGain, 0.0f, 3.0f);
     c.brakeHzScale = clampf(c.brakeHzScale, 0.5f, 2.0f);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
     c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0;
@@ -479,27 +479,16 @@ void ApplyProfile(const Config& base, const CarProfile& p, Config& e) {
     if (p.weightFeel > 0)   e.weightFeel = clampf(p.weightFeel, 0.5f, 2.0f);
 }
 
-// -------------------------------------------------- tap on RBR's own device
-// IDirectInputDevice8 vtable slots
-enum { VT_ACQUIRE = 7, VT_UNACQUIRE = 8, VT_GETDEVICESTATE = 9, VT_GETDEVICEDATA = 10, VT_POLL = 25 };
+// ------------------------------------------------ landing boost on RBR's own force
+// RBR drives the wheel with its own DirectInput constant-force effect. Instead of adding effects on top of it, a detected
+// landing scales that force on its way to the wheel: every SetParameters call RBR makes on a constant-force effect is
+// multiplied by g_boostMul, plus a minimum extra push (g_boostAdd, share of full torque) in the direction RBR is already
+// pushing. Our own effects are periodic, so they never pass through this path.
+std::atomic<float> g_boostMul{1.0f}, g_boostAdd{0.0f};
+std::atomic<int>   g_rbrSeen{0}, g_rbrRaw{0}, g_rbrOut{0};      // diagnostics: RBR constant-force updates seen, last in / out
+typedef HRESULT (WINAPI *PFN_SetParams)(IDirectInputEffect*, LPCDIEFFECT, DWORD);
+enum { VT_FX_SETPARAMETERS = 6 };
 
-typedef HRESULT (WINAPI *PFN_Acquire)(IDirectInputDevice8A*);
-typedef HRESULT (WINAPI *PFN_GetState)(IDirectInputDevice8A*, DWORD, LPVOID);
-typedef HRESULT (WINAPI *PFN_GetData)(IDirectInputDevice8A*, DWORD, LPDIDEVICEOBJECTDATA, LPDWORD, DWORD);
-typedef HRESULT (WINAPI *PFN_Poll)(IDirectInputDevice8A*);
-
-bool GetInstanceGuid(IDirectInputDevice8A* d, bool wide, GUID& g) {
-    if (wide) {
-        DIDEVICEINSTANCEW di{}; di.dwSize = sizeof(di);
-        if (FAILED(reinterpret_cast<IDirectInputDevice8W*>(d)->GetDeviceInfo(&di))) return false;
-        g = di.guidInstance;
-    } else {
-        DIDEVICEINSTANCEA di{}; di.dwSize = sizeof(di);
-        if (FAILED(d->GetDeviceInfo(&di))) return false;
-        g = di.guidInstance;
-    }
-    return true;
-}
 struct EffectTap {
     static void** vtbl;
     static void*  orig;
@@ -526,6 +515,59 @@ struct EffectTap {
         }
         return ((PFN_SetParams)orig)(self, peff, flags);
     }
+    // vt = vtable of any effect created on RBR's device (RBR's own effects share the class)
+    static bool Patch(void** vt) {
+        if (vtbl == vt) return true;
+        if (vtbl) return false;
+        DWORD old;
+        if (!VirtualProtect(&vt[VT_FX_SETPARAMETERS], sizeof(void*), PAGE_READWRITE, &old)) return false;
+        orig = vt[VT_FX_SETPARAMETERS];
+        vt[VT_FX_SETPARAMETERS] = (void*)&HSetParameters;
+        VirtualProtect(&vt[VT_FX_SETPARAMETERS], sizeof(void*), old, &old);
+        vtbl = vt;
+        Logf("Effect hook installed");
+        return true;
+    }
+    static bool Unpatch() {
+        g_boostMul = 1.0f; g_boostAdd = 0.0f;
+        if (!vtbl) return true;
+        bool clean = vtbl[VT_FX_SETPARAMETERS] == (void*)&HSetParameters;
+        if (clean) {
+            DWORD old;
+            if (orig && VirtualProtect(&vtbl[VT_FX_SETPARAMETERS], sizeof(void*), PAGE_READWRITE, &old)) {
+                vtbl[VT_FX_SETPARAMETERS] = orig;
+                VirtualProtect(&vtbl[VT_FX_SETPARAMETERS], sizeof(void*), old, &old);
+            }
+            vtbl = nullptr;
+        }
+        return clean;
+    }
+};
+void** EffectTap::vtbl = nullptr;
+void*  EffectTap::orig = nullptr;
+
+// -------------------------------------------------- tap on RBR's own device
+// IDirectInputDevice8 vtable slots
+enum { VT_ACQUIRE = 7, VT_UNACQUIRE = 8, VT_GETDEVICESTATE = 9, VT_GETDEVICEDATA = 10, VT_POLL = 25 };
+
+typedef HRESULT (WINAPI *PFN_Acquire)(IDirectInputDevice8A*);
+typedef HRESULT (WINAPI *PFN_GetState)(IDirectInputDevice8A*, DWORD, LPVOID);
+typedef HRESULT (WINAPI *PFN_GetData)(IDirectInputDevice8A*, DWORD, LPDIDEVICEOBJECTDATA, LPDWORD, DWORD);
+typedef HRESULT (WINAPI *PFN_Poll)(IDirectInputDevice8A*);
+
+bool GetInstanceGuid(IDirectInputDevice8A* d, bool wide, GUID& g) {
+    if (wide) {
+        DIDEVICEINSTANCEW di{}; di.dwSize = sizeof(di);
+        if (FAILED(reinterpret_cast<IDirectInputDevice8W*>(d)->GetDeviceInfo(&di))) return false;
+        g = di.guidInstance;
+    } else {
+        DIDEVICEINSTANCEA di{}; di.dwSize = sizeof(di);
+        if (FAILED(d->GetDeviceInfo(&di))) return false;
+        g = di.guidInstance;
+    }
+    return true;
+}
+
 class GameDeviceTap {
 public:
     static GameDeviceTap& I() { static GameDeviceTap t; return t; }
@@ -701,48 +743,6 @@ void GameDeviceTap::Remove() {
     }
     m_installed = false;
 }
-
-// ------------------------------------------------ landing boost on RBR's own force
-// RBR drives the wheel with its own DirectInput constant-force effect. Instead of adding effects on top of it, a detected
-// landing scales that force on its way to the wheel: every SetParameters call RBR makes on a constant-force effect is
-// multiplied by g_boostMul, plus a minimum extra push (g_boostAdd, share of full torque) in the direction RBR is already
-// pushing. Our own effects are periodic, so they never pass through this path.
-std::atomic<float> g_boostMul{1.0f}, g_boostAdd{0.0f};
-std::atomic<int>   g_rbrSeen{0}, g_rbrRaw{0}, g_rbrOut{0};      // diagnostics: RBR constant-force updates seen, last in / out
-typedef HRESULT (WINAPI *PFN_SetParams)(IDirectInputEffect*, LPCDIEFFECT, DWORD);
-enum { VT_FX_SETPARAMETERS = 6 };
-
-
-    // vt = vtable of any effect created on RBR's device (RBR's own effects share the class)
-    static bool Patch(void** vt) {
-        if (vtbl == vt) return true;
-        if (vtbl) return false;
-        DWORD old;
-        if (!VirtualProtect(&vt[VT_FX_SETPARAMETERS], sizeof(void*), PAGE_READWRITE, &old)) return false;
-        orig = vt[VT_FX_SETPARAMETERS];
-        vt[VT_FX_SETPARAMETERS] = (void*)&HSetParameters;
-        VirtualProtect(&vt[VT_FX_SETPARAMETERS], sizeof(void*), old, &old);
-        vtbl = vt;
-        Logf("Effect hook installed");
-        return true;
-    }
-    static bool Unpatch() {
-        g_boostMul = 1.0f; g_boostAdd = 0.0f;
-        if (!vtbl) return true;
-        bool clean = vtbl[VT_FX_SETPARAMETERS] == (void*)&HSetParameters;
-        if (clean) {
-            DWORD old;
-            if (orig && VirtualProtect(&vtbl[VT_FX_SETPARAMETERS], sizeof(void*), PAGE_READWRITE, &old)) {
-                vtbl[VT_FX_SETPARAMETERS] = orig;
-                VirtualProtect(&vtbl[VT_FX_SETPARAMETERS], sizeof(void*), old, &old);
-            }
-            vtbl = nullptr;
-        }
-        return clean;
-    }
-};
-void** EffectTap::vtbl = nullptr;
-void*  EffectTap::orig = nullptr;
 
 // ----------------------------------------------------------- effect layer
 BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
