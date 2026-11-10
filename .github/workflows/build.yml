@@ -1,16 +1,15 @@
-name: Build and Release ForceFX
+name: Build RBR_ForceFX Plugin
 
 on:
   push:
-    tags:
-      - 'v*'       # Triggered automatically when you push a tag like v1.0.0
-  workflow_dispatch: # Allows manual triggering from the GitHub Actions tab if needed
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
-  build-and-release:
+  build:
     runs-on: windows-latest
-    permissions:
-      contents: write # Required to create a GitHub Release and upload assets
 
     steps:
       - name: Checkout Repository
@@ -25,26 +24,8 @@ jobs:
         run: |
           cl /O2 /MT /EHsc /LD RBR_ForceFX.cpp /link /DEF:RBR_ForceFX.def dinput8.lib dxguid.lib user32.lib ws2_32.lib /OUT:RBR_ForceFX.dll
 
-      - name: Prepare Release Package
-        run: |
-          # Create a staging folder for the distribution package
-          mkdir release_stage
-          copy RBR_ForceFX.dll release_stage\
-          copy ForceFX.ini release_stage\
-          copy ForceFXCars.ini release_stage\
-          
-          # Compress the folder contents into a zip archive
-          Compress-Archive -Path release_stage\* -DestinationPath ForceFX_Plugin.zip
-
-      - name: Upload Artifact (Backup)
+      - name: Upload Compiled DLL Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ForceFX-Package
-          path: ForceFX_Plugin.zip
-
-      - name: Create GitHub Release and Upload Zip
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: ForceFX_Plugin.zip
-          generate_release_notes: true
+          name: RBR_ForceFX
+          path: RBR_ForceFX.dll
