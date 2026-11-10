@@ -26,25 +26,30 @@ jobs:
           cl /O2 /MT /EHsc /LD RBR_ForceFX.cpp /link /DEF:RBR_ForceFX.def dinput8.lib dxguid.lib user32.lib ws2_32.lib /OUT:RBR_ForceFX.dll
 
       - name: Prepare Release Package
+        shell: pwsh
         run: |
+          # Extract version from GitHub ref (e.g., refs/tags/v0.2.0 -> v0.2.0)
+          $tag = $env:GITHUB_REF_NAME
+          if (-not $tag) { $tag = "v0.0.0-dev" }
+          
+          $zipName = "ForceFX-$tag.zip"
+          Write-Host "Creating archive: $zipName"
+
           # Create a staging folder for the distribution package
           mkdir release_stage
           copy RBR_ForceFX.dll release_stage\
           copy ForceFX.ini release_stage\
           copy ForceFXCars.ini release_stage\
           
-          # Compress the folder contents into a zip archive
-          Compress-Archive -Path release_stage\* -DestinationPath ForceFX_Plugin.zip
-
-      - name: Upload Artifact (Backup)
-        uses: actions/upload-artifact@v4
-        with:
-          name: ForceFX-Package
-          path: ForceFX_Plugin.zip
+          # Compress contents into a dynamically named zip archive
+          Compress-Archive -Path release_stage\* -DestinationPath $zipName
+          
+          # Save the filename as an environment variable for the release step
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
 
       - name: Create GitHub Release and Upload Zip
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: ForceFX_Plugin.zip
+          files: ${{ env.ZIP_NAME }}
           generate_release_notes: true
