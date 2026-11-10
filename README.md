@@ -1,6 +1,6 @@
 # RBR_ForceFX
 
-RBR_ForceFX is a community-developed force feedback enhancement plugin for Richard Burns Rally (RBR) using NGP telemetry. It adds extra vibration and impact detail on top of RBR's native steering force, making the wheel feel more alive without replacing the base sim's steering model.
+RBR_ForceFX is a community-developed force feedback enhancement plugin for Richard Burns Rally (RBR) using NGP telemetry. It adds extra vibration and impact detail on top of RBR's native steering force.
 
 It is designed to improve the feedback from:
 
@@ -12,7 +12,7 @@ It is designed to improve the feedback from:
 
 ## Why use it?
 
-RBR already does a great job with steering force, but many sim racers want a richer sense of the car, the road, and the suspension. RBR_ForceFX adds layered effects that react to telemetry such as wheel load, tyre roughness, engine speed, suspension travel, and car identity.
+RBR already does a great job with steering force, but many sim racers want a richer sense of the car, the road, and the suspension. RBR_ForceFX adds layered effects that react to telemetry such as wheel speed, engine RPM, braking, suspension movement, and tyre load.
 
 The result is a more detailed and immersive wheel experience, with a focus on road feel, weight transfer, and more convincing landing impacts.
 
@@ -29,18 +29,18 @@ The result is a more detailed and immersive wheel experience, with a focus on ro
 
 ## Requirements
 
-- Richard Burns Rally
-- NGP7 telemetry enabled and outputting data to the plugin
-- A DirectInput-compatible force feedback wheel
 - Windows
+- The latest RallySimFans (RSF) version of Richard Burns Rally, with NGP7
+- A DirectInput-compatible force feedback wheel
+- NGP7 UDP telemetry enabled and configured to send data to RBR_ForceFX
 
 ## Installation
 
-1. Place the plugin files in the RBR plugins directory or the appropriate install location used by your RBR setup.
-2. Ensure the telemetry port configured in NGP matches the plugin's UDP port (`ForceFX.ini`).
-3. Launch RBR and open the plugin settings from:
-   - RBR main menu > Plugins > ForceFX
-4. Select your wheel and adjust settings as needed.
+1. Install and launch the latest RallySimFans (RSF) version of RBR. NGP7 is provided as part of the RSF installation; a standard RBR installation without NGP7 is not supported.
+2. Copy `RBR_ForceFX.dll`, `ForceFX.ini`, and `ForceFXCars.ini` into your RBR `Plugins` directory (or the corresponding plugin location used by your RSF installation).
+3. Enable NGP UDP telemetry in the RSF Launcher. Open its NGP/Telemetry settings, turn on UDP telemetry, and set the telemetry destination to `127.0.0.1` (this PC) and port `6778`. Save/apply the settings. Launcher labels can vary between RSF versions; make sure UDP telemetry output is enabled, not just another telemetry feature.
+4. Open `ForceFX.ini` and check `UdpPort=6778`. The port must match the port configured for NGP telemetry. If you change it in one place, use the same port in the other.
+5. Launch RBR and open the plugin settings from **RBR main menu > Plugins > ForceFX**. Select your wheel and adjust the settings as needed.
 
 The repository includes:
 
@@ -57,7 +57,7 @@ The main setup file is `ForceFX.ini`. It controls:
 - frequency ranges
 - landing sensitivity
 - live tuning level and hotkeys
-- telemetry offsets and connection settings
+- telemetry offsets and connection settings, including the UDP port
 
 The car-specific setup is in `ForceFXCars.ini`, which allows tuning by vehicle type and name.
 
@@ -73,7 +73,7 @@ The exact hotkeys and settings can be adjusted in `ForceFX.ini`.
 
 ## Safety and design notes
 
-This plugin enhances RBR's existing force feedback; it does not replace or override the simulator's steering force. All added effects are zero-mean vibrations layered on top of the wheel's normal steering output.
+This plugin enhances RBR's existing force feedback; it does not replace or override the simulator's steering force. Added effects are zero-mean vibrations layered on top of the wheel's normal steering force, except for the landing boost, which briefly scales RBR's own steering force.
 
 The plugin includes safety protections such as:
 
@@ -84,7 +84,7 @@ The plugin includes safety protections such as:
 
 ## Important note
 
-This project is intended for enthusiasts and advanced users. It relies on telemetry and uses aggressive vibration shaping, so calibration is often personal and may require tuning depending on wheel hardware, seating, and preference.
+This project is intended for enthusiasts and advanced users. It relies on telemetry and uses aggressive vibration shaping, so calibration is personal and may require tuning depending on the wheel and hardware.
 
 ## License and support
 
@@ -93,4 +93,3 @@ This project is provided as-is for the community. Please use it responsibly and 
 ## Project status
 
 RBR_ForceFX is a feature-rich plugin designed for players who want a stronger and more detailed sense of road, engine, suspension, and impact events in Richard Burns Rally.
-
