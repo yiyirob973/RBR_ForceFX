@@ -2,10 +2,8 @@ name: Build and release ForceFX
 
 on:
   push:
-    branches:
-      - 'noudp'    # builds the telemetry-hook branch and attaches the zip to the run (no release)
     tags:
-      - 'v*'       # runs when you push a tag like v1.0.0 (builds and creates a release)
+      - 'v*'       # runs when you push a tag like v1.0.0
   workflow_dispatch: # lets you run it by hand from the Actions tab
 
 jobs:
@@ -30,7 +28,7 @@ jobs:
       - name: Prepare Release Package
         shell: pwsh
         run: |
-          # Use the tag or branch name (for example v0.2.0 or noudp) in the zip's file name
+          # Use the tag name (for example v0.2.0) in the zip's file name
           $tag = $env:GITHUB_REF_NAME
           if (-not $tag) { $tag = "v0.0.0-dev" }
           
@@ -48,13 +46,6 @@ jobs:
           
           # Pass the zip's name on to the release step
           echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
-
-      - name: Upload build as a workflow artifact
-        uses: actions/upload-artifact@v4
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        with:
-          name: ForceFX-${{ github.ref_name }}
-          path: ${{ env.ZIP_NAME }}
 
       - name: Create GitHub Release and Upload Zip
         uses: softprops/action-gh-release@v2
