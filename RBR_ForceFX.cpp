@@ -1,6 +1,6 @@
 // RBR_ForceFX.cpp
 //
-// Extra force feedback for Richard Burns Rally (RSF with NGP7). It reads NGP's UDP telemetry and adds engine,
+// Extra force feedback for Richard Burns Rally (RSF with NGP7). It reads NGP's telemetry and adds engine,
 // road and braking vibration on top of RBR's own steering force. When the car lands from a jump or takes a hard
 // hit, it also makes RBR's own force pull harder for a moment.
 //
@@ -32,8 +32,11 @@
 // Building (RBR is 32-bit, so build x86 with the static runtime):
 //   cl /std:c++17 /EHsc /LD /MT /O2 RBR_ForceFX.cpp /Fe:RBR_ForceFX.dll /link /DEF:RBR_ForceFX.def
 //
-// Telemetry: NGP needs udpTelemetry=1 and an endpoint for this plugin's port, for example
-//   udpTelemetryEndpoints=127.0.0.1:6776,127.0.0.1:6777,127.0.0.1:6778
+// Telemetry: NGP needs UDP telemetry switched on, but the destination doesn't matter. ForceFX picks the packets up as
+//   NGP sends them, by watching the Winsock send calls inside the RBR process (see PacketTap), so it needs no UDP port
+//   of its own and won't fight SimHub or anything else for one. As a backup it also listens on UdpPort, so a setup where
+//   the hook can't see NGP's packets still works if NGP is pointed at that port, for example
+//   udpTelemetryEndpoints=127.0.0.1:6776,127.0.0.1:6778. TelemetrySource in ForceFX.ini chooses hook, UDP, or both (default).
 //   The packet layout is NGP 7.4.778's TelemetryData (664 bytes). Offsets are configurable in ForceFX.ini.
 //
 // Live level while driving: Numpad + and - change the overall level in equal-loudness steps (x or / 0.85) and
@@ -41,7 +44,8 @@
 //   down from the configured ceilings, never above them. Keys and an optional modifier are set in ForceFX.ini.
 //
 // Safety: hard compile-time ceilings (kHardTotalMax and friends), a frequency floor, a slow thermal derate,
-//   loopback-only UDP, a fade to zero on shutdown, and an exception guard around the worker thread.
+//   loopback-only telemetry (the send hook ignores anything that isn't a loopback UDP packet), a fade to zero on
+//   shutdown, and an exception guard around the worker thread.
 //
 // Car profiles: the car is identified by its name (rallysimfans.ini slot -> Cars\Cars.ini CarName / RSFCarID)
 //   and matched loosely against the Name= entries in ForceFXCars.ini. Each profile sets the engine character
@@ -61,6 +65,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <tlhelp32.h>
 #include <dinput.h>
 #include <cmath>
 #include <cstdio>
@@ -118,6 +123,12 @@ std::string pluginDirectory() {
     return slash == std::string::npos ? std::string(".\\") : p.substr(0, slash + 1);
 }
 
+// Keeps our DLL loaded for the rest of the process. Used when another hook was chained after ours and we can't unhook cleanly.
+void PinThisDll() {
+    HMODULE h = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCSTR)&pluginDirectory, &h);
+}
+
 void Logf(const char* fmt, ...) {
     char b[512];
     va_list ap; va_start(ap, fmt);
@@ -132,7 +143,8 @@ struct Config {
     // These defaults match the shipped ForceFX.ini, so "Reset" in the menu gives you a fresh-install setup.
 
     // telemetry connection
-    int   udpPort = 6778;            // SimHub usually listens on 6776 and RbrSurfaceAudio on 6777: never share a port
+    int   telemetrySource = 0;       // 0 = auto (NGP's send hook, UDP port as backup), 1 = send hook only, 2 = UDP port only
+    int   udpPort = 6778;            // backup listening port (0 = never open one). SimHub usually uses 6776 and RbrSurfaceAudio 6777: never share a port
     int   minPacket = 664;
     int   cylinders = 4;             // engine pulses per rev = cylinders / 2
 
@@ -205,6 +217,9 @@ struct Config {
 
 // Pulls every setting back into its safe range. Runs after the ini is read and after every menu edit.
 void ClampConfig(Config& c) {
+    c.telemetrySource = std::max(0, std::min(c.telemetrySource, 2));
+    c.udpPort = std::max(0, std::min(c.udpPort, 65535));
+    c.minPacket = std::max(64, std::min(c.minPacket, 1024));
     c.cylinders = std::max(1, std::min(c.cylinders, 16));
     c.engineMaxMag = std::max(0, std::min(c.engineMaxMag, 10000));
     c.roadMaxMag = std::max(0, std::min(c.roadMaxMag, 10000));
@@ -252,7 +267,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
         if (write) { snprintf(b, sizeof(b), "%d", v); WritePrivateProfileStringA(S, k, b, path.c_str()); }
         else { GetPrivateProfileStringA(S, k, "", b, sizeof(b), path.c_str()); if (b[0]) v = atoi(b); }
     };
-    I("UdpPort", c.udpPort);  I("MinPacketBytes", c.minPacket);  I("Cylinders", c.cylinders);
+    I("TelemetrySource", c.telemetrySource);  I("UdpPort", c.udpPort);  I("MinPacketBytes", c.minPacket);  I("Cylinders", c.cylinders);
     I("EngineMaxMagnitude", c.engineMaxMag); I("RoadMaxMagnitude", c.roadMaxMag);
     I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
     F("ImpactGain", c.impactGain);
@@ -752,12 +767,342 @@ void GameDeviceTap::Remove() {
     clean = EffectTap::Unpatch() && clean;
     if (!clean) {
         // Someone chained their hook after ours. Unloading now would leave them pointing into freed code, so pin the DLL.
-        HMODULE h = nullptr;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCSTR)&pluginDirectory, &h);
+        PinThisDll();
         Logf("Another hook was chained after ours, so the DLL stays pinned in memory");
     }
     m_installed = false;
 }
+
+// ------------------------------------------------ telemetry tap on NGP's UDP send
+// NGP runs inside the RBR process and sends its telemetry packet from the game loop. Rather than opening a UDP port to
+// receive that packet, we watch the send: sendto, send, WSASendTo and WSASend are redirected through small hooks that copy
+// any loopback UDP packet of telemetry size into a queue and then let the call carry on untouched. NGP only needs UDP
+// telemetry switched on. Where it sends the packet no longer matters.
+//
+// Each function is hooked one of two ways:
+//   hot patch  ws2_32's 32-bit exports normally start with a 2-byte "mov edi, edi" and have 5 spare bytes in front of them.
+//              We write a jump into the spare bytes and turn the 2 bytes into a short jump back to it. That catches every
+//              caller, however it found the function. It's only used after checking the bytes really look like that.
+//   IAT        otherwise every loaded module's import table is searched for the function's address and patched. The
+//              search repeats now and then, so a module loaded later is picked up too.
+//
+// NGP sends one copy of the packet per configured endpoint. We lock on to the first destination we see and ignore the rest.
+namespace PacketTap {
+
+constexpr int kMaxPkt = 1024;     // NGP's packet is 664 bytes; anything bigger is not telemetry we know about
+constexpr int kRing = 32;
+
+struct Slot { int len; Clock::time_point ts; uint8_t d[kMaxPkt]; };
+
+Slot g_ring[kRing];
+std::atomic<uint32_t> g_head{0}, g_tail{0};
+std::atomic<bool>     g_spin{false};          // only matters if NGP ever sends from more than one thread
+std::atomic<bool>     g_consume{false};       // true while the worker thread wants packets
+std::atomic<int>      g_minLen{664};
+std::atomic<unsigned long long> g_destKey{0};
+std::atomic<DWORD>    g_destSeen{0};
+std::atomic<long long> g_calls{0}, g_taken{0}, g_otherDest{0}, g_dropped{0};
+HANDLE g_event = nullptr;                     // set whenever a packet is queued
+bool   g_installed = false;
+thread_local bool t_busy = false;             // stops a hooked call that ends up in another hooked call from being counted twice
+
+struct Busy {
+    bool was;
+    Busy() : was(t_busy) { t_busy = true; }
+    ~Busy() { t_busy = was; }
+};
+
+// ---- queue
+void Offer(const uint8_t* data, int len, uint32_t ipNet, uint16_t portNet) {
+    g_calls++;
+    if ((ipNet & 0xFF) != 127) return;                                  // loopback only (the first octet is the low byte)
+    const unsigned long long key = ((unsigned long long)ipNet << 16) | portNet;
+    const DWORD nowMs = GetTickCount();
+    unsigned long long locked = g_destKey.load();
+    if (locked == 0 || (locked != key && nowMs - g_destSeen.load() > 5000)) {   // first destination, or the old one went quiet
+        g_destKey.store(key);
+        locked = key;
+    }
+    if (locked != key) { g_otherDest++; return; }
+    g_destSeen.store(nowMs);
+    if (!g_consume.load()) return;
+
+    while (g_spin.exchange(true, std::memory_order_acquire)) {}
+    const uint32_t h = g_head.load(std::memory_order_relaxed), t = g_tail.load(std::memory_order_acquire);
+    if (h - t >= (uint32_t)kRing) {
+        g_dropped++;
+    } else {
+        Slot& sl = g_ring[h % kRing];
+        sl.len = len;
+        sl.ts = Clock::now();
+        std::memcpy(sl.d, data, (size_t)len);
+        g_head.store(h + 1, std::memory_order_release);
+        g_taken++;
+    }
+    g_spin.store(false, std::memory_order_release);
+    if (g_event) SetEvent(g_event);
+}
+
+bool Pop(Slot& out) {
+    const uint32_t t = g_tail.load(std::memory_order_relaxed);
+    if (t == g_head.load(std::memory_order_acquire)) return false;
+    out = g_ring[t % kRing];
+    g_tail.store(t + 1, std::memory_order_release);
+    return true;
+}
+
+void Activate()   { g_tail.store(g_head.load()); g_consume.store(true); }    // starts with an empty queue
+void Deactivate() { g_consume.store(false); }
+
+// ---- the hooks
+typedef int (WSAAPI *PFN_sendto)(SOCKET, const char*, int, int, const sockaddr*, int);
+typedef int (WSAAPI *PFN_send)(SOCKET, const char*, int, int);
+typedef int (WSAAPI *PFN_WSASendTo)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const sockaddr*, int, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+typedef int (WSAAPI *PFN_WSASend)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+
+void* r_sendto = nullptr; void* r_send = nullptr; void* r_WSASendTo = nullptr; void* r_WSASend = nullptr;   // the real functions
+
+bool WantLen(int len) { return len >= g_minLen.load(std::memory_order_relaxed) && len <= kMaxPkt; }
+
+// The destination of a connected UDP socket (for send / WSASend).
+bool PeerOf(SOCKET s, uint32_t& ip, uint16_t& port) {
+    int type = 0, tl = sizeof(type);
+    if (getsockopt(s, SOL_SOCKET, SO_TYPE, (char*)&type, &tl) != 0 || type != SOCK_DGRAM) return false;
+    sockaddr_in a{}; int al = sizeof(a);
+    if (getpeername(s, (sockaddr*)&a, &al) != 0 || a.sin_family != AF_INET) return false;
+    ip = a.sin_addr.s_addr; port = a.sin_port;
+    return true;
+}
+
+// Joins a WSABUF list into one contiguous block (almost always it is a single buffer already).
+const uint8_t* Flatten(LPWSABUF b, DWORD cnt, uint8_t* tmp, int& len) {
+    len = 0;
+    if (!b || cnt == 0) return nullptr;
+    if (cnt == 1) { len = (int)b[0].len; return (const uint8_t*)b[0].buf; }
+    long long total = 0;
+    for (DWORD i = 0; i < cnt; ++i) total += b[i].len;
+    if (total > kMaxPkt) { len = (int)total; return nullptr; }
+    for (DWORD i = 0; i < cnt; ++i) { std::memcpy(tmp + len, b[i].buf, b[i].len); len += (int)b[i].len; }
+    return tmp;
+}
+
+int WSAAPI H_sendto(SOCKET s, const char* buf, int len, int flags, const sockaddr* to, int tolen) {
+    if (!t_busy) {
+        Busy guard;
+        if (buf && to && WantLen(len) && tolen >= (int)sizeof(sockaddr_in) && to->sa_family == AF_INET) {
+            const sockaddr_in* a = (const sockaddr_in*)to;
+            Offer((const uint8_t*)buf, len, a->sin_addr.s_addr, a->sin_port);
+        }
+        return ((PFN_sendto)r_sendto)(s, buf, len, flags, to, tolen);
+    }
+    return ((PFN_sendto)r_sendto)(s, buf, len, flags, to, tolen);
+}
+
+int WSAAPI H_send(SOCKET s, const char* buf, int len, int flags) {
+    if (!t_busy) {
+        Busy guard;
+        uint32_t ip; uint16_t port;
+        if (buf && WantLen(len) && PeerOf(s, ip, port)) Offer((const uint8_t*)buf, len, ip, port);
+        return ((PFN_send)r_send)(s, buf, len, flags);
+    }
+    return ((PFN_send)r_send)(s, buf, len, flags);
+}
+
+int WSAAPI H_WSASendTo(SOCKET s, LPWSABUF bufs, DWORD cnt, LPDWORD sent, DWORD flags, const sockaddr* to, int tolen,
+                       LPWSAOVERLAPPED ov, LPWSAOVERLAPPED_COMPLETION_ROUTINE cr) {
+    if (!t_busy) {
+        Busy guard;
+        uint8_t tmp[kMaxPkt]; int len;
+        const uint8_t* p = Flatten(bufs, cnt, tmp, len);
+        if (p && WantLen(len) && to && tolen >= (int)sizeof(sockaddr_in) && to->sa_family == AF_INET) {
+            const sockaddr_in* a = (const sockaddr_in*)to;
+            Offer(p, len, a->sin_addr.s_addr, a->sin_port);
+        }
+        return ((PFN_WSASendTo)r_WSASendTo)(s, bufs, cnt, sent, flags, to, tolen, ov, cr);
+    }
+    return ((PFN_WSASendTo)r_WSASendTo)(s, bufs, cnt, sent, flags, to, tolen, ov, cr);
+}
+
+int WSAAPI H_WSASend(SOCKET s, LPWSABUF bufs, DWORD cnt, LPDWORD sent, DWORD flags, LPWSAOVERLAPPED ov,
+                     LPWSAOVERLAPPED_COMPLETION_ROUTINE cr) {
+    if (!t_busy) {
+        Busy guard;
+        uint8_t tmp[kMaxPkt]; int len; uint32_t ip; uint16_t port;
+        const uint8_t* p = Flatten(bufs, cnt, tmp, len);
+        if (p && WantLen(len) && PeerOf(s, ip, port)) Offer(p, len, ip, port);
+        return ((PFN_WSASend)r_WSASend)(s, bufs, cnt, sent, flags, ov, cr);
+    }
+    return ((PFN_WSASend)r_WSASend)(s, bufs, cnt, sent, flags, ov, cr);
+}
+
+// ---- installing the hooks
+struct Target {
+    const char* name;
+    void*  hook;
+    void** real;
+    void*  addr;          // the function in ws2_32 (null if the export wasn't found)
+    int    mode;          // 0 = not hooked, 1 = hot patch, 2 = import tables
+    BYTE   saved[7];      // the 7 bytes a hot patch replaced
+};
+Target g_t[4] = {
+    {"sendto",    (void*)&H_sendto,    &r_sendto,    nullptr, 0, {0}},
+    {"send",      (void*)&H_send,      &r_send,      nullptr, 0, {0}},
+    {"WSASendTo", (void*)&H_WSASendTo, &r_WSASendTo, nullptr, 0, {0}},
+    {"WSASend",   (void*)&H_WSASend,   &r_WSASend,   nullptr, 0, {0}},
+};
+
+struct IatRecord { void** slot; void* orig; void* hook; };
+std::vector<IatRecord> g_iat;
+std::mutex g_mtx;
+HMODULE g_self = nullptr;
+
+bool TryHotPatch(Target& t) {
+    BYTE* f = (BYTE*)t.addr;
+    if (((uintptr_t)f & 1) != 0 || f[0] != 0x8B || f[1] != 0xFF) return false;              // not "mov edi, edi"
+    for (int i = 1; i <= 5; ++i) if (f[-i] != 0xCC && f[-i] != 0x90) return false;          // no spare bytes in front
+    DWORD old;
+    if (!VirtualProtect(f - 5, 7, PAGE_EXECUTE_READWRITE, &old)) return false;
+    std::memcpy(t.saved, f - 5, 7);
+    *t.real = f + 2;                                           // the real function continues after the 2-byte nop
+    BYTE jmp[5]; jmp[0] = 0xE9;
+    const int32_t rel = (int32_t)((BYTE*)t.hook - f);          // from the end of the jump (f - 5 + 5) to the hook
+    std::memcpy(jmp + 1, &rel, 4);
+    std::memcpy(f - 5, jmp, 5);
+    InterlockedExchange16((SHORT volatile*)f, (SHORT)0xF9EB);  // bytes EB F9: jmp short back 7, onto the jump above
+    FlushInstructionCache(GetCurrentProcess(), f - 5, 7);
+    VirtualProtect(f - 5, 7, old, &old);
+    t.mode = 1;
+    return true;
+}
+
+bool UnpatchHot(Target& t) {
+    BYTE* f = (BYTE*)t.addr;
+    BYTE jmp[5]; jmp[0] = 0xE9;
+    const int32_t rel = (int32_t)((BYTE*)t.hook - f);
+    std::memcpy(jmp + 1, &rel, 4);
+    if (f[0] != 0xEB || f[1] != 0xF9 || std::memcmp(f - 5, jmp, 5) != 0) return false;   // someone changed it after us
+    DWORD old;
+    if (!VirtualProtect(f - 5, 7, PAGE_EXECUTE_READWRITE, &old)) return false;
+    InterlockedExchange16((SHORT volatile*)f, (SHORT)(t.saved[5] | (t.saved[6] << 8)));       // the original "mov edi, edi"
+    std::memcpy(f - 5, t.saved, 5);
+    FlushInstructionCache(GetCurrentProcess(), f - 5, 7);
+    VirtualProtect(f - 5, 7, old, &old);
+    t.mode = 0;
+    return true;
+}
+
+void RecordIat(void** slot, void* orig, void* hook) { g_iat.push_back(IatRecord{slot, orig, hook}); }
+
+// Looks through one module's import table for the addresses of the functions we hook (by value, so it doesn't matter
+// whether the module imported them by name, by ordinal, or through wsock32's forwarders). Plain C only: it runs under SEH.
+void ScanModuleRaw(HMODULE m) {
+    BYTE* base = (BYTE*)m;
+    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    const IMAGE_DATA_DIRECTORY& dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dd.VirtualAddress) return;
+    const IMAGE_IMPORT_DESCRIPTOR* d = (const IMAGE_IMPORT_DESCRIPTOR*)(base + dd.VirtualAddress);
+    for (; d->Name; ++d) {
+        void** slot = (void**)(base + d->FirstThunk);
+        for (; *slot; ++slot) {
+            for (int i = 0; i < 4; ++i) {
+                if (g_t[i].mode == 1 || !g_t[i].addr || *slot != g_t[i].addr) continue;
+                DWORD old;
+                if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) continue;
+                *slot = g_t[i].hook;
+                VirtualProtect(slot, sizeof(void*), old, &old);
+                RecordIat(slot, g_t[i].addr, g_t[i].hook);
+                g_t[i].mode = 2;
+            }
+        }
+    }
+}
+
+void ScanModule(HMODULE m) {
+    if (m == g_self) return;
+    __try { ScanModuleRaw(m); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+void ScanAllModules() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32 me{}; me.dwSize = sizeof(me);
+    if (Module32First(snap, &me)) do { ScanModule(me.hModule); } while (Module32Next(snap, &me));
+    CloseHandle(snap);
+}
+
+bool Install(int minLen) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (g_installed) return true;
+    g_minLen.store(minLen);
+    if (!g_event) g_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&pluginDirectory, &g_self);
+    HMODULE ws = GetModuleHandleA("ws2_32.dll");
+    if (!ws) ws = LoadLibraryA("ws2_32.dll");
+    if (!ws || !g_event) return false;
+    for (Target& t : g_t) {
+        t.addr = (void*)GetProcAddress(ws, t.name);
+        if (!t.addr) continue;
+        *t.real = t.addr;
+        TryHotPatch(t);
+    }
+    bool anyIat = false;
+    for (const Target& t : g_t) if (t.addr && t.mode == 0) anyIat = true;
+    if (anyIat) ScanAllModules();
+    int n = 0;
+    for (const Target& t : g_t) if (t.mode) ++n;
+    g_installed = n > 0;
+    return g_installed;
+}
+
+// Called now and then by the worker thread: picks up modules that were loaded after the first search.
+void Rescan() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (!g_installed) return;
+    bool anyIat = false;
+    for (const Target& t : g_t) if (t.addr && t.mode != 1) anyIat = true;
+    if (anyIat) ScanAllModules();
+}
+
+bool Installed() { return g_installed; }
+
+std::string Describe() {
+    std::string out;
+    for (const Target& t : g_t) {
+        if (!out.empty()) out += "  ";
+        out += t.name;
+        out += t.mode == 1 ? ":hot-patch" : t.mode == 2 ? ":import" : ":-";
+    }
+    return out;
+}
+
+bool RestoreSlot(const IatRecord& r) {      // plain C only: it runs under SEH
+    __try {
+        if (*r.slot != r.hook) return false;                    // someone patched it again after us
+        DWORD old;
+        if (!VirtualProtect(r.slot, sizeof(void*), PAGE_READWRITE, &old)) return false;
+        *r.slot = r.orig;
+        VirtualProtect(r.slot, sizeof(void*), old, &old);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Puts everything back. Returns false if something else changed our patches in the meantime.
+bool Remove() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_consume.store(false);
+    if (!g_installed) return true;
+    bool clean = true;
+    for (Target& t : g_t) if (t.mode == 1 && !UnpatchHot(t)) clean = false;
+    for (const IatRecord& r : g_iat) if (!RestoreSlot(r)) clean = false;
+    g_iat.clear();
+    g_installed = false;
+    return clean;
+}
+
+}  // namespace PacketTap
 
 // ----------------------------------------------------------- effect layer
 BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
@@ -1294,6 +1639,7 @@ private:
     std::atomic<bool> m_test{false};
     std::atomic<int>  m_testPhase{0};
     std::atomic<long long> m_packets{0};
+    std::atomic<int>       m_source{0};      // where the latest packet came from: 0 none yet, 1 NGP send hook, 2 UDP port
     std::atomic<float> m_mag[S_COUNT], m_hz[S_COUNT];
     std::atomic<float> m_dRpm{0}, m_dSpeed{0}, m_dThr{0}, m_dBrk{0}, m_dTex{0}, m_dRough{0}, m_dBump{0},
                        m_dDive{0}, m_dLock{0};
@@ -1364,6 +1710,7 @@ private:
         GameDeviceTap::I().Arm(dev.guid);
         m_connectedIdx = m_sel;
         m_packets = 0;
+        m_source = 0;
         m_pktLen = 0;
         m_run = true;
         m_thread = std::thread(&ForceFXPlugin::Loop, this);
@@ -1461,27 +1808,39 @@ private:
         Config base;                           // this thread's own copy of m_cfg, because the menu edits m_cfg on the UI thread
         { std::lock_guard<std::mutex> lk(m_mtx); base = m_cfg; }
         int seenRev = m_cfgRev.load();
+        // Telemetry comes from NGP's send call (the hook in PacketTap), from our own UDP port, or from both. The hook wins
+        // whenever it is delivering, so a setup that happens to feed both never counts a packet twice.
+        const bool useTap = base.telemetrySource != 2 && PacketTap::Installed();
+        const bool useUdp = base.telemetrySource != 1 && base.udpPort > 0;
         WSADATA wsa;
         bool wsaOk = WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
         SOCKET sock = INVALID_SOCKET;
-        if (wsaOk) {
+        WSAEVENT sockEvent = WSA_INVALID_EVENT;
+        if (wsaOk && useUdp) {
             sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             if (sock != INVALID_SOCKET) {
                 sockaddr_in a{};
                 a.sin_family = AF_INET;
                 a.sin_port = htons((u_short)base.udpPort);
                 a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // telemetry is local only
-                if (bind(sock, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
-                    Logf("Couldn't bind UDP port %d (WSA error %d). Is another app using that port?", base.udpPort, WSAGetLastError());
+                sockEvent = WSACreateEvent();
+                if (bind(sock, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR || sockEvent == WSA_INVALID_EVENT ||
+                    WSAEventSelect(sock, sockEvent, FD_READ) == SOCKET_ERROR) {
+                    Logf("Couldn't listen on UDP port %d (WSA error %d)%s", base.udpPort, WSAGetLastError(),
+                         useTap ? ". That's fine, the telemetry hook is in use" : ". Is another app using that port?");
+                    if (sockEvent != WSA_INVALID_EVENT) { WSACloseEvent(sockEvent); sockEvent = WSA_INVALID_EVENT; }
                     closesocket(sock); sock = INVALID_SOCKET;
-                } else {
-                    DWORD to = 20;
-                    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
                 }
             }
         }
         const bool haveSock = sock != INVALID_SOCKET;
-        if (!haveSock) Logf("No UDP socket, so only the test mode will work");
+        if (useTap) PacketTap::Activate();
+        if (!useTap && !haveSock) Logf("No telemetry source is available, so only the test mode will work");
+        else Logf("Telemetry source: %s%s%s", useTap ? "NGP send hook" : "", useTap && haveSock ? " + " : "",
+                  haveSock ? "UDP port (backup)" : "");
+        HANDLE waitOn[2]; DWORD nWait = 0;
+        if (useTap) waitOn[nWait++] = PacketTap::g_event;
+        if (haveSock) waitOn[nWait++] = sockEvent;
 
         std::vector<uint8_t> buf(2048);
         FFLayer ff;
@@ -1500,7 +1859,7 @@ private:
 
         const auto t0 = Clock::now();
         auto lastRx = t0 - std::chrono::seconds(10);
-        auto lastPkt = t0, lastApply = t0, nextTry = t0;
+        auto lastPkt = t0, lastApply = t0, nextTry = t0, tapLastRx = t0 - std::chrono::seconds(10), nextRescan = t0;
 
         // Which car is this? The name comes from RSF / RBR (see ResolveCarIdentity). We keep polling rather than relying on
         // a few events, because the car is changed in the menus where no telemetry flows, and RSF may write its files a
@@ -1531,35 +1890,57 @@ private:
                  id.name.c_str(), lab, eff.cylinders, eff.rpmMax, eff.weightFeel, sameCar ? "  (profiles reloaded)" : "");
         };
 
-        while (m_run) {
-            const auto now = Clock::now();
-            bool got = false;
+        // One telemetry packet, from either source. ts is when it was sent (or arrived), so packets that pile up
+        // in the queue still get the right time step between them.
+        auto handlePacket = [&](const uint8_t* data, int n, Clock::time_point ts, int source) {
+            m_packets++;
+            m_source = source;
+            const float pdt = std::max(0.0f, std::chrono::duration<float>(ts - lastPkt).count());
+            lastPkt = ts; lastRx = ts;
+            if (pdt > 1.0f) carForce = true;                   // telemetry is back after a pause: probably a new stage, maybe a new car
+            if (m_stageReset.exchange(false)) {                 // the car is at the start line: learn its static load again
+                for (int i = 0; i < 4; ++i) dsp.statRef[i] = Ema();
+                dsp.thumpL = dsp.thumpR = 0;
+                dsp.airT = 0; dsp.landWin = 0; dsp.totLow = 1.0f;
+            }
+            ParsePacket(eff, data, n, live, dsp, pdt);
+            if (live.carIndex >= 0 && live.carIndex != curSlot) { curSlot = live.carIndex; carForce = true; }
+            {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                m_pktLen = n;
+                std::memcpy(m_pkt, data, n);
+            }
+            if (!dumped) { DumpPacket(data, n); dumped = true; }
+        };
 
-            if (haveSock) {
-                int n = recvfrom(sock, (char*)buf.data(), (int)buf.size(), 0, nullptr, nullptr);
-                if (n >= base.minPacket) {
-                    m_packets++;
-                    got = true;
-                    float pdt = std::chrono::duration<float>(now - lastPkt).count();
-                    lastPkt = now; lastRx = now;
-                    if (pdt > 1.0f) carForce = true;                   // telemetry is back after a pause: probably a new stage, maybe a new car
-                    if (m_stageReset.exchange(false)) {                 // the car is at the start line: learn its static load again
-                        for (int i = 0; i < 4; ++i) dsp.statRef[i] = Ema();
-                        dsp.thumpL = dsp.thumpR = 0;
-                        dsp.airT = 0; dsp.landWin = 0; dsp.totLow = 1.0f;
+        while (m_run) {
+            // Wait for a packet from either source (or 20 ms), then handle everything that has arrived.
+            if (nWait) {
+                WaitForMultipleObjects(nWait, waitOn, FALSE, 20);
+                if (useTap) {
+                    PacketTap::Slot sl;
+                    while (PacketTap::Pop(sl)) {
+                        if (sl.len < base.minPacket) continue;
+                        tapLastRx = sl.ts;
+                        handlePacket(sl.d, sl.len, sl.ts, 1);
                     }
-                    ParsePacket(eff, buf.data(), n, live, dsp, pdt);
-                    if (live.carIndex >= 0 && live.carIndex != curSlot) { curSlot = live.carIndex; carForce = true; }
-                    {
-                        std::lock_guard<std::mutex> lk(m_mtx);
-                        m_pktLen = n;
-                        std::memcpy(m_pkt, buf.data(), n);
+                }
+                if (haveSock) {
+                    WSAResetEvent(sockEvent);
+                    for (;;) {
+                        const int n = recvfrom(sock, (char*)buf.data(), (int)buf.size(), 0, nullptr, nullptr);
+                        if (n == SOCKET_ERROR) break;                          // nothing more waiting
+                        const auto ts = Clock::now();
+                        if (n < base.minPacket) continue;
+                        if (useTap && std::chrono::duration<float>(ts - tapLastRx).count() < 1.0f) continue;   // the hook is delivering
+                        handlePacket(buf.data(), n, ts, 2);
                     }
-                    if (!dumped) { DumpPacket(buf.data(), n); dumped = true; }
                 }
             } else {
                 Sleep(10);
             }
+            const auto now = Clock::now();
+            if (useTap && now >= nextRescan) { nextRescan = now + std::chrono::seconds(5); PacketTap::Rescan(); }
 
             if (m_cfgRev.load() != seenRev) {                  // the menu changed something: pick it up now
                 seenRev = m_cfgRev.load();
@@ -1664,7 +2045,12 @@ private:
             Sleep(30);
         }
         ff.Destroy();
-        if (sock != INVALID_SOCKET) closesocket(sock);
+        if (useTap) PacketTap::Deactivate();
+        if (sock != INVALID_SOCKET) {
+            WSAEventSelect(sock, sockEvent, 0);
+            closesocket(sock);
+        }
+        if (sockEvent != WSA_INVALID_EVENT) WSACloseEvent(sockEvent);
         if (wsaOk) WSACleanup();
     }
 
@@ -1850,6 +2236,12 @@ private:
         snprintf(buf, sizeof(buf), "RBR force updates seen %d   last in %d   out %d",
                  g_rbrSeen.load(), g_rbrRaw.load(), g_rbrOut.load());
         line(buf);
+        snprintf(buf, sizeof(buf), "send hook: %s", PacketTap::Installed() ? PacketTap::Describe().c_str() : "not installed");
+        line(buf);
+        snprintf(buf, sizeof(buf), "sends seen %lld   taken %lld   other destination %lld   dropped %lld",
+                 (long long)PacketTap::g_calls.load(), (long long)PacketTap::g_taken.load(),
+                 (long long)PacketTap::g_otherDest.load(), (long long)PacketTap::g_dropped.load());
+        line(buf);
         line("Raw packet floats:");
         for (int row = 0; row < 12; ++row) {
             int base = m_tableBase + row * 16;
@@ -1879,6 +2271,11 @@ public:
         SyncConfig(m_cfg, m_iniPath, false);
         m_userGain = m_cfg.userGain;
 
+        if (m_cfg.telemetrySource != 2) {
+            const bool ok = PacketTap::Install(m_cfg.minPacket);
+            Logf("Telemetry hook: %s (%s)", ok ? "installed" : "not available", PacketTap::Describe().c_str());
+        }
+
         BuildRows();
         SetStatus("Choose your wheel with Left/Right, then press Select.");
         EnumerateDevices();
@@ -1898,6 +2295,10 @@ public:
     ~ForceFXPlugin() {
         Disconnect();
         GameDeviceTap::I().Remove();       // put the original vtable entries back before our DLL goes away
+        if (!PacketTap::Remove()) {
+            PinThisDll();
+            Logf("Another hook was chained onto the Winsock send calls after ours, so the DLL stays pinned in memory");
+        }
         if (m_pDI) { m_pDI->Release(); m_pDI = nullptr; }
     }
 
@@ -1931,8 +2332,13 @@ public:
         snprintf(buf, sizeof(buf), "Status: %s", st.c_str());
         line(buf);
         static const char* const kPhase[] = {"engine sweep", "gravel", "rough / dirt", "hard braking + lock-up"};
-        snprintf(buf, sizeof(buf), "UDP packets: %lld (port %d)   live gain %.0f%%%s   derate x%.2f",
-                 (long long)m_packets.load(), m_cfg.udpPort, m_userGain.load() * 100.0f, m_muted ? " MUTED" : "", m_dHeat.load());
+        const int src = m_source.load();
+        char from[48];
+        if (src == 1) snprintf(from, sizeof(from), "from NGP");
+        else if (src == 2) snprintf(from, sizeof(from), "from UDP port %d", m_cfg.udpPort);
+        else snprintf(from, sizeof(from), "(none yet)");
+        snprintf(buf, sizeof(buf), "Telemetry: %lld packets %s   live gain %.0f%%%s   derate x%.2f",
+                 (long long)m_packets.load(), from, m_userGain.load() * 100.0f, m_muted ? " MUTED" : "", m_dHeat.load());
         line(buf);
         { std::string nm, pr; { std::lock_guard<std::mutex> lk(m_mtx); nm = m_carName; pr = m_carPreset; }
           snprintf(buf, sizeof(buf), "car slot %d: %s %s", m_dCar.load(), nm.empty() ? "waiting for telemetry" : nm.c_str(), pr.c_str());
