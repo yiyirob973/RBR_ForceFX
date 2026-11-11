@@ -1,16 +1,16 @@
-name: Build and Release ForceFX
+name: Build and release ForceFX
 
 on:
   push:
     tags:
-      - 'v*'       # Triggered automatically when you push a tag like v1.0.0
-  workflow_dispatch: # Allows manual triggering from the GitHub Actions tab if needed
+      - 'v*'       # runs when you push a tag like v1.0.0
+  workflow_dispatch: # lets you run it by hand from the Actions tab
 
 jobs:
   build-and-release:
     runs-on: windows-latest
     permissions:
-      contents: write # Required to create a GitHub Release and upload assets
+      contents: write # needed to create the release and upload the zip
 
     steps:
       - name: Checkout Repository
@@ -28,23 +28,23 @@ jobs:
       - name: Prepare Release Package
         shell: pwsh
         run: |
-          # Extract version from GitHub ref (e.g., refs/tags/v0.2.0 -> v0.2.0)
+          # Use the tag name (for example v0.2.0) in the zip's file name
           $tag = $env:GITHUB_REF_NAME
           if (-not $tag) { $tag = "v0.0.0-dev" }
           
           $zipName = "ForceFX-$tag.zip"
           Write-Host "Creating archive: $zipName"
 
-          # Create a staging folder for the distribution package
+          # Gather the files that go in the release
           mkdir release_stage
           copy RBR_ForceFX.dll release_stage\
           copy ForceFX.ini release_stage\
           copy ForceFXCars.ini release_stage\
           
-          # Compress contents into a dynamically named zip archive
+          # Zip them up
           Compress-Archive -Path release_stage\* -DestinationPath $zipName
           
-          # Save the filename as an environment variable for the release step
+          # Pass the zip's name on to the release step
           echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
 
       - name: Create GitHub Release and Upload Zip
