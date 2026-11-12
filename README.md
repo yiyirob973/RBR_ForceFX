@@ -1,11 +1,13 @@
 # RBR_ForceFX
 
-- AI tools were used during the development of this project.
-- This project was built for the RallySimFans (RSF) version of Richard Burns Rally (RBR) and is intended for the RSF/NGP7 setup.
-- It may work with other versions of RBR or other setups, but compatibility is not guaranteed.
-- Testing has been completed and every effort has been made to reduce the risk of hardware damage.
-- However, because ForceFX sends force-feedback output directly to the wheel, hardware damage is still possible.
-- Use this software at your own risk.
+> **Disclaimer**
+>
+> - AI tools were used during the development of this project.
+> - This project was built for the RallySimFans (RSF) version of Richard Burns Rally (RBR) and is intended for the RSF/NGP7 setup.
+> - It may work with other versions of RBR or other setups, but compatibility is not guaranteed.
+> - Testing has been completed and every effort has been made to reduce the risk of hardware damage.
+> - However, because ForceFX sends force-feedback output directly to the wheel, hardware damage is still possible.
+> - Use this software at your own risk.
 
 ForceFX is a force-feedback plugin for Richard Burns Rally (RBR). It uses NGP telemetry to add configurable vibration and impact detail to a compatible DirectInput force-feedback wheel while RBR is running.
 
