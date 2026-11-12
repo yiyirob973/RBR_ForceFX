@@ -2,6 +2,8 @@ name: Build and release ForceFX
 
 on:
   push:
+    branches:
+      - memory     # runs automatically on every commit to the memory branch
     tags:
       - 'v*'       # runs when you push a tag like v1.0.0
   workflow_dispatch: # lets you run it by hand from the Actions tab
@@ -28,11 +30,17 @@ jobs:
       - name: Prepare Release Package
         shell: pwsh
         run: |
-          # Use the tag name (for example v0.2.0) in the zip's file name
-          $tag = $env:GITHUB_REF_NAME
-          if (-not $tag) { $tag = "v0.0.0-dev" }
+          # Use the tag or branch name (for example v0.2.0 or memory) in the zip's file name
+          $ref = $env:GITHUB_REF_NAME
+          if (-not $ref) { $ref = "v0.0.0-dev" }
           
-          $zipName = "ForceFX-$tag.zip"
+          # Append short commit SHA when building from a branch rather than a version tag
+          if ($env:GITHUB_REF -notlike "refs/tags/*") {
+            $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+            $zipName = "ForceFX-$ref-$shortSha.zip"
+          } else {
+            $zipName = "ForceFX-$ref.zip"
+          }
           Write-Host "Creating archive: $zipName"
 
           # Gather the files that go in the release
@@ -44,8 +52,14 @@ jobs:
           # Zip them up
           Compress-Archive -Path release_stage\* -DestinationPath $zipName
           
-          # Pass the zip's name on to the release step
+          # Pass the zip's name on to the upload and release steps
           echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
 
       - name: Create GitHub Release and Upload Zip
         uses: softprops/action-gh-release@v2

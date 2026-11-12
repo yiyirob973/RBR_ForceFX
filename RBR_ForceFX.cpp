@@ -55,6 +55,9 @@
 //   more heavily loaded side transmits more), the compression thump, a quiet engine and road when airborne, and
 //   the braking judder.
 //
+// Branch "memory": a temporary memory scanner (see the MemScan block) that hunts for the surface type under each tyre.
+//   Everything it adds is marked MEMSCAN or sits inside namespace MemScan, so it can be deleted in one go.
+//
 // Files next to the DLL: ForceFX.ini (settings, written with defaults on first run), ForceFXCars.ini (car
 //   profiles), ForceFX.log, and ForceFX_packet.txt (a dump of the first telemetry packet, handy for checking offsets).
 
@@ -1621,6 +1624,1189 @@ struct Synth {
 };
 
 // ----------------------------------------------------------------- plugin
+// ====================================================================================================================
+// TEMPORARY: RBR memory scanner (branch "memory")
+//
+// Goal: find where RBR keeps the surface type under each tyre, so ForceFX can give gravel, snow and ice their own
+// feel. This whole block is throwaway. Once the addresses are known, delete it, the lines marked MEMSCAN further
+// down, and the [MemScan] section of ForceFX.ini.
+//
+// How it finds the value
+//   RBR stores a surface id (a small integer) for every tyre. We can't know where, so the scanner learns it from you,
+//   the same way a Cheat Engine search does. You drive, and tell it which surface you are on with a key:
+//     Numpad 1..8   "I'm fully on surface N now" (names come from Label1..Label8 in [MemScan], default Tarmac, Gravel,
+//                   Snow, Ice, Dirt, Sand, Mud, Other)
+//     Numpad 9      pause sampling. Press it as you LEAVE a surface and the new surface's key once all four wheels
+//                   are on it; a key pressed late counts the new surface's value against the old label
+//     Numpad .      write the full report now, including the search for pointers to the best candidates
+//     Numpad 0      throw everything away and start over
+//   1. First label press: after a moment on that surface the scanner snapshots every small number in RBR's writable
+//      memory, reads it again 0.7 s later, and throws away everything that moved (timers, positions, counters).
+//   2. Second, different label press: the same read happens on the new surface. Only numbers that held still on both
+//      surfaces and differ between them survive. That is usually a few thousand candidates out of tens of millions.
+//   3. From then on every label press just samples the survivors a few times a second. A candidate must keep the
+//      same value for the same surface. Visit more surfaces and revisit old ones: wrong candidates drop out.
+//   4. Candidates are grouped into wheel sets (four equal values at a fixed stride, as an array of four tyres would
+//      look). The report lists those first, then the best single addresses, then which static pointers lead to them.
+//
+//   What the game's own code tells us (RichardBurnsRally_SSE.exe, found by disassembly):
+//     * a surface is a material id below 256. Each tyre contact keeps {blend weight (float), material A, material B} and
+//       the tyre model blends the two materials by the weight.
+//     * the material table is reachable through a fixed pointer at VA 0x1659B70 (the exe has no ASLR):
+//       world = [0x1659B70], physics = [world+0x24], manager = physics+0x18, material i = manager+0xC+i*0x160, and an
+//       id is valid when bit 0 of the byte at manager+0x164+i*0x160 is set. The scanner reads that table and only
+//       accepts values that are valid ids (UseValid=1), which throws away about half of all false candidates.
+//     * RBR has a FORCE_MATERIAL debug override: when bit 0x40000 of the dword at physics+0x160CC is set, every tyre
+//       contact takes the id stored at physics+0x1614C (weight 0). The optional probe (ForceProbe=1, key Numpad *)
+//       uses it as a controlled experiment: force three known ids in turn and keep the memory that follows them as
+//       {0, id, id}. That finds the tyre contact structures in a few seconds, parked, without a multi-surface drive.
+//       The probe WRITES those two dwords for about 3 seconds and restores them afterwards, so it is off by default.
+//
+//   Sampling only happens while the car is moving and all wheels are loaded (telemetry speed and airborne), so the
+//   ForceFX wheel connection has to be up, or set RequireTelemetry=0 in [MemScan]. Don't restart the stage in the
+//   middle of a scan: heap addresses move and the candidates are cleared on every stage start. NumLock must be on.
+//   Beeps confirm what happened: rising pitch = label set, two tones = snapshot taken, three tones = diff done,
+//   one low long tone = the step was cancelled (the car left the ground, slowed down, or you pressed another key).
+//
+//   Output: ForceFX_memscan.txt (the report, rewritten every ReportSeconds), ForceFX_memscan.log (events).
+//   Watchlist: put Watch1..Watch8 in [MemScan] to follow addresses you already know, even across game restarts:
+//     Watch1=RichardBurnsRally_SSE.exe+0x7E1234>0x20*4@0x80
+//     module+offset (or exe+offset for the main program, or an absolute 0xADDRESS), each ">off" reads a pointer
+//     there and adds off, "*4@0x80" shows 4 values at a 0x80 stride. Every change is written to the log with the
+//     current label, so you can confirm an address by driving over known surfaces.
+// ====================================================================================================================
+namespace MemScan {
+
+constexpr int     kLabels = 8;
+constexpr uint8_t kNone   = 0xFF;          // "no value": out of range, unread or not set yet
+constexpr size_t  kChunk  = 4u << 20;      // read granularity of a full memory pass
+constexpr size_t  kChunkBuf = kChunk + 16;  // plus room for the 4-byte overlap the probe reads on each side
+// layout of RBR's physics object (see the header comment)
+constexpr uintptr_t kPhysOff = 0x24, kMgrOff = 0x18, kValidOff = 0x164, kMatSize = 0x160, kFlagsOff = 0x160CC, kForcedOff = 0x1614C;
+constexpr uint32_t  kForceBit = 0x40000;
+
+struct Settings {
+    int   enable = 1;
+    int   width = 4;                       // bytes per value: 1, 2 or 4. A surface id is most likely a 32-bit int
+    int   maxValue = 254;                  // only values 0..maxValue are candidates (material ids go up to 255)
+    int   maxRegionMB = 64;                // skip single regions bigger than this (textures, audio, mesh data); 0 = no limit
+    int   snapshotMB = 192;                // memory budget of the first snapshot (one byte per scanned value)
+    int   includeReadOnly = 0, includeMapped = 0;
+    int   requireTelemetry = 1;            // 0 = sample even when ForceFX has no telemetry (you must keep the car on the ground yourself)
+    float minSpeed = 6.0f;                 // m/s; sampling only happens above this speed
+    int   settleMs = 1500;                 // a label has to be active this long before anything is sampled
+    int   gapMs = 700;                     // gap between the two reads that prove a value holds still
+    float trackHz = 4.0f;
+    int   maxCands = 3000000;
+    int   missPercent = 30, minSamples = 8;   // a candidate is dropped when more than this share of its samples disagree
+    int   reportSec = 10;
+    int   keyLabel1 = 0x61;                // VK_NUMPAD1; the next seven labels use the following key codes
+    int   keyPause = 0x69, keyReport = 0x6E, keyReset = 0x60;   // Numpad 9, Numpad ., Numpad 0
+    int   beep = 1;
+    int   useValid = 1;                    // only accept values that are valid material ids (needs the anchor below)
+    int   anchorVA = 0x1659B70;            // RichardBurnsRally_SSE.exe: pointer to the physics world
+    int   forceProbe = 0;                  // 1 = allow the Numpad * probe, which temporarily writes RBR's FORCE_MATERIAL override
+    int   probeSettleMs = 500;             // wait after forcing an id so the physics step has rewritten the contacts
+    int   probeWeightZero = 1;             // also require the float before the id pair to be 0 (what the override writes)
+    int   keyProbe = 0x6A;                 // Numpad *
+    std::string probeIds;                  // "a,b,c" to force three specific ids; empty = three valid ones are picked
+    std::string label[kLabels] = {"Tarmac", "Gravel", "Snow", "Ice", "Dirt", "Sand", "Mud", "Other"};
+    std::string watch[8];
+};
+
+// ---------------------------------------------------------------- memory we must never scan (our own buffers)
+struct Range { uintptr_t lo, hi; };
+std::mutex         g_exMtx;
+std::vector<Range> g_ex;
+
+void ExAdd(const void* p, size_t n) {
+    std::lock_guard<std::mutex> lk(g_exMtx);
+    g_ex.push_back(Range{(uintptr_t)p, (uintptr_t)p + n});
+}
+void ExRemove(const void* p) {
+    std::lock_guard<std::mutex> lk(g_exMtx);
+    for (size_t i = 0; i < g_ex.size(); ++i)
+        if (g_ex[i].lo == (uintptr_t)p) { g_ex.erase(g_ex.begin() + (ptrdiff_t)i); break; }
+}
+bool IsExcluded(uintptr_t a, size_t n) {
+    std::lock_guard<std::mutex> lk(g_exMtx);
+    for (const Range& e : g_ex) if (a < e.hi && a + n > e.lo) return true;
+    return false;
+}
+
+// Fixed-capacity buffer on its own VirtualAlloc pages. Because it is registered as excluded, a scan of RBR's memory
+// never reads the scanner's own data (which would otherwise change under it and look like a "candidate").
+template <class T>
+class Buf {
+    T* p_ = nullptr; size_t n_ = 0, cap_ = 0;
+public:
+    Buf() {}
+    Buf(const Buf&) = delete;
+    Buf& operator=(const Buf&) = delete;
+    ~Buf() { Free(); }
+    bool Alloc(size_t cap) {
+        Free();
+        if (!cap) return false;
+        void* m = VirtualAlloc(nullptr, cap * sizeof(T), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!m) return false;
+        p_ = static_cast<T*>(m); cap_ = cap; n_ = 0;
+        ExAdd(m, cap * sizeof(T));
+        return true;
+    }
+    void Free() {
+        if (p_) { ExRemove(p_); VirtualFree(p_, 0, MEM_RELEASE); }
+        p_ = nullptr; n_ = cap_ = 0;
+    }
+    bool   ok() const { return p_ != nullptr; }
+    T*     data() { return p_; }
+    size_t size() const { return n_; }
+    size_t cap() const { return cap_; }
+    void   resize(size_t n) { n_ = n < cap_ ? n : cap_; }
+    bool   push(const T& v) { if (n_ >= cap_) return false; p_[n_++] = v; return true; }
+    T&     operator[](size_t i) { return p_[i]; }
+};
+
+// ---------------------------------------------------------------- small helpers
+bool Rd(uintptr_t a, void* d, size_t n) {            // safe even on unmapped memory: it just fails
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), (LPCVOID)a, d, n, &got) && got == n;
+}
+
+struct Mod { std::string name; uintptr_t base, size; };
+std::vector<Mod> Modules() {
+    std::vector<Mod> v;
+    HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (h == INVALID_HANDLE_VALUE) return v;
+    MODULEENTRY32 e; std::memset(&e, 0, sizeof(e)); e.dwSize = sizeof(e);
+    if (Module32First(h, &e)) do {
+        char path[MAX_PATH] = {0};
+        GetModuleFileNameA(e.hModule, path, MAX_PATH);
+        std::string nm(path);
+        const size_t sl = nm.find_last_of("\\/");
+        Mod m; m.name = sl == std::string::npos ? nm : nm.substr(sl + 1);
+        m.base = (uintptr_t)e.modBaseAddr; m.size = (uintptr_t)e.modBaseSize;
+        v.push_back(m);
+    } while (Module32Next(h, &e));
+    CloseHandle(h);
+    return v;
+}
+bool InModule(const std::vector<Mod>& mods, uintptr_t a) {
+    for (const Mod& m : mods) if (a >= m.base && a < m.base + m.size) return true;
+    return false;
+}
+std::string WatchTok(const std::vector<Mod>& mods, uintptr_t a) {
+    char b[256];
+    for (const Mod& m : mods)
+        if (a >= m.base && a < m.base + m.size) {
+            snprintf(b, sizeof(b), "%s+0x%llX", m.name.c_str(), (unsigned long long)(a - m.base));
+            return b;
+        }
+    snprintf(b, sizeof(b), "0x%llX", (unsigned long long)a);
+    return b;
+}
+std::string Describe(const std::vector<Mod>& mods, uintptr_t a) {
+    char b[256];
+    for (const Mod& m : mods)
+        if (a >= m.base && a < m.base + m.size) {
+            snprintf(b, sizeof(b), "%s+0x%llX", m.name.c_str(), (unsigned long long)(a - m.base));
+            return b;
+        }
+    snprintf(b, sizeof(b), "heap 0x%08llX", (unsigned long long)a);
+    return b;
+}
+
+std::string g_mdir;
+Clock::time_point g_t0 = Clock::now();
+void MLog(const char* fmt, ...) {
+    char b[600];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    FILE* f = fopen((g_mdir + "ForceFX_memscan.log").c_str(), "a");
+    if (f) { fprintf(f, "[%8.2f] %s\n", std::chrono::duration<double>(Clock::now() - g_t0).count(), b); fclose(f); }
+}
+
+inline int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+}
+
+// ---------------------------------------------------------------- data
+struct Cand { uintptr_t addr; uint8_t v[kLabels]; uint8_t hit, miss; };   // v[label] = the value seen on that surface
+struct Region { uintptr_t base; size_t size; size_t snapOff; bool image; };
+
+struct LabStat {
+    bool   used = false;
+    int    passes = 0;
+    double sumRough = 0, sumTex = 0, sumSpeed = 0;
+    float  maxRough = 0, maxTex = 0;
+};
+
+struct Watch {
+    std::string text;
+    bool valid = false, isAbs = false;
+    std::string mod;
+    uintptr_t base = 0;                  // absolute address, or offset into the module
+    std::vector<uintptr_t> chain;        // each step: read a pointer at the current address, then add the offset
+    int count = 1;
+    uintptr_t stride = 4;
+    uint32_t last[8] = {};
+    bool haveLast = false;
+};
+
+class Scanner {
+public:
+    Settings S;
+    std::string ini;
+
+    // fed from the ForceFX worker thread
+    std::atomic<float>   fSpeed{0}, fAir{0}, fRough{0}, fTex{0};
+    std::atomic<int64_t> fLast{0};
+    std::atomic<bool>    stage{false};
+
+    void Begin(const std::string& dir, const std::string& iniPath) {
+        g_mdir = dir; ini = iniPath;
+        ExAdd(this, sizeof(*this));        // the scanner's own state (label index, phase...) must never look like a candidate
+        Load();
+        if (!S.enable) return;
+        MLog("---- memory scanner started: width %d, values 0..%d, report every %d s", S.width, S.maxValue, S.reportSec);
+        run_ = true;
+        th_ = std::thread(&Scanner::Loop, this);
+    }
+    void End() {
+        run_ = false;
+        if (th_.joinable()) th_.join();
+        ExRemove(this);
+    }
+    std::string Status(int k) {
+        std::lock_guard<std::mutex> lk(sm_);
+        return k == 0 ? s0_ : k == 1 ? s1_ : s2_;
+    }
+
+private:
+    std::thread th_;
+    std::atomic<bool> run_{false};
+    std::mutex sm_;
+    std::string s0_, s1_, s2_;
+
+    enum Phase { P_IDLE, P_WAIT_DIFF, P_TRACK };
+    Phase phase_ = P_IDLE;
+    int   label_ = -1, passLabel_ = -1, snapLabel_ = -1;
+    bool  paused_ = false, reportReq_ = false, resetReq_ = false, probeReq_ = false, probing_ = false;
+    bool  keyPrev_[kLabels + 4] = {};
+    Clock::time_point sticky_ = Clock::now();      // a message set before this time isn't overwritten by routine status text
+    Clock::time_point labelSince_ = Clock::now(), nextTrack_ = Clock::now(), nextReport_ = Clock::now(), nextTry_ = Clock::now(),
+                      nextWatch_ = Clock::now();
+    int   trackPasses_ = 0;
+    bool  overflow_ = false;
+    LabStat stat_[kLabels];
+
+    Buf<uint8_t> snap_, chunk_, page_;
+    Buf<Cand>    cands_;
+    std::vector<Region> regions_;
+    size_t snapItems_ = 0, skippedRegions_ = 0, skippedMB_ = 0, overBudget_ = 0;
+    std::vector<Watch> watches_;
+    // RBR's material table (read through the anchor)
+    bool anchorOk_ = false; uintptr_t world_ = 0, phys_ = 0, mgr_ = 0; bool valid_[256] = {}; int validCount_ = 0;
+    std::string probeName_[kLabels];                 // a forced id is shown under its own name instead of a surface name
+    uint32_t probeIds_[3] = {}; bool probeDone_ = false; size_t probePairs_ = 0;
+    const std::string& LabName(int l) const { return probeName_[l].empty() ? S.label[l] : probeName_[l]; }
+
+    // ------------------------------------------------------------ settings
+    void Load() {
+        const char* K = "MemScan";
+        char b[512];
+        GetPrivateProfileStringA(K, "Enable", "", b, sizeof(b), ini.c_str());
+        const bool fresh = b[0] == 0;
+        auto I = [&](const char* k, int& v, bool hex = false) {
+            if (fresh) { char o[32]; snprintf(o, sizeof(o), hex ? "0x%X" : "%d", v); WritePrivateProfileStringA(K, k, o, ini.c_str()); return; }
+            GetPrivateProfileStringA(K, k, "", b, sizeof(b), ini.c_str()); if (b[0]) v = (int)strtol(b, nullptr, 0);
+        };
+        auto F = [&](const char* k, float& v) {
+            if (fresh) { char o[32]; snprintf(o, sizeof(o), "%g", v); WritePrivateProfileStringA(K, k, o, ini.c_str()); return; }
+            GetPrivateProfileStringA(K, k, "", b, sizeof(b), ini.c_str()); if (b[0]) v = (float)atof(b);
+        };
+        auto T = [&](const char* k, std::string& v) {
+            if (fresh) { WritePrivateProfileStringA(K, k, v.c_str(), ini.c_str()); return; }
+            GetPrivateProfileStringA(K, k, "", b, sizeof(b), ini.c_str()); if (b[0]) v = b;
+        };
+        I("Enable", S.enable); I("Width", S.width); I("MaxValue", S.maxValue); I("MaxRegionMB", S.maxRegionMB);
+        I("SnapshotMB", S.snapshotMB); I("IncludeReadOnly", S.includeReadOnly); I("IncludeMapped", S.includeMapped);
+        I("RequireTelemetry", S.requireTelemetry); F("MinSpeed", S.minSpeed); I("SettleMs", S.settleMs); I("GapMs", S.gapMs);
+        F("TrackHz", S.trackHz); I("MaxCandidates", S.maxCands); I("MissPercent", S.missPercent); I("MinSamples", S.minSamples);
+        I("ReportSeconds", S.reportSec); I("KeyLabel1", S.keyLabel1, true); I("KeyPause", S.keyPause, true);
+        I("KeyReport", S.keyReport, true); I("KeyReset", S.keyReset, true); I("Beep", S.beep);
+        I("UseValid", S.useValid); I("AnchorVA", S.anchorVA, true); I("ForceProbe", S.forceProbe); I("ProbeSettleMs", S.probeSettleMs);
+        I("ProbeWeightZero", S.probeWeightZero); I("KeyProbe", S.keyProbe, true); T("ProbeIds", S.probeIds);
+        for (int i = 0; i < kLabels; ++i) { char k[16]; snprintf(k, sizeof(k), "Label%d", i + 1); T(k, S.label[i]); }
+        for (int i = 0; i < 8; ++i) { char k[16]; snprintf(k, sizeof(k), "Watch%d", i + 1); T(k, S.watch[i]); }
+
+        S.width = (S.width == 1 || S.width == 2) ? S.width : 4;
+        S.maxValue = std::max(1, std::min(S.maxValue, 254));
+        S.maxRegionMB = std::max(0, S.maxRegionMB);
+        S.snapshotMB = std::max(16, std::min(S.snapshotMB, 1024));
+        S.minSpeed = clampf(S.minSpeed, 0.0f, 60.0f);
+        S.settleMs = std::max(200, S.settleMs); S.gapMs = std::max(100, S.gapMs);
+        S.trackHz = clampf(S.trackHz, 0.5f, 20.0f);
+        S.maxCands = std::max(10000, std::min(S.maxCands, 8000000));
+        S.missPercent = std::max(0, std::min(S.missPercent, 90)); S.minSamples = std::max(2, S.minSamples);
+        S.reportSec = std::max(2, S.reportSec);
+        S.probeSettleMs = std::max(100, S.probeSettleMs);
+        for (int i = 0; i < 8; ++i) {
+            Watch w; w.text = S.watch[i];
+            ParseWatch(w);
+            if (w.valid) watches_.push_back(w);
+        }
+    }
+
+    static std::string Trim(const std::string& s) {
+        size_t a = s.find_first_not_of(" \t\r\n"), z = s.find_last_not_of(" \t\r\n");
+        return a == std::string::npos ? std::string() : s.substr(a, z - a + 1);
+    }
+    static uintptr_t Num(const std::string& s) { return (uintptr_t)strtoull(Trim(s).c_str(), nullptr, 0); }
+
+    // "module+0xOFF>0xA>0xB*4@0x80", "exe+0xOFF" or "0xABSOLUTE"
+    static void ParseWatch(Watch& w) {
+        std::string t = Trim(w.text);
+        if (t.empty()) return;
+        size_t star = t.find('*');
+        if (star != std::string::npos) {
+            std::string tail = t.substr(star + 1);
+            t = Trim(t.substr(0, star));
+            size_t at = tail.find('@');
+            w.count = std::max(1, std::min((int)Num(at == std::string::npos ? tail : tail.substr(0, at)), 8));
+            if (at != std::string::npos) w.stride = std::max<uintptr_t>(1, Num(tail.substr(at + 1)));
+        }
+        std::vector<std::string> parts;
+        size_t p = 0;
+        for (;;) {
+            size_t q = t.find('>', p);
+            parts.push_back(Trim(t.substr(p, q == std::string::npos ? std::string::npos : q - p)));
+            if (q == std::string::npos) break;
+            p = q + 1;
+        }
+        const std::string& head = parts[0];
+        size_t plus = head.find('+');
+        if (plus == std::string::npos) { w.isAbs = true; w.base = Num(head); }
+        else { w.mod = Trim(head.substr(0, plus)); w.base = Num(head.substr(plus + 1)); }
+        for (size_t i = 1; i < parts.size(); ++i) w.chain.push_back(Num(parts[i]));
+        w.valid = w.isAbs ? w.base != 0 : !w.mod.empty();
+    }
+
+    // ------------------------------------------------------------ keys, gating, feedback
+    static bool FocusOk() {
+        HWND w = GetForegroundWindow();
+        if (!w) return false;
+        DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
+        return pid == GetCurrentProcessId();
+    }
+    static bool Key(int vk) { return vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+    void Tune(int a, int b = 0, int c = 0, int ms = 60) {
+        if (!S.beep) return;
+        std::thread([=] { Beep((DWORD)a, (DWORD)ms); if (b) Beep((DWORD)b, (DWORD)ms); if (c) Beep((DWORD)c, (DWORD)ms); }).detach();
+    }
+
+    void SetLabel(int i) {
+        label_ = i; labelSince_ = Clock::now(); paused_ = false; stat_[i].used = true;
+        Tune(450 + 70 * i, 0, 0, 45);
+        MLog("label -> %d (%s)", i + 1, S.label[i].c_str());
+    }
+
+    void PollKeys() {
+        if (!FocusOk()) { std::memset(keyPrev_, 0, sizeof(keyPrev_)); return; }
+        for (int i = 0; i < kLabels; ++i) {
+            const bool d = Key(S.keyLabel1 + i);
+            if (d && !keyPrev_[i]) SetLabel(i);
+            keyPrev_[i] = d;
+        }
+        const bool p = Key(S.keyPause), r = Key(S.keyReport), z = Key(S.keyReset);
+        if (p && !keyPrev_[kLabels]) { paused_ = true; Tune(300, 0, 0, 45); MLog("paused"); }
+        const bool pr = Key(S.keyProbe);
+        if (pr && !keyPrev_[kLabels + 3]) probeReq_ = true;
+        keyPrev_[kLabels + 3] = pr;
+        if (r && !keyPrev_[kLabels + 1]) reportReq_ = true;
+        if (z && !keyPrev_[kLabels + 2]) resetReq_ = true;
+        keyPrev_[kLabels] = p; keyPrev_[kLabels + 1] = r; keyPrev_[kLabels + 2] = z;
+    }
+
+    bool Fresh() const { return NowMs() - fLast.load() < 700; }
+    // The car has to be rolling on loaded wheels: that is when the surface ids are meaningful and stable.
+    bool GateOk() const {
+        if (!Fresh()) return !S.requireTelemetry;
+        return fSpeed.load() >= S.minSpeed && fAir.load() < 0.3f;
+    }
+    bool Aborted() {
+        PollKeys();
+        if (probing_) return !run_ || stage.load() || resetReq_;     // the probe works parked, so no speed requirement
+        return !run_ || stage.load() || paused_ || passLabel_ != label_ || resetReq_ || !GateOk();
+    }
+    bool Wait(int ms) {
+        const int64_t until = NowMs() + ms;
+        while (NowMs() < until) { if (Aborted()) return false; Sleep(20); }
+        return true;
+    }
+    void SetMsg(const char* fmt, ...) {
+        if (Clock::now() < sticky_) return;
+        char b[300];
+        va_list ap; va_start(ap, fmt);
+        vsnprintf(b, sizeof(b), fmt, ap);
+        va_end(ap);
+        std::lock_guard<std::mutex> lk(sm_);
+        s1_ = b;
+    }
+    void Fail(const char* what) {
+        sticky_ = Clock::now();
+        SetMsg("%s cancelled (left the ground, slowed down, or another key). Keep driving on the surface and it will retry.", what);
+        MLog("%s cancelled", what);
+        Tune(200, 0, 0, 160);
+        nextTry_ = Clock::now() + std::chrono::milliseconds(1000);
+    }
+
+    // ------------------------------------------------------------ memory layout
+    static bool RegionOk(const MEMORY_BASIC_INFORMATION& m, const Settings& s) {
+        if (m.State != MEM_COMMIT) return false;
+        if (m.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+        const DWORD p = m.Protect & 0xFF;
+        const bool rw = p == PAGE_READWRITE || p == PAGE_WRITECOPY;
+        if (!(rw || (p == PAGE_READONLY && s.includeReadOnly))) return false;
+        if (m.Type == MEM_MAPPED && !s.includeMapped) return false;
+        return true;
+    }
+    static void AddSplit(std::vector<Region>& out, const std::vector<Range>& ex, uintptr_t lo, size_t size, bool image) {
+        const uintptr_t hi = lo + size;
+        uintptr_t cur = lo;
+        for (const Range& e : ex) {
+            if (e.hi <= cur || e.lo >= hi) continue;
+            if (e.lo > cur) out.push_back(Region{cur, (size_t)(e.lo - cur), 0, image});
+            cur = std::max(cur, e.hi);
+            if (cur >= hi) break;
+        }
+        if (cur < hi) out.push_back(Region{cur, (size_t)(hi - cur), 0, image});
+    }
+    // All scannable regions: program images (static data, where game singletons live) and private heap, minus our own memory.
+    void Enum(std::vector<Region>& img, std::vector<Region>& prv) {
+        std::vector<Range> ex;
+        { std::lock_guard<std::mutex> lk(g_exMtx); ex = g_ex; }
+        std::sort(ex.begin(), ex.end(), [](const Range& a, const Range& b) { return a.lo < b.lo; });
+        SYSTEM_INFO si; GetSystemInfo(&si);
+        uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
+        const uintptr_t maxA = (uintptr_t)si.lpMaximumApplicationAddress;
+        skippedRegions_ = 0; skippedMB_ = 0;
+        while (addr < maxA) {
+            MEMORY_BASIC_INFORMATION m;
+            if (VirtualQuery((LPCVOID)addr, &m, sizeof(m)) != sizeof(m)) break;
+            const uintptr_t base = (uintptr_t)m.BaseAddress;
+            const size_t size = (size_t)m.RegionSize;
+            if (base + size <= addr) break;
+            addr = base + size;
+            if (!RegionOk(m, S)) continue;
+            if (S.maxRegionMB > 0 && size > (size_t)S.maxRegionMB * 1048576u) { ++skippedRegions_; skippedMB_ += size >> 20; continue; }
+            AddSplit(m.Type == MEM_IMAGE ? img : prv, ex, base, size, m.Type == MEM_IMAGE);
+        }
+    }
+    void BuildRegions() {
+        regions_.clear();
+        std::vector<Region> img, prv;
+        Enum(img, prv);
+        std::sort(prv.begin(), prv.end(), [](const Region& a, const Region& b) { return a.size < b.size; });
+        const size_t W = (size_t)S.width, budget = (size_t)S.snapshotMB * 1048576u;
+        size_t off = 0;
+        overBudget_ = 0;
+        auto take = [&](std::vector<Region>& v) {
+            for (Region r : v) {
+                const size_t items = r.size / W;
+                if (!items) continue;
+                if (off + items > budget) { ++overBudget_; continue; }
+                r.size = items * W; r.snapOff = off; off += items;
+                regions_.push_back(r);
+            }
+        };
+        take(img); take(prv);          // program images first, then heap regions from small to large
+        snapItems_ = off;
+    }
+
+    // ------------------------------------------------------------ passes over the whole memory
+    template <int W> static inline uint32_t Ld(const uint8_t* p) {
+        if (W == 1) return *p;
+        if (W == 2) { uint16_t v; std::memcpy(&v, p, 2); return v; }
+        uint32_t v; std::memcpy(&v, p, 4); return v;
+    }
+    inline bool IdOk(uint32_t v) const { return !(anchorOk_ && S.useValid) || valid_[v & 0xFF]; }
+    inline uint8_t Clip(uint32_t v) const { return v <= (uint32_t)S.maxValue && IdOk(v) ? (uint8_t)v : kNone; }
+
+    // mode 0: first read into the snapshot. mode 1: second read, anything that changed is thrown away.
+    // mode 2: read on the second surface, keep numbers that held still on both surfaces and differ between them.
+    template <int W>
+    void Chunk(int mode, const Region& r, size_t done, size_t items, bool ok, uint8_t* sn, int labA, int labB) {
+        const uint8_t* c = chunk_.data();
+        if (mode == 0) {
+            if (!ok) { std::memset(sn, kNone, items); return; }
+            for (size_t i = 0; i < items; ++i) sn[i] = Clip(Ld<W>(c + i * W));
+        } else if (mode == 1) {
+            if (!ok) { std::memset(sn, kNone, items); return; }
+            for (size_t i = 0; i < items; ++i) if (sn[i] != kNone && Clip(Ld<W>(c + i * W)) != sn[i]) sn[i] = kNone;
+        } else if (ok) {
+            for (size_t i = 0; i < items; ++i) {
+                const uint8_t a = sn[i];
+                if (a == kNone) continue;
+                const uint8_t b = Clip(Ld<W>(c + i * W));
+                if (b == kNone || b == a) continue;
+                Cand cd; std::memset(&cd, 0, sizeof(cd));
+                cd.addr = r.base + done + i * W;
+                for (int l = 0; l < kLabels; ++l) cd.v[l] = kNone;
+                cd.v[labA] = a; cd.v[labB] = b; cd.hit = 1;
+                if (!cands_.push(cd)) { overflow_ = true; return; }
+            }
+        }
+    }
+
+    bool Pass(int mode, int labA, int labB) {
+        for (const Region& r : regions_) {
+            size_t done = 0;
+            while (done < r.size) {
+                if (Aborted()) return false;
+                const size_t n = std::min(kChunk, r.size - done);
+                const size_t items = n / (size_t)S.width;
+                bool ok = !IsExcluded(r.base + done, n) && Rd(r.base + done, chunk_.data(), n);
+                uint8_t* sn = snap_.data() + r.snapOff + done / (size_t)S.width;
+                switch (S.width) {
+                    case 1: Chunk<1>(mode, r, done, items, ok, sn, labA, labB); break;
+                    case 2: Chunk<2>(mode, r, done, items, ok, sn, labA, labB); break;
+                    default: Chunk<4>(mode, r, done, items, ok, sn, labA, labB); break;
+                }
+                done += n;
+                Sleep(1);                    // let the game breathe between 4 MB chunks
+            }
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------------ steps
+    void DoSnapshot() {
+        passLabel_ = label_;
+        SetMsg("Taking the first snapshot on %s... keep the car rolling on it", S.label[label_].c_str());
+        if (!chunk_.ok() && !chunk_.Alloc(kChunkBuf)) { SetMsg("Out of memory (scan buffer)"); nextTry_ = Clock::now() + std::chrono::seconds(5); return; }
+        if (!page_.ok() && !page_.Alloc(4096)) { SetMsg("Out of memory (page buffer)"); nextTry_ = Clock::now() + std::chrono::seconds(5); return; }
+        if (!cands_.ok() && !cands_.Alloc((size_t)S.maxCands)) { SetMsg("Out of memory (candidate list)"); nextTry_ = Clock::now() + std::chrono::seconds(5); return; }
+        cands_.resize(0);
+        ReadAnchor();
+        BuildRegions();
+        if (!snap_.Alloc(snapItems_)) { SetMsg("Out of memory (snapshot of %u MB). Lower SnapshotMB.", (unsigned)(snapItems_ >> 20)); nextTry_ = Clock::now() + std::chrono::seconds(5); return; }
+        size_t bytes = 0; for (const Region& r : regions_) bytes += r.size;
+        MLog("snapshot on %s: %u regions, %u MB scanned (%u big regions skipped = %u MB, %u over budget)", S.label[label_].c_str(),
+             (unsigned)regions_.size(), (unsigned)(bytes >> 20), (unsigned)skippedRegions_, (unsigned)skippedMB_, (unsigned)overBudget_);
+        if (!Pass(0, 0, 0) || !Wait(S.gapMs) || !Pass(1, 0, 0)) { snap_.Free(); Fail("The snapshot"); return; }
+        size_t keep = 0;
+        for (size_t i = 0; i < snap_.cap(); ++i) if (snap_[i] != kNone) ++keep;
+        snapLabel_ = label_; phase_ = P_WAIT_DIFF;
+        MLog("snapshot done: %u steady small values", (unsigned)keep);
+        SetMsg("Snapshot taken on %s (%u steady values). Now drive onto a different surface and press its key.", S.label[label_].c_str(), (unsigned)keep);
+        Tune(700, 900);
+    }
+
+    void DoDiff() {
+        passLabel_ = label_;
+        const int a = snapLabel_, b = label_;
+        SetMsg("Comparing %s with %s...", S.label[a].c_str(), S.label[b].c_str());
+        cands_.resize(0); overflow_ = false;
+        if (!Pass(2, a, b)) { cands_.resize(0); Fail("The comparison"); return; }
+        std::sort(cands_.data(), cands_.data() + cands_.size(), [](const Cand& x, const Cand& y) { return x.addr < y.addr; });
+        MLog("compare %s vs %s: %u values differ between the two surfaces%s", S.label[a].c_str(), S.label[b].c_str(),
+             (unsigned)cands_.size(), overflow_ ? " (list full, raise MaxCandidates or lower MaxValue)" : "");
+        if (!Wait(S.gapMs) || !Refresh(b, true)) { cands_.resize(0); Fail("The comparison"); return; }
+        snap_.Free();
+        regions_.clear();
+        phase_ = P_TRACK; trackPasses_ = 0;
+        stat_[a].passes++; stat_[b].passes++;
+        MLog("%u candidates held still on both surfaces", (unsigned)cands_.size());
+        SetMsg("%u candidates left. Keep driving; press a key whenever the surface changes (revisit surfaces).", (unsigned)cands_.size());
+        Tune(700, 900, 1100);
+        nextReport_ = Clock::now();
+    }
+
+    // Reads every candidate once (a page at a time) and updates it. stabilityOnly: just drop anything that isn't equal to what we saw.
+    bool Refresh(int lab, bool stabilityOnly) {
+        size_t n = cands_.size(), w = 0, i = 0;
+        const size_t W = (size_t)S.width;
+        auto finish = [&](bool okRet) {
+            while (i < n) cands_[w++] = cands_[i++];
+            cands_.resize(w);
+            return okRet;
+        };
+        while (i < n) {
+            if ((i & 0x3FFF) == 0 && Aborted()) return finish(false);
+            const uintptr_t page = cands_[i].addr & ~(uintptr_t)0xFFF;
+            const bool ok = Rd(page, page_.data(), 4096);
+            size_t j = i;
+            while (j < n && (cands_[j].addr & ~(uintptr_t)0xFFF) == page) {
+                Cand c = cands_[j];
+                uint8_t b = kNone;
+                if (ok) {
+                    const uint8_t* p = page_.data() + (c.addr - page);
+                    const uint32_t v = W == 1 ? Ld<1>(p) : W == 2 ? Ld<2>(p) : Ld<4>(p);
+                    b = Clip(v);
+                }
+                bool keep = true;
+                if (stabilityOnly) {
+                    keep = b == c.v[lab];
+                } else {
+                    if (c.v[lab] == kNone) { if (b == kNone) ++c.miss; else { c.v[lab] = b; ++c.hit; } }
+                    else if (b == c.v[lab]) ++c.hit; else ++c.miss;
+                    if (c.hit == 255 || c.miss == 255) { c.hit >>= 1; c.miss >>= 1; }
+                    const int samples = c.hit + c.miss;
+                    if (samples >= S.minSamples && (int)c.miss * 100 > samples * S.missPercent) keep = false;
+                }
+                if (keep) cands_[w++] = c;
+                ++j;
+            }
+            i = j;
+        }
+        return finish(true);
+    }
+
+    void DoTrack() {
+        passLabel_ = label_;
+        const size_t before = cands_.size();
+        if (!Refresh(label_, false)) return;
+        LabStat& st = stat_[label_];
+        st.passes++; ++trackPasses_;
+        const float rough = fRough.load(), tex = fTex.load(), sp = fSpeed.load();
+        st.sumRough += rough; st.sumTex += tex; st.sumSpeed += sp;
+        st.maxRough = std::max(st.maxRough, rough); st.maxTex = std::max(st.maxTex, tex);
+        if (cands_.size() != before) MLog("%s: %u -> %u candidates", S.label[label_].c_str(), (unsigned)before, (unsigned)cands_.size());
+        SetMsg("Tracking on %s: %u candidates after %d samples", S.label[label_].c_str(), (unsigned)cands_.size(), trackPasses_);
+        if (cands_.size() == 0) {
+            phase_ = P_IDLE;
+            MLog("every candidate was eliminated");
+            SetMsg("Every candidate was eliminated. Pick a surface key to start again (the value may need Width=2 or 1, or a higher MaxValue).");
+            Tune(200, 0, 0, 200);
+        }
+    }
+
+
+    // ------------------------------------------------------------ RBR's material table and the force probe
+    bool Wr32(uintptr_t a, uint32_t v) {
+        SIZE_T w = 0;
+        return WriteProcessMemory(GetCurrentProcess(), (LPVOID)a, &v, 4, &w) && w == 4;
+    }
+
+    // world = [anchor], physics = [world+0x24], manager = physics+0x18; an id is valid when bit 0 of its flag byte is set
+    bool ReadAnchor() {
+        anchorOk_ = false; world_ = phys_ = mgr_ = 0; validCount_ = 0;
+        std::memset(valid_, 0, sizeof(valid_));
+        if (!S.useValid && !S.forceProbe) return false;
+        const uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr);
+        const uintptr_t cell = exe + (uintptr_t)((uintptr_t)(unsigned)S.anchorVA - 0x400000u);
+        uintptr_t w = 0, p = 0;
+        if (!Rd(cell, &w, sizeof(w)) || w < 0x10000) { MLog("material table: the anchor at 0x%llX holds no world pointer yet", (unsigned long long)cell); return false; }
+        if (!Rd(w + kPhysOff, &p, sizeof(p)) || p < 0x10000) { MLog("material table: world 0x%llX has no physics pointer", (unsigned long long)w); return false; }
+        const uintptr_t mgr = p + kMgrOff;
+        int cnt = 0;
+        for (int id = 0; id < 256; ++id) {
+            uint8_t fl = 0;
+            if (Rd(mgr + kValidOff + (uintptr_t)id * kMatSize, &fl, 1) && (fl & 1)) { valid_[id] = true; ++cnt; }
+        }
+        world_ = w; phys_ = p; mgr_ = mgr; validCount_ = cnt;
+        anchorOk_ = cnt >= 8;
+        MLog("material table: world 0x%llX physics 0x%llX manager 0x%llX, %d valid ids%s", (unsigned long long)w, (unsigned long long)p,
+             (unsigned long long)mgr, cnt, anchorOk_ ? "" : " (too few: this is probably not the exe the offsets were taken from)");
+        return anchorOk_;
+    }
+
+    // First probe step: every {0, X, X} dword triple in memory (what the override leaves in a tyre contact).
+    bool PassProbe(uint32_t X, int slot) {
+        for (const Region& r : regions_) {
+            size_t done = 0;
+            while (done < r.size) {
+                if (Aborted()) return false;
+                const size_t n = std::min(kChunk, r.size - done);
+                const size_t pre = done > 0 ? 4 : 0, post = (done + n < r.size) ? 4 : 0;
+                const uintptr_t at0 = r.base + done - pre;
+                if (!IsExcluded(at0, pre + n + post) && Rd(at0, chunk_.data(), pre + n + post)) {
+                    const size_t items = (pre + n + post) / 4;
+                    const uint8_t* c = chunk_.data();
+                    for (size_t j = 1; j + 1 < items; ++j) {
+                        uint32_t a, b;
+                        std::memcpy(&a, c + j * 4, 4);
+                        if (a != X) continue;
+                        std::memcpy(&b, c + j * 4 + 4, 4);
+                        if (b != X) continue;
+                        if (S.probeWeightZero) { uint32_t w; std::memcpy(&w, c + j * 4 - 4, 4); if (w != 0) continue; }
+                        const uintptr_t at = at0 + j * 4;
+                        if (at < r.base + done || at >= r.base + done + n) continue;      // belongs to a neighbouring chunk
+                        Cand cd; std::memset(&cd, 0, sizeof(cd));
+                        cd.addr = at; cd.hit = 1;
+                        for (int l = 0; l < kLabels; ++l) cd.v[l] = kNone;
+                        cd.v[slot] = (uint8_t)X;
+                        if (!cands_.push(cd)) { overflow_ = true; return true; }
+                    }
+                }
+                done += n;
+                Sleep(1);
+            }
+        }
+        return true;
+    }
+
+    // Later probe steps: keep only the pairs that now hold the new forced id.
+    bool RefreshExpect(uint32_t X, int slot) {
+        size_t n = cands_.size(), w = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if ((i & 0x3FFF) == 0 && Aborted()) return false;
+            uint32_t pr[2] = {0, 0};
+            if (Rd(cands_[i].addr, pr, 8) && pr[0] == X && pr[1] == X) {
+                Cand c = cands_[i];
+                c.v[slot] = (uint8_t)X; if (c.hit < 255) ++c.hit;
+                cands_[w++] = c;
+            }
+        }
+        cands_.resize(w);
+        return true;
+    }
+
+    void DoProbe() {
+        probeReq_ = false;
+        sticky_ = Clock::now();
+        if (!S.forceProbe) {
+            SetMsg("The probe is off. It writes RBR's FORCE_MATERIAL debug override for about 3 s; set ForceProbe=1 in [MemScan] to allow it.");
+            sticky_ = Clock::now() + std::chrono::seconds(8);
+            return;
+        }
+        if (S.requireTelemetry && !Fresh()) {
+            SetMsg("No telemetry yet: start a stage with the wheel connected, then press Numpad * at the start line.");
+            sticky_ = Clock::now() + std::chrono::seconds(6);
+            return;
+        }
+        if (!chunk_.ok() && !chunk_.Alloc(kChunkBuf)) { SetMsg("Out of memory (scan buffer)"); return; }
+        if (!page_.ok() && !page_.Alloc(4096)) { SetMsg("Out of memory (page buffer)"); return; }
+        if (!cands_.ok() && !cands_.Alloc((size_t)S.maxCands)) { SetMsg("Out of memory (candidate list)"); return; }
+        if (!ReadAnchor()) {
+            SetMsg("Couldn't read RBR's material table. Is a stage loaded, and is this RichardBurnsRally_SSE.exe? See the log.");
+            sticky_ = Clock::now() + std::chrono::seconds(8);
+            Tune(200, 0, 0, 160);
+            return;
+        }
+        uint32_t ids[3] = {0, 0, 0};
+        {   // explicit ProbeIds win, otherwise three valid ids spread over the table
+            std::vector<uint32_t> want;
+            size_t p = 0;
+            while (p < S.probeIds.size() && want.size() < 3) {
+                size_t q = S.probeIds.find(',', p);
+                const uint32_t v = (uint32_t)strtoul(Trim(S.probeIds.substr(p, q == std::string::npos ? std::string::npos : q - p)).c_str(), nullptr, 0);
+                if (v >= 1 && v <= 254) want.push_back(v);
+                if (q == std::string::npos) break;
+                p = q + 1;
+            }
+            if (want.size() == 3) { for (int i = 0; i < 3; ++i) ids[i] = want[(size_t)i]; }
+            else {
+                std::vector<uint32_t> ok;
+                for (uint32_t id = 1; id <= 254; ++id) if (valid_[id]) ok.push_back(id);
+                for (int i = 0; i < 3; ++i) ids[i] = ok.size() >= 3 ? ok[ok.size() * (size_t)(i + 1) / 4] : (uint32_t)(40 + 37 * i);
+            }
+        }
+        uint32_t origFlags = 0, origId = 0;
+        if (!Rd(phys_ + kFlagsOff, &origFlags, 4) || !Rd(phys_ + kForcedOff, &origId, 4)) { SetMsg("Couldn't read the override fields."); return; }
+        if (origFlags & kForceBit) {
+            SetMsg("RBR's FORCE_MATERIAL override is already on (something else set it), so the probe won't touch it.");
+            sticky_ = Clock::now() + std::chrono::seconds(8);
+            return;
+        }
+
+        struct Restore {     // always puts RBR's two dwords back, however the probe ends
+            Scanner* s; uint32_t flags, id;
+            ~Restore() { s->Wr32(s->phys_ + kForcedOff, id); s->Wr32(s->phys_ + kFlagsOff, flags); }
+        } restore{this, origFlags, origId};
+
+        const int slot[3] = {kLabels - 3, kLabels - 2, kLabels - 1};
+        probeDone_ = false; probePairs_ = 0;
+        for (int k = 0; k < 3; ++k) { probeIds_[k] = ids[k]; probeName_[slot[k]].clear(); stat_[slot[k]].used = false; }
+        probing_ = true; passLabel_ = label_;
+        cands_.resize(0); overflow_ = false;
+        MLog("probe: forcing material ids %u, %u, %u (original flags 0x%X, id %u)", ids[0], ids[1], ids[2], origFlags, origId);
+        SetMsg("Probe: forcing material ids %u, %u and %u for about 3 s (restored afterwards)...", ids[0], ids[1], ids[2]);
+        bool ok = true;
+        BuildRegions();
+        for (int k = 0; k < 3 && ok; ++k) {
+            Wr32(phys_ + kForcedOff, ids[k]);
+            Wr32(phys_ + kFlagsOff, origFlags | kForceBit);
+            ok = Wait(S.probeSettleMs);
+            if (ok) ok = k == 0 ? PassProbe(ids[k], slot[k]) : RefreshExpect(ids[k], slot[k]);
+            if (ok) {
+                char nm[32]; snprintf(nm, sizeof(nm), "forced %u", ids[k]);
+                probeName_[slot[k]] = nm; stat_[slot[k]].used = true;
+                MLog("probe step %d (id %u): %u pairs%s", k + 1, ids[k], (unsigned)cands_.size(), overflow_ ? " (list full)" : "");
+            }
+        }
+        // restore right away, before the slower follow-up work
+        Wr32(phys_ + kForcedOff, origId);
+        Wr32(phys_ + kFlagsOff, origFlags);
+        probing_ = false;
+        MLog("probe: override restored");
+        if (!ok) { cands_.resize(0); for (int k = 0; k < 3; ++k) { probeName_[slot[k]].clear(); stat_[slot[k]].used = false; } Fail("The probe"); return; }
+        std::sort(cands_.data(), cands_.data() + cands_.size(), [](const Cand& x, const Cand& y) { return x.addr < y.addr; });
+        probeDone_ = true; probePairs_ = cands_.size();
+        phase_ = P_TRACK; label_ = -1; passLabel_ = -1; snapLabel_ = -1; paused_ = false;
+        snap_.Free();
+        MLog("probe done: %u contact pairs followed the forced ids", (unsigned)cands_.size());
+        SetMsg("Probe done: %u contact pairs followed the forced ids. Writing the full report...", (unsigned)cands_.size());
+        sticky_ = Clock::now() + std::chrono::seconds(8);
+        reportReq_ = true;
+        Tune(700, 900, 1100);
+    }
+
+    void ResetAll(const char* why) {
+        snap_.Free(); cands_.resize(0); regions_.clear();
+        phase_ = P_IDLE; label_ = -1; snapLabel_ = -1; paused_ = false; trackPasses_ = 0;
+        for (LabStat& s : stat_) s = LabStat();
+        for (std::string& n : probeName_) n.clear();
+        probeDone_ = false; probePairs_ = 0;
+        MLog("reset (%s)", why);
+        SetMsg("Reset (%s). Press a surface key (Numpad 1-8) while driving on that surface.", why);
+    }
+
+    // ------------------------------------------------------------ watches
+    bool EvalWatch(const Watch& w, uintptr_t& addr) {
+        if (w.isAbs) addr = w.base;
+        else {
+            HMODULE m = GetModuleHandleA(LowerStr(w.mod) == "exe" ? nullptr : w.mod.c_str());
+            if (!m) return false;
+            addr = (uintptr_t)m + w.base;
+        }
+        for (uintptr_t off : w.chain) {
+            uintptr_t p = 0;
+            if (!Rd(addr, &p, sizeof(p)) || p == 0) return false;
+            addr = p + off;
+        }
+        return true;
+    }
+    void TickWatches() {
+        std::string line;
+        for (size_t k = 0; k < watches_.size(); ++k) {
+            Watch& w = watches_[k];
+            uintptr_t a = 0;
+            uint32_t now[8] = {};
+            bool ok = EvalWatch(w, a);
+            for (int i = 0; ok && i < w.count; ++i) {
+                uint32_t v = 0;
+                if (!Rd(a + (uintptr_t)i * w.stride, &v, (size_t)S.width)) ok = false;
+                if (S.width == 1) v &= 0xFF; else if (S.width == 2) v &= 0xFFFF;
+                now[i] = v;
+            }
+            char b[160]; int p = snprintf(b, sizeof(b), "w%u:", (unsigned)(k + 1));
+            if (!ok) p += snprintf(b + p, sizeof(b) - p, " n/a");
+            else for (int i = 0; i < w.count; ++i) p += snprintf(b + p, sizeof(b) - p, " %u", (unsigned)now[i]);
+            line += b; line += "  ";
+            if (ok && (!w.haveLast || std::memcmp(now, w.last, sizeof(now)) != 0)) {
+                MLog("watch %u at 0x%llX ->%s  (label %s, speed %.1f m/s)", (unsigned)(k + 1), (unsigned long long)a,
+                     b + 3, label_ >= 0 ? S.label[label_].c_str() : "none", fSpeed.load());
+                std::memcpy(w.last, now, sizeof(now)); w.haveLast = true;
+            }
+        }
+        std::lock_guard<std::mutex> lk(sm_);
+        s2_ = line;
+    }
+
+    // ------------------------------------------------------------ report
+    static uint64_t KeyOf(const Cand& c) { uint64_t k; std::memcpy(&k, c.v, 8); return k; }
+
+    std::string Vals(const Cand& c) const {
+        std::string s;
+        for (int l = 0; l < kLabels; ++l) {
+            if (!stat_[l].used) continue;
+            char b[64];
+            if (c.v[l] == kNone) snprintf(b, sizeof(b), "%s=- ", LabName(l).c_str());
+            else snprintf(b, sizeof(b), "%s=%u ", LabName(l).c_str(), (unsigned)c.v[l]);
+            s += b;
+        }
+        return s;
+    }
+    static int Distinct(const Cand& c, int& setCount) {
+        bool seen[256] = {};
+        int d = 0; setCount = 0;
+        for (int l = 0; l < kLabels; ++l) if (c.v[l] != kNone) { ++setCount; if (!seen[c.v[l]]) { seen[c.v[l]] = true; ++d; } }
+        return d;
+    }
+    static long Score(const Cand& c) { int sc; return Distinct(c, sc) * 1000L + (long)c.hit - (long)c.miss * 10L; }
+
+    struct Quad { uintptr_t base, stride; int distinct; int minHit; int maxMiss; size_t idx; };
+    struct Holder { uintptr_t at, value; size_t quad; bool inMod; };
+
+    static bool HasAt(const std::vector<const Cand*>& e, uintptr_t addr, uint64_t key) {
+        size_t lo = 0, hi = e.size();
+        while (lo < hi) { size_t m = (lo + hi) / 2; if (e[m]->addr < addr) lo = m + 1; else hi = m; }
+        return lo < e.size() && e[lo]->addr == addr && KeyOf(*e[lo]) == key;
+    }
+
+    void FindQuads(const std::vector<const Cand*>& e, std::vector<Quad>& out) {
+        const uintptr_t maxStride = 0x2000;
+        uint64_t pairs = 0;
+        for (size_t i = 0; i < e.size() && pairs < 60000000ull; ++i) {
+            const uint64_t ki = KeyOf(*e[i]);
+            for (size_t j = i + 1; j < e.size(); ++j) {
+                const uintptr_t d = e[j]->addr - e[i]->addr;
+                if (d > maxStride) break;
+                ++pairs;
+                if (KeyOf(*e[j]) != ki) continue;
+                if (!HasAt(e, e[i]->addr + 2 * d, ki) || !HasAt(e, e[i]->addr + 3 * d, ki)) continue;
+                bool dup = false;
+                for (Quad& q : out) if (q.base == e[i]->addr) { dup = true; if (d < q.stride) q.stride = d; break; }
+                if (dup) continue;
+                Quad q; q.base = e[i]->addr; q.stride = d; q.idx = i;
+                int sc; q.distinct = Distinct(*e[i], sc);
+                q.minHit = 255; q.maxMiss = 0;
+                for (int k = 0; k < 4; ++k) {
+                    const Cand* c = e[i];
+                    const uintptr_t at = e[i]->addr + (uintptr_t)k * d;
+                    size_t lo = 0, hi = e.size();
+                    while (lo < hi) { size_t m = (lo + hi) / 2; if (e[m]->addr < at) lo = m + 1; else hi = m; }
+                    if (lo < e.size()) c = e[lo];
+                    q.minHit = std::min<int>(q.minHit, c->hit); q.maxMiss = std::max<int>(q.maxMiss, c->miss);
+                }
+                out.push_back(q);
+                if (out.size() >= 400) return;
+            }
+        }
+    }
+
+    // Looks through all writable memory for pointers that land within 0x4000 bytes before each quad. A pointer held in a
+    // program image is static: it survives restarts, so "module+offset, then +delta" is the stable way to the tyre data.
+    void FindHolders(const std::vector<Quad>& quads, size_t nQuads, const std::vector<Mod>& mods, std::vector<Holder>& out) {
+        std::vector<Region> img, prv;
+        Enum(img, prv);
+        img.insert(img.end(), prv.begin(), prv.end());
+        const uintptr_t span = 0x4000;
+        const size_t PW = sizeof(uintptr_t);
+        for (const Region& r : img) {
+            size_t done = 0;
+            while (done < r.size) {
+                if (!run_ || out.size() > 6000) return;
+                const size_t n = std::min(kChunk, r.size - done);
+                if (!IsExcluded(r.base + done, n) && Rd(r.base + done, chunk_.data(), n)) {
+                    for (size_t i = 0; i + PW <= n; i += PW) {
+                        uintptr_t v; std::memcpy(&v, chunk_.data() + i, PW);
+                        if (v < 0x10000) continue;
+                        for (size_t q = 0; q < nQuads; ++q) {
+                            if (v <= quads[q].base && quads[q].base - v <= span) {
+                                const uintptr_t at = r.base + done + i;
+                                out.push_back(Holder{at, v, q, InModule(mods, at)});
+                                break;
+                            }
+                        }
+                    }
+                }
+                done += n;
+                Sleep(1);
+            }
+        }
+    }
+
+    void WriteReport(bool pointers) {
+        // The automatic report keeps being refreshed; the full one (with the pointer search) gets its own file so it isn't overwritten.
+        FILE* f = fopen((g_mdir + (pointers ? "ForceFX_memscan_full.txt" : "ForceFX_memscan.txt")).c_str(), "w");
+        if (!f) return;
+        const std::vector<Mod> mods = Modules();
+        fprintf(f, "ForceFX memory scan report   (width %d, values 0..%d)\n", S.width, S.maxValue);
+        fprintf(f, "Candidates: %u   (state: %s)\n\n", (unsigned)cands_.size(),
+                phase_ == P_TRACK ? "tracking" : phase_ == P_WAIT_DIFF ? "snapshot taken, waiting for a second surface" : "idle");
+        if (anchorOk_) {
+            fprintf(f, "RBR material table: world 0x%llX, physics 0x%llX, manager 0x%llX (material i at manager+0xC+i*0x160), %d valid ids:\n  ",
+                    (unsigned long long)world_, (unsigned long long)phys_, (unsigned long long)mgr_, validCount_);
+            for (int id = 0; id < 256; ++id) if (valid_[id]) fprintf(f, "%d ", id);
+            fprintf(f, "\n  %s\n\n", S.useValid ? "Only valid ids are accepted as candidates." : "UseValid=0: ids are not checked against this table.");
+        } else fprintf(f, "RBR material table: not read (no stage loaded yet, a different exe, or UseValid/ForceProbe are off), candidates are not validated.\n\n");
+        if (probeDone_)
+            fprintf(f, "Probe: forced ids %u, %u, %u; %u contact pairs {0, id, id} followed them. These are the tyre contact structures (material A at the\n"
+                       "listed address, material B right after it, the blend weight in the float before it).\n\n", probeIds_[0], probeIds_[1], probeIds_[2], (unsigned)probePairs_);
+        fprintf(f, "Surfaces used (telemetry averages while sampling, to help tell them apart from the signal side):\n");
+        for (int l = 0; l < kLabels; ++l) {
+            if (!stat_[l].used) continue;
+            const LabStat& s = stat_[l]; const int n = std::max(1, s.passes);
+            if (!probeName_[l].empty()) { fprintf(f, "  %d %-8s (forced by the probe)\n", l + 1, probeName_[l].c_str()); continue; }
+            fprintf(f, "  %d %-8s samples %-4d  roughness avg %.3f max %.3f   texture avg %.3f max %.3f   speed avg %.1f m/s\n",
+                    l + 1, S.label[l].c_str(), s.passes, s.sumRough / n, s.maxRough, s.sumTex / n, s.maxTex, s.sumSpeed / n);
+        }
+        fprintf(f, "\n");
+
+        std::vector<const Cand*> e;               // address order, those that already separate at least two surfaces
+        for (size_t i = 0; i < cands_.size(); ++i) {
+            int sc; if (Distinct(cands_[i], sc) >= 2) e.push_back(&cands_[i]);
+        }
+        std::vector<Quad> quads;
+        FindQuads(e, quads);
+        std::sort(quads.begin(), quads.end(), [&](const Quad& a, const Quad& b) {
+            if (a.distinct != b.distinct) return a.distinct > b.distinct;
+            if (a.minHit != b.minHit) return a.minHit > b.minHit;
+            return a.maxMiss < b.maxMiss;
+        });
+        fprintf(f, "== Wheel sets: four equal values at a fixed stride (best first) ==\n");
+        if (quads.empty()) fprintf(f, "  none yet (visit more surfaces, or the four tyres aren't stored at an even stride)\n");
+        for (size_t i = 0; i < quads.size() && i < 40; ++i) {
+            const Quad& q = quads[i];
+            fprintf(f, "  %s  stride 0x%llX  %s hit>=%d miss<=%d\n", Describe(mods, q.base).c_str(), (unsigned long long)q.stride,
+                    Vals(*e[q.idx]).c_str(), q.minHit, q.maxMiss);
+        }
+
+        if (probeDone_) {
+            fprintf(f, "\n== Contact pairs found by the probe, in address order (gap to the previous one in brackets) ==\n");
+            uintptr_t prev = 0;
+            for (size_t i = 0; i < cands_.size() && i < 160; ++i) {
+                fprintf(f, "  %-34s", Describe(mods, cands_[i].addr).c_str());
+                if (prev) fprintf(f, " [+0x%llX]", (unsigned long long)(cands_[i].addr - prev));
+                fprintf(f, "\n");
+                prev = cands_[i].addr;
+            }
+            if (cands_.size() > 160) fprintf(f, "  ... %u more\n", (unsigned)(cands_.size() - 160));
+        }
+        std::vector<const Cand*> best;
+        for (const Cand* c : e) best.push_back(c);
+        std::sort(best.begin(), best.end(), [](const Cand* a, const Cand* b) { return Score(*a) > Score(*b); });
+        fprintf(f, "\n== Best single addresses ==\n");
+        for (size_t i = 0; i < best.size() && i < 80; ++i)
+            fprintf(f, "  %-34s %s hit %d miss %d\n", Describe(mods, best[i]->addr).c_str(), Vals(*best[i]).c_str(), best[i]->hit, best[i]->miss);
+
+        if (pointers && !quads.empty()) {
+            const size_t nq = std::min<size_t>(quads.size(), 6);
+            std::vector<Holder> hs;
+            SetMsg("Searching for pointers to the best wheel sets...");
+            FindHolders(quads, nq, mods, hs);
+            fprintf(f, "\n== Pointers into the structures that hold the best wheel sets ==\n");
+            fprintf(f, "  Read it as: the value stored at HOLDER points DELTA bytes before the wheel set. A holder inside a program\n"
+                       "  image never moves, so  Watch=<holder>>DELTA*4@STRIDE  in [MemScan] follows it from run to run.\n");
+            for (size_t q = 0; q < nq; ++q) {
+                fprintf(f, "\n  wheel set %s (stride 0x%llX, %s)\n", Describe(mods, quads[q].base).c_str(), (unsigned long long)quads[q].stride, Vals(*e[quads[q].idx]).c_str());
+                std::vector<Holder> mine;
+                for (const Holder& h : hs) if (h.quad == q) mine.push_back(h);
+                std::sort(mine.begin(), mine.end(), [&](const Holder& a, const Holder& b) {
+                    if (a.inMod != b.inMod) return a.inMod;
+                    return (quads[q].base - a.value) < (quads[q].base - b.value);
+                });
+                if (mine.empty()) fprintf(f, "    no pointers found\n");
+                for (size_t i = 0; i < mine.size() && i < 16; ++i) {
+                    const uintptr_t delta = quads[q].base - mine[i].value;
+                    fprintf(f, "    %-34s -> +0x%llX    Watch=%s>0x%llX*4@0x%llX%s\n", Describe(mods, mine[i].at).c_str(), (unsigned long long)delta,
+                            WatchTok(mods, mine[i].at).c_str(), (unsigned long long)delta, (unsigned long long)quads[q].stride,
+                            mine[i].inMod ? "" : "   (heap: moves between runs)");
+                }
+            }
+        }
+        fclose(f);
+    }
+
+    // ------------------------------------------------------------ thread
+    void Loop() {
+        try { LoopImpl(); }
+        catch (...) { MLog("the scanner thread hit an exception and stopped"); }
+    }
+
+    std::string WhyNot() {
+        if (label_ < 0) return "Press a surface key (Numpad 1-8) while driving on that surface.";
+        if (paused_) return "Paused. Press a surface key to continue.";
+        const int64_t settle = (int64_t)S.settleMs - std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - labelSince_).count();
+        if (!Fresh() && S.requireTelemetry) return "No telemetry yet: connect the wheel in the ForceFX menu first (or set RequireTelemetry=0).";
+        if (Fresh() && fSpeed.load() < S.minSpeed) return "Too slow: sampling starts above the minimum speed.";
+        if (Fresh() && fAir.load() >= 0.3f) return "Wheels are off the ground; waiting for the landing.";
+        if (settle > 0) return "Settling on the new surface...";
+        return std::string();
+    }
+
+    void LoopImpl() {
+        // the scanner's own stack and the plugin's image are never scanned
+        typedef BOOL (WINAPI *LimitsFn)(PULONG_PTR, PULONG_PTR);
+        LimitsFn fn = (LimitsFn)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetCurrentThreadStackLimits");
+        ULONG_PTR slo = 0, shi = 0;
+        if (fn) { fn(&slo, &shi); if (shi > slo) ExAdd((const void*)slo, (size_t)(shi - slo)); }
+        {
+            HMODULE self = nullptr;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&pluginDirectory, &self);
+            if (self) {
+                uintptr_t a = (uintptr_t)self, lo = a, hi = a;
+                for (;;) {
+                    MEMORY_BASIC_INFORMATION m;
+                    if (VirtualQuery((LPCVOID)a, &m, sizeof(m)) != sizeof(m) || (uintptr_t)m.AllocationBase != lo) break;
+                    a = (uintptr_t)m.BaseAddress + m.RegionSize; hi = a;
+                }
+                if (hi > lo) ExAdd((const void*)lo, (size_t)(hi - lo));
+            }
+        }
+        if (!chunk_.Alloc(kChunkBuf) || !page_.Alloc(4096)) { MLog("couldn't allocate the scan buffers"); return; }
+        { std::lock_guard<std::mutex> lk(sm_); s0_ = "MEMSCAN ready"; s1_ = "Press a surface key (Numpad 1-8) while driving on that surface."; }
+
+        while (run_) {
+            Sleep(25);
+            const auto now = Clock::now();
+            PollKeys();
+            if (stage.exchange(false)) ResetAll("a stage started");
+            if (resetReq_) { resetReq_ = false; ResetAll("Numpad 0"); Tune(250, 250); }
+            if (probeReq_) DoProbe();
+            if (now >= nextWatch_) { nextWatch_ = now + std::chrono::milliseconds(100); TickWatches(); }
+
+            const std::string why = WhyNot();
+            if (why.empty() && now >= nextTry_) {
+                if (phase_ == P_IDLE) DoSnapshot();
+                else if (phase_ == P_WAIT_DIFF) { if (label_ != snapLabel_) DoDiff(); }
+                else if (phase_ == P_TRACK && now >= nextTrack_) {
+                    nextTrack_ = now + std::chrono::milliseconds((int)(1000.0f / S.trackHz));
+                    DoTrack();
+                }
+            } else if (!why.empty() && phase_ != P_TRACK) {
+                SetMsg("%s", why.c_str());
+            } else if (!why.empty()) {
+                SetMsg("Tracking is waiting: %s", why.c_str());
+            }
+            if (phase_ == P_WAIT_DIFF && why.empty() && label_ == snapLabel_)
+                SetMsg("Snapshot is ready on %s. Drive onto a different surface and press its key.", S.label[snapLabel_].c_str());
+
+            { char b[200];
+              snprintf(b, sizeof(b), "MEMSCAN %s | label %s | %u candidates",
+                       phase_ == P_TRACK ? "tracking" : phase_ == P_WAIT_DIFF ? "snapshot ready" : "idle",
+                       label_ >= 0 ? S.label[label_].c_str() : "none", (unsigned)cands_.size());
+              std::lock_guard<std::mutex> lk(sm_); s0_ = b; }
+
+            if (reportReq_) {
+                reportReq_ = false;
+                sticky_ = Clock::now();
+                SetMsg("Writing the full report (this includes the pointer search)...");
+                WriteReport(true);
+                sticky_ = Clock::now();
+                SetMsg("Full report written to ForceFX_memscan_full.txt");
+                sticky_ = Clock::now() + std::chrono::seconds(6);
+                MLog("full report written");
+                Tune(900, 700);
+                nextReport_ = Clock::now() + std::chrono::seconds(S.reportSec);
+            } else if (phase_ == P_TRACK && now >= nextReport_) {
+                nextReport_ = now + std::chrono::seconds(S.reportSec);
+                WriteReport(false);
+            }
+        }
+        if (phase_ == P_TRACK && cands_.size()) WriteReport(false);
+        snap_.Free(); cands_.Free(); chunk_.Free(); page_.Free();
+        if (fn && shi > slo) ExRemove((const void*)slo);
+    }
+};
+
+Scanner* g_scan = nullptr;
+
+void Start(const std::string& dir, const std::string& ini) {
+    if (g_scan) return;
+    g_scan = new Scanner();
+    g_scan->Begin(dir, ini);
+}
+void Stop() {
+    if (!g_scan) return;
+    g_scan->End();
+    delete g_scan;
+    g_scan = nullptr;
+}
+void Feed(float speed, float airborne, float rough, float texture) {
+    if (!g_scan) return;
+    g_scan->fSpeed = speed; g_scan->fAir = airborne; g_scan->fRough = rough; g_scan->fTex = texture;
+    g_scan->fLast = NowMs();
+}
+void OnStage() { if (g_scan) g_scan->stage = true; }
+std::string Status(int k) { return g_scan ? g_scan->Status(k) : std::string(); }
+
+} // namespace MemScan
+
 struct DeviceInfo { GUID guid; char name[MAX_PATH]; };
 
 class ForceFXPlugin : public IPlugin {
@@ -1972,6 +3158,7 @@ private:
             m_dTex = sig.texture; m_dRough = sig.rough; m_dBump = sig.bump;
             m_dDive = sig.dive; m_dLock = sig.lock;
             m_dStat = sig.staticLoad; m_dLoadL = sig.loadL; m_dLoadR = sig.loadR; m_dAir = sig.airborne;
+            if (!m_test) MemScan::Feed(sig.speed, sig.airborne, sig.rough, sig.texture);   // MEMSCAN
 
             PollHotkeys(now, base);
             const bool testNow = m_test.load();
@@ -2242,6 +3429,10 @@ private:
                  (long long)PacketTap::g_calls.load(), (long long)PacketTap::g_taken.load(),
                  (long long)PacketTap::g_otherDest.load(), (long long)PacketTap::g_dropped.load());
         line(buf);
+        for (int k = 0; k < 3; ++k) {                                   // MEMSCAN
+            const std::string ms = MemScan::Status(k);
+            if (!ms.empty()) DrawWrapped(ms.c_str(), 70.0f, y, 90);
+        }
         line("Raw packet floats:");
         for (int row = 0; row < 12; ++row) {
             int base = m_tableBase + row * 16;
@@ -2270,6 +3461,7 @@ public:
         if (!exists) SyncConfig(m_cfg, m_iniPath, true);     // first run: write an ini with every key and its default
         SyncConfig(m_cfg, m_iniPath, false);
         m_userGain = m_cfg.userGain;
+        MemScan::Start(g_dir, m_iniPath);     // MEMSCAN (temporary, branch "memory")
 
         if (m_cfg.telemetrySource != 2) {
             const bool ok = PacketTap::Install(m_cfg.minPacket);
@@ -2293,6 +3485,7 @@ public:
     }
 
     ~ForceFXPlugin() {
+        MemScan::Stop();                   // MEMSCAN
         Disconnect();
         GameDeviceTap::I().Remove();       // put the original vtable entries back before our DLL goes away
         if (!PacketTap::Remove()) {
@@ -2442,7 +3635,7 @@ public:
     }
 
     void TickFrontEndPage(float) override {}
-    void StageStarted(int, const char*, bool) override { m_stageReset = true; m_carRescan = true; }
+    void StageStarted(int, const char*, bool) override { m_stageReset = true; m_carRescan = true; MemScan::OnStage(); }   // MEMSCAN
     void HandleResults(float, float, float, const char*) override {}
     void CheckPoint(float, int, const char*) override {}
 };
