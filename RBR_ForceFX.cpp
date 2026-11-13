@@ -55,7 +55,7 @@
 //   more heavily loaded side transmits more), the compression thump, a quiet engine and road when airborne, and
 //   the braking judder.
 //
-// Branch "memory": a temporary memory scanner (see the MemScan block) that hunts for the surface type under each tyre.
+// Branch "memory": a temporary memory scanner (see the MemScan block) that reads the surface id under each tyre.
 //   Everything it adds is marked MEMSCAN or sits inside namespace MemScan, so it can be deleted in one go.
 //
 // Files next to the DLL: ForceFX.ini (settings, written with defaults on first run), ForceFXCars.ini (car
@@ -1631,23 +1631,25 @@ struct Synth {
 // feel. This whole block is throwaway. Once the addresses are known, delete it, the lines marked MEMSCAN further
 // down, and the [MemScan] section of ForceFX.ini.
 //
-// How it finds the value
-//   RBR stores a surface id (a small integer) for every tyre. We can't know where, so the scanner learns it from you,
-//   the same way a Cheat Engine search does. You drive, and tell it which surface you are on with a key:
-//     Numpad 1..8   "I'm fully on surface N now" (names come from Label1..Label8 in [MemScan], default Tarmac, Gravel,
-//                   Snow, Ice, Dirt, Sand, Mud, Other)
-//     Numpad 9      pause sampling. Press it as you LEAVE a surface and the new surface's key once all four wheels
-//                   are on it; a key pressed late counts the new surface's value against the old label
-//     Numpad .      write the full report now, including the search for pointers to the best candidates
-//     Numpad 0      throw everything away and start over
-//   1. First label press: after a moment on that surface the scanner snapshots every small number in RBR's writable
-//      memory, reads it again 0.7 s later, and throws away everything that moved (timers, positions, counters).
-//   2. Second, different label press: the same read happens on the new surface. Only numbers that held still on both
-//      surfaces and differ between them survive. That is usually a few thousand candidates out of tens of millions.
-//   3. From then on every label press just samples the survivors a few times a second. A candidate must keep the
-//      same value for the same surface. Visit more surfaces and revisit old ones: wrong candidates drop out.
-//   4. Candidates are grouped into wheel sets (four equal values at a fixed stride, as an array of four tyres would
-//      look). The report lists those first, then the best single addresses, then which static pointers lead to them.
+// How it finds the value (v4: find the tyre objects, read the ids)
+//   The game's own code (found by disassembling RichardBurnsRally_SSE.exe) gave the exact layout, so nothing has to be
+//   guessed any more:
+//     * every tyre is an object of one class whose first dword is the vtable pointer 0x74288C (a fixed address, the exe
+//       has no ASLR). Scanning memory for that one value finds all tyre objects.
+//     * each tyre object holds three surface-contact records (three probe points across the tread) at tyre+0xC20,
+//       +0xC90 and +0xD00. In a record: +0x00 contact flag, +0x34 blend weight (float), +0x38 material A, +0x3C material B.
+//     * a material id is below 256; the manager that owns the materials sits behind [0x1659B70] (see below).
+//   The scanner finds the tyres (Numpad * or automatically a few seconds after a stage starts), then reads the records
+//   about 20 times a second and logs every id change together with speed and roughness. ForceFX_surfaces.txt lists every
+//   id that was seen, how often, and the average roughness/texture/speed while it was under the tyres. That is the table
+//   needed to give each surface its own feel. Pressing a surface key (Numpad 1..8, names from Label1..8) while driving
+//   only annotates the log and the table with what you say you're on; it is not needed to find anything.
+//
+//   The old drive-and-label search (Numpad 1..8 with snapshots) is still there behind Passive=1, but it assumed the
+//   id stays constant on a surface, which is false in a real stage, so it is off by default.
+//
+//   Keys:  Numpad *  find the tyre objects now     Numpad .  write both reports now     Numpad 0  forget everything
+//          Numpad 1..8  tell the log what surface you are on    Numpad 9  clear that annotation
 //
 //   What the game's own code tells us (RichardBurnsRally_SSE.exe, found by disassembly):
 //     * a surface is a material id below 256. Each tyre contact keeps {blend weight (float), material A, material B} and
@@ -1662,7 +1664,7 @@ struct Synth {
 //     * Read-only structure hint: the tyre contact is {float weight in 0..1, material A, material B} (three dwords in a
 //       row). PairFilter=1 only accepts addresses that look like that on the first snapshot.
 //
-//   Sampling only happens while the car is moving and all wheels are loaded (telemetry speed and airborne), so the
+//   Passive mode only (Passive=1): sampling only happens while the car is moving and all wheels are loaded (telemetry speed and airborne), so the
 //   ForceFX wheel connection has to be up, or set RequireTelemetry=0 in [MemScan]. Don't restart the stage in the
 //   middle of a scan: heap addresses move and the candidates are cleared on every stage start. NumLock must be on.
 //   Beeps confirm what happened: rising pitch = label set, two tones = snapshot taken, three tones = diff done,
@@ -1704,6 +1706,15 @@ struct Settings {
     int   beep = 1;
     int   useValid = 1;                    // only accept values that are valid material ids (needs the anchor below)
     int   anchorVA = 0x1659B70;            // RichardBurnsRally_SSE.exe: pointer to the physics world
+    int   passive = 0;                     // 1 = the old drive-and-label search (Numpad 1..8 snapshots); off by default
+    int   tyreScan = 1;                    // find the tyre objects by their vtable and read the surface ids from them
+    int   autoTyres = 1;                   // look for the tyres by itself a few seconds after a stage starts
+    int   tyreHz = 20;                     // how often the tyre records are read
+    int   tyreVtable = 0x74288C;           // RichardBurnsRally_SSE.exe: vtable of the tyre class
+    int   recOff = 0xC20, recStride = 0x70, recCount = 3;   // contact records inside a tyre object
+    int   recFlag = 0x00, recWeight = 0x34, recMatA = 0x38, recMatB = 0x3C;
+    int   keyTyres = 0x6A;                 // Numpad *
+    int   logLines = 4000;                 // stop writing id changes to the log after this many lines
     int   pairFilter = 1;                  // first snapshot only keeps {float 0..1, valid id, valid id} dword triples (width 4 only)
     std::string label[kLabels] = {"Tarmac", "Gravel", "Snow", "Ice", "Dirt", "Sand", "Mud", "Other"};
     std::string watch[8];
@@ -1760,6 +1771,30 @@ public:
     bool   push(const T& v) { if (n_ >= cap_) return false; p_[n_++] = v; return true; }
     T&     operator[](size_t i) { return p_[i]; }
 };
+
+// Names of the ids we could verify against the exe's material table (ids 1..65 line up exactly; above that the order
+// of the table and the ids drift apart, so those are shown as unknown). Dry/damp/wet is the low two bits (1/2/3).
+const char* FamilyName(int id) {
+    struct F { int lo, hi; const char* n; };
+    static const F t[] = {
+        {1, 3, "Gravel_Fine_Deeper"}, {5, 7, "Gravel_Medium_Deeper"}, {9, 11, "Gravel_Fine_Deep"}, {13, 15, "Gravel_Medium_Deep"},
+        {17, 19, "Gravel_Fine_Shallow"}, {21, 23, "Gravel_Medium_Shallow"}, {24, 24, "Spret_Bush_Small"}, {25, 25, "Spret_Bush_Medium"},
+        {26, 26, "Spret_Bush_Large"}, {27, 27, "Lov_Bush_Small"}, {28, 28, "Lov_Bush_Medium"}, {29, 29, "Lov_Bush_Large"},
+        {30, 30, "Tree_Small"}, {31, 31, "Tree_Medium"}, {32, 32, "Tree_Large"}, {33, 35, "Gravel_Coarse_Deeper"},
+        {37, 39, "Tarmac_Fine_Clean"}, {41, 43, "Gravel_Coarse_Deep"}, {45, 47, "Tarmac_Fine_Sprinkled"}, {49, 51, "Gravel_Coarse_Shallow"},
+        {53, 55, "Tarmac_Fine_Covered"}, {56, 56, "Rock_Small"}, {57, 57, "Rock_Medium"}, {58, 58, "Rock_Large"}, {59, 59, "Trunk_Small"},
+        {60, 60, "Trunk_Medium"}, {61, 61, "Trunk_Large"}, {62, 62, "Snowwall"}, {63, 63, "Metal_Pole"}, {65, 65, "Metal_Barrier"}};
+    for (const F& f : t) if (id >= f.lo && id <= f.hi) return f.n;
+    return nullptr;
+}
+std::string IdName(int id) {
+    const char* n = FamilyName(id);
+    if (!n) return id == 0 ? "default" : "(unverified)";
+    char b[96];
+    if (id <= 55 && (id & 3)) snprintf(b, sizeof(b), "%s_%s", n, (id & 3) == 1 ? "Dry" : (id & 3) == 2 ? "Damp" : "Wet");
+    else snprintf(b, sizeof(b), "%s", n);
+    return b;
+}
 
 // ---------------------------------------------------------------- small helpers
 bool Rd(uintptr_t a, void* d, size_t n) {            // safe even on unmapped memory: it just fails
@@ -1904,6 +1939,21 @@ private:
     bool anchorOk_ = false; uintptr_t world_ = 0, phys_ = 0, mgr_ = 0; bool valid_[256] = {}; int validCount_ = 0;
     const std::string& LabName(int l) const { return S.label[l]; }
 
+    // tyre objects found by their vtable, and what they hold
+    struct Rec { uint32_t flag = 0; float w = 0; uint32_t a = 0, b = 0; float depth = 0; };
+    struct Tyre {
+        uintptr_t base = 0; uint32_t car = 0; std::vector<Rec> rec, last; bool haveLast = false; bool dead = false;
+        uint32_t samples = 0, changes = 0, contact = 0, blkChanges = 0;
+        std::vector<uint8_t> blk;                         // last raw read: a live tyre keeps changing, a stale copy never does
+    };
+    struct IdStat { uint32_t n = 0, asA = 0, asB = 0; double rough = 0, tex = 0, speed = 0; uint32_t tyreMask = 0; uint32_t byLabel[kLabels] = {}; };
+    std::vector<Tyre> tyres_;
+    IdStat ids_[256];
+    bool tyreReq_ = false;
+    uint32_t tyreScans_ = 0, tyreLogged_ = 0;
+    Clock::time_point nextTyre_ = Clock::now(), tyreFindAt_ = Clock::now(), nextSurf_ = Clock::now();
+    int tyreRetry_ = 0;
+
     // ------------------------------------------------------------ settings
     void Load() {
         const char* K = "MemScan";
@@ -1929,6 +1979,10 @@ private:
         I("ReportSeconds", S.reportSec); I("KeyLabel1", S.keyLabel1, true); I("KeyPause", S.keyPause, true);
         I("KeyReport", S.keyReport, true); I("KeyReset", S.keyReset, true); I("Beep", S.beep);
         I("UseValid", S.useValid); I("AnchorVA", S.anchorVA, true); I("PairFilter", S.pairFilter);
+        I("Passive", S.passive); I("TyreScan", S.tyreScan); I("AutoTyres", S.autoTyres); I("TyreHz", S.tyreHz);
+        I("TyreVtable", S.tyreVtable, true); I("RecOff", S.recOff, true); I("RecStride", S.recStride, true); I("RecCount", S.recCount);
+        I("RecFlag", S.recFlag, true); I("RecWeight", S.recWeight, true); I("RecMatA", S.recMatA, true); I("RecMatB", S.recMatB, true);
+        I("KeyTyres", S.keyTyres, true); I("LogLines", S.logLines);
         for (int i = 0; i < kLabels; ++i) { char k[16]; snprintf(k, sizeof(k), "Label%d", i + 1); T(k, S.label[i]); }
         for (int i = 0; i < 8; ++i) { char k[16]; snprintf(k, sizeof(k), "Watch%d", i + 1); T(k, S.watch[i]); }
 
@@ -1942,6 +1996,7 @@ private:
         S.maxCands = std::max(10000, std::min(S.maxCands, 8000000));
         S.missPercent = std::max(0, std::min(S.missPercent, 90)); S.minSamples = std::max(2, S.minSamples);
         S.reportSec = std::max(2, S.reportSec);
+        S.tyreHz = std::max(1, std::min(S.tyreHz, 100)); S.recCount = std::max(1, std::min(S.recCount, 6));
         for (int i = 0; i < 8; ++i) {
             Watch w; w.text = S.watch[i];
             ParseWatch(w);
@@ -2011,7 +2066,10 @@ private:
             keyPrev_[i] = d;
         }
         const bool p = Key(S.keyPause), r = Key(S.keyReport), z = Key(S.keyReset);
-        if (p && !keyPrev_[kLabels]) { paused_ = true; Tune(300, 0, 0, 45); MLog("paused"); }
+        if (p && !keyPrev_[kLabels]) { paused_ = true; if (!S.passive) label_ = -1; Tune(300, 0, 0, 45); MLog(S.passive ? "paused" : "label cleared"); }
+        const bool ty = Key(S.keyTyres);
+        if (ty && !keyPrev_[kLabels + 3]) tyreReq_ = true;
+        keyPrev_[kLabels + 3] = ty;
         if (r && !keyPrev_[kLabels + 1]) reportReq_ = true;
         if (z && !keyPrev_[kLabels + 2]) resetReq_ = true;
         keyPrev_[kLabels] = p; keyPrev_[kLabels + 1] = r; keyPrev_[kLabels + 2] = z;
@@ -2306,12 +2364,15 @@ private:
         return anchorOk_;
     }
 
-    void ResetAll(const char* why) {
+    void ResetAll(const char* why, bool full = true) {
         snap_.Free(); cands_.resize(0); regions_.clear();
         phase_ = P_IDLE; label_ = -1; snapLabel_ = -1; paused_ = false; trackPasses_ = 0;
         for (LabStat& s : stat_) s = LabStat();
+        tyres_.clear(); tyreRetry_ = 0;
+        tyreFindAt_ = Clock::now() + std::chrono::seconds(full ? 1 : 4);
+        if (full) { for (IdStat& st : ids_) st = IdStat(); tyreScans_ = 0; tyreLogged_ = 0; }
         MLog("reset (%s)", why);
-        SetMsg("Reset (%s). Press a surface key (Numpad 1-8) while driving on that surface.", why);
+        SetMsg("Reset (%s).", why);
     }
 
     // ------------------------------------------------------------ watches
@@ -2527,6 +2588,154 @@ private:
         fclose(f);
     }
 
+
+    // ------------------------------------------------------------ tyre objects (the direct way)
+    uint32_t vt_ = 0;
+
+    bool ReadTyre(Tyre& t) {
+        uint32_t v = 0;
+        if (!Rd(t.base, &v, 4) || v != vt_) return false;               // freed or reused: it no longer starts with the tyre vtable
+        const size_t mx = (size_t)std::max(std::max(S.recFlag, S.recWeight), std::max(S.recMatA, S.recMatB));
+        const size_t need = (size_t)S.recStride * (size_t)(S.recCount - 1) + std::max<size_t>(mx + 4, 0x44);
+        uint8_t blk[1024];
+        if (need > sizeof(blk) || !Rd(t.base + (uintptr_t)S.recOff, blk, need)) return false;
+        if (!t.blk.empty() && t.blk.size() == need && std::memcmp(t.blk.data(), blk, need) != 0) ++t.blkChanges;
+        t.blk.assign(blk, blk + need);
+        t.rec.resize((size_t)S.recCount);
+        for (int k = 0; k < S.recCount; ++k) {
+            const uint8_t* r = blk + (size_t)k * (size_t)S.recStride;
+            Rec& o = t.rec[(size_t)k];
+            std::memcpy(&o.flag, r + S.recFlag, 4); std::memcpy(&o.w, r + S.recWeight, 4);
+            std::memcpy(&o.a, r + S.recMatA, 4);    std::memcpy(&o.b, r + S.recMatB, 4);
+            std::memcpy(&o.depth, r + 0x40, 4);
+        }
+        uint32_t car = 0;
+        if (Rd(t.base + 0x7F4, &car, 4)) t.car = car;                   // the car object that owns the tyre
+        return true;
+    }
+
+    // Looks through all writable memory for objects that start with the tyre vtable.
+    void FindTyres() {
+        tyreReq_ = false;
+        tyres_.clear();
+        ++tyreScans_;
+        if (!chunk_.ok() && !chunk_.Alloc(kChunkBuf)) return;
+        const uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr);
+        vt_ = (uint32_t)(exe + (uintptr_t)((uintptr_t)(unsigned)S.tyreVtable - 0x400000u));
+        std::vector<Region> img, prv;
+        Enum(img, prv);
+        img.insert(img.end(), prv.begin(), prv.end());
+        std::vector<uintptr_t> hits;
+        size_t scanned = 0;
+        SetMsg("Looking for the tyre objects (vtable 0x%X)...", (unsigned)vt_);
+        for (const Region& r : img) {
+            size_t done = 0;
+            while (done < r.size && hits.size() < 64) {
+                if (!run_ || stage.load() || resetReq_) return;
+                const size_t n = std::min(kChunk, r.size - done) & ~(size_t)3;
+                if (!n) break;
+                if (!IsExcluded(r.base + done, n) && Rd(r.base + done, chunk_.data(), n)) {
+                    const uint32_t* p = reinterpret_cast<const uint32_t*>(chunk_.data());
+                    for (size_t i = 0; i < n / 4; ++i) if (p[i] == vt_) hits.push_back(r.base + done + i * 4);
+                    scanned += n;
+                }
+                done += n;
+                Sleep(0);
+            }
+        }
+        ReadAnchor();                                                  // for the 'valid' column of the report
+        MLog("tyre scan %u: %u MB read, %u objects start with vtable 0x%X", tyreScans_, (unsigned)(scanned >> 20), (unsigned)hits.size(), (unsigned)vt_);
+        for (uintptr_t a : hits) {
+            Tyre t; t.base = a;
+            if (!ReadTyre(t)) continue;
+            MLog("  tyre object 0x%llX  car 0x%X  rec0 flag %u  A %u B %u  w %.2f", (unsigned long long)a, t.car, t.rec[0].flag, t.rec[0].a, t.rec[0].b, t.rec[0].w);
+            tyres_.push_back(t);
+        }
+        if (tyres_.empty()) SetMsg("No tyre objects yet. They exist once a stage is loaded; it will keep looking.");
+        else { SetMsg("Found %u tyre objects. Reading their surface ids...", (unsigned)tyres_.size()); Tune(700, 900); }
+    }
+
+    void TickTyres() {
+        const float rough = fRough.load(), tex = fTex.load(), speed = fSpeed.load();
+        int alive = 0;
+        for (size_t ti = 0; ti < tyres_.size(); ++ti) {
+            Tyre& t = tyres_[ti];
+            if (t.dead) continue;
+            if (!ReadTyre(t)) { t.dead = true; continue; }
+            ++alive; ++t.samples;
+            if (t.blkChanges == 0) { t.last = t.rec; t.haveLast = true; continue; }     // not proven live (could be a stale copy of an old stage)
+            bool changed = false;
+            for (size_t k = 0; k < t.rec.size(); ++k) {
+                const Rec& r = t.rec[k];
+                if (r.flag != 1 || r.a > 255 || r.b > 255) continue;
+                ++t.contact;
+                const uint32_t dom = r.w < 0.5f ? r.a : r.b;           // the material that dominates the blend
+                IdStat& st = ids_[dom];
+                ++st.n; st.rough += rough; st.tex += tex; st.speed += speed; st.tyreMask |= 1u << (ti & 31);
+                if (label_ >= 0) ++st.byLabel[label_];
+                ++ids_[r.a].asA; ++ids_[r.b].asB;
+                if (t.haveLast && k < t.last.size() && t.last[k].flag == 1 && (t.last[k].a != r.a || t.last[k].b != r.b)) changed = true;
+            }
+            if (changed) {
+                ++t.changes;
+                if ((int)tyreLogged_ < S.logLines) {
+                    ++tyreLogged_;
+                    std::string line;
+                    for (const Rec& r : t.rec) { char b[48]; snprintf(b, sizeof(b), " %u/%u(w%.2f)%s", r.a, r.b, r.w, r.flag == 1 ? "" : "-"); line += b; }
+                    MLog("tyre %u:%s   label %s  speed %.1f  rough %.2f", (unsigned)ti, line.c_str(), label_ >= 0 ? S.label[label_].c_str() : "-", speed, rough);
+                }
+            }
+            t.last = t.rec; t.haveLast = true;
+        }
+        if (!alive) {
+            tyres_.clear();
+            MLog("the tyre objects are gone (stage ended?); will look again");
+            tyreFindAt_ = Clock::now() + std::chrono::seconds(3); tyreRetry_ = 0;
+        }
+    }
+
+    void WriteSurfaceReport() {
+        FILE* f = fopen((g_mdir + "ForceFX_surfaces.txt").c_str(), "w");
+        if (!f) return;
+        const std::vector<Mod> mods = Modules();
+        fprintf(f, "ForceFX surface ids seen under the tyres\n");
+        fprintf(f, "tyre vtable 0x%X, %u scans, %u tyre objects, records %d x 0x%X from +0x%X (flag +0x%X, weight +0x%X, A +0x%X, B +0x%X)\n\n",
+                (unsigned)vt_, tyreScans_, (unsigned)tyres_.size(), S.recCount, S.recStride, S.recOff, S.recFlag, S.recWeight, S.recMatA, S.recMatB);
+        fprintf(f, "== Tyre objects ==\n");
+        if (tyres_.empty()) fprintf(f, "  none right now (no stage loaded, or the scan hasn't found them yet)\n");
+        for (size_t i = 0; i < tyres_.size(); ++i) {
+            const Tyre& t = tyres_[i];
+            fprintf(f, "  #%u  %s  car 0x%X  %s  samples %u, contact reads %u, id changes %u\n", (unsigned)i, Describe(mods, t.base).c_str(), t.car,
+                    t.dead ? "GONE" : t.blkChanges ? "live" : "static copy (never changes, ignored)", t.samples, t.contact, t.changes);
+            if (t.haveLast) for (size_t k = 0; k < t.last.size(); ++k)
+                fprintf(f, "       rec %u: flag %u  weight %.2f  A %u  B %u\n", (unsigned)k, t.last[k].flag, t.last[k].w, t.last[k].a, t.last[k].b);
+        }
+        if (tyres_.size() > 1) {
+            fprintf(f, "  spacing:");
+            for (size_t i = 1; i < tyres_.size(); ++i) fprintf(f, " +0x%llX", (unsigned long long)(tyres_[i].base - tyres_[i - 1].base));
+            fprintf(f, "\n");
+        }
+        uint64_t total = 0; for (const IdStat& s : ids_) total += s.n;
+        fprintf(f, "\n== Surface ids seen (dominant material of each contact record; %llu reads in total) ==\n", (unsigned long long)total);
+        fprintf(f, "  id  valid  share   reads   roughness  texture  speed(m/s)  tyres  name\n");
+        std::vector<int> order;
+        for (int id = 0; id < 256; ++id) if (ids_[id].n || ids_[id].asA || ids_[id].asB) order.push_back(id);
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return ids_[a].n > ids_[b].n; });
+        for (int id : order) {
+            const IdStat& s = ids_[id];
+            const double n = (double)std::max<uint32_t>(1, s.n);
+            fprintf(f, "  %3d  %-5s %5.1f%%  %6u  %9.3f  %7.3f  %9.1f   %04X   %s", id, valid_[id] ? "yes" : (anchorOk_ ? "NO" : "?"),
+                    total ? 100.0 * (double)s.n / (double)total : 0.0, s.n, s.rough / n, s.tex / n, s.speed / n, s.tyreMask, IdName(id).c_str());
+            bool any = false;
+            for (int l = 0; l < kLabels; ++l) if (s.byLabel[l]) { fprintf(f, "%s%s %u", any ? ", " : "   [", S.label[l].c_str(), s.byLabel[l]); any = true; }
+            fprintf(f, "%s", any ? "]\n" : "\n");
+        }
+        fprintf(f, "\n  'reads' counts the dominant material (weight < 0.5 means material A, otherwise B). Ids 1..65 are named from the exe's\n"
+                   "  material table (dry/damp/wet from the low two bits); above that the names are unverified, which is what this\n"
+                   "  table is for: drive over a surface, see which id appears and how rough it is.\n");
+        fclose(f);
+    }
+
     // ------------------------------------------------------------ thread
     void Loop() {
         try { LoopImpl(); }
@@ -2565,18 +2774,32 @@ private:
         }
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);     // never compete with the game for CPU
         if (!chunk_.Alloc(kChunkBuf) || !page_.Alloc(4096)) { MLog("couldn't allocate the scan buffers"); return; }
-        { std::lock_guard<std::mutex> lk(sm_); s0_ = "MEMSCAN ready"; s1_ = "Press a surface key (Numpad 1-8) while driving on that surface."; }
+        { std::lock_guard<std::mutex> lk(sm_); s0_ = "MEMSCAN ready"; s1_ = S.tyreScan ? "Looking for the tyre objects once a stage is running (or press Numpad *)." : "Idle."; }
 
         while (run_) {
             Sleep(25);
             const auto now = Clock::now();
             PollKeys();
-            if (stage.exchange(false)) ResetAll("a stage started");
+            if (stage.exchange(false)) ResetAll("a stage started", false);
             if (resetReq_) { resetReq_ = false; ResetAll("Numpad 0"); Tune(250, 250); }
             if (now >= nextWatch_) { nextWatch_ = now + std::chrono::milliseconds(100); TickWatches(); }
 
-            const std::string why = WhyNot();
-            if (why.empty() && now >= nextTry_) {
+            if (S.tyreScan) {
+                if (tyreReq_ || (S.autoTyres && tyres_.empty() && (Fresh() || !S.requireTelemetry) && now >= tyreFindAt_)) {
+                    FindTyres();
+                    if (tyres_.empty()) { ++tyreRetry_; tyreFindAt_ = Clock::now() + std::chrono::seconds(std::min(30, 5 * tyreRetry_)); }
+                    else tyreRetry_ = 0;
+                }
+                if (!tyres_.empty() && now >= nextTyre_) { nextTyre_ = now + std::chrono::milliseconds(1000 / S.tyreHz); TickTyres(); }
+                if (!S.passive) {
+                    uint32_t seen = 0; for (const IdStat& st : ids_) if (st.n) ++seen;
+                    if (!tyres_.empty()) SetMsg("Reading %u tyre objects, %u different surface ids seen so far. Numpad . writes ForceFX_surfaces.txt.", (unsigned)tyres_.size(), seen);
+                }
+            }
+            const std::string why = S.passive ? WhyNot() : std::string("passive off");
+            if (!S.passive) {
+                // nothing else to do: the tyre scan above is the whole job
+            } else if (why.empty() && now >= nextTry_) {
                 if (phase_ == P_IDLE) DoSnapshot();
                 else if (phase_ == P_WAIT_DIFF) { if (label_ != snapLabel_) DoDiff(); }
                 else if (phase_ == P_TRACK && now >= nextTrack_) {
@@ -2592,28 +2815,32 @@ private:
                 SetMsg("Snapshot is ready on %s. Drive onto a different surface and press its key.", S.label[snapLabel_].c_str());
 
             { char b[200];
-              snprintf(b, sizeof(b), "MEMSCAN %s | label %s | %u candidates",
+              if (S.passive) snprintf(b, sizeof(b), "MEMSCAN %s | label %s | %u candidates",
                        phase_ == P_TRACK ? "tracking" : phase_ == P_WAIT_DIFF ? "snapshot ready" : "idle",
                        label_ >= 0 ? S.label[label_].c_str() : "none", (unsigned)cands_.size());
+              else snprintf(b, sizeof(b), "MEMSCAN tyres %u | label %s | ids seen %u", (unsigned)tyres_.size(),
+                       label_ >= 0 ? S.label[label_].c_str() : "none", (unsigned)std::count_if(ids_, ids_ + 256, [](const IdStat& x) { return x.n > 0; }));
               std::lock_guard<std::mutex> lk(sm_); s0_ = b; }
 
             if (reportReq_) {
                 reportReq_ = false;
                 sticky_ = Clock::now();
-                SetMsg("Writing the full report (this includes the pointer search)...");
-                WriteReport(true);
+                if (S.tyreScan) WriteSurfaceReport();
+                if (S.passive) { SetMsg("Writing the full report (this includes the pointer search)..."); WriteReport(true); }
                 sticky_ = Clock::now();
-                SetMsg("Full report written to ForceFX_memscan_full.txt");
+                SetMsg(S.passive ? "Reports written (ForceFX_surfaces.txt and ForceFX_memscan_full.txt)" : "Report written to ForceFX_surfaces.txt");
                 sticky_ = Clock::now() + std::chrono::seconds(6);
                 MLog("full report written");
                 Tune(900, 700);
                 nextReport_ = Clock::now() + std::chrono::seconds(S.reportSec);
-            } else if (phase_ == P_TRACK && now >= nextReport_) {
+            } else if (now >= nextReport_) {
                 nextReport_ = now + std::chrono::seconds(S.reportSec);
-                WriteReport(false);
+                if (S.tyreScan && (!tyres_.empty() || tyreScans_)) WriteSurfaceReport();
+                if (S.passive && phase_ == P_TRACK) WriteReport(false);
             }
         }
-        if (phase_ == P_TRACK && cands_.size()) WriteReport(false);
+        if (S.tyreScan && tyreScans_) WriteSurfaceReport();
+        if (S.passive && phase_ == P_TRACK && cands_.size()) WriteReport(false);
         snap_.Free(); cands_.Free(); chunk_.Free(); page_.Free();
         if (fn && shi > slo) ExRemove((const void*)slo);
     }
