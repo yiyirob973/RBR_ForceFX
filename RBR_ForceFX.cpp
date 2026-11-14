@@ -55,8 +55,10 @@
 //   more heavily loaded side transmits more), the compression thump, a quiet engine and road when airborne, and
 //   the braking judder.
 //
-// Branch "memory": a temporary memory scanner (see the MemScan block) that reads the surface id under each tyre.
-//   Everything it adds is marked MEMSCAN or sits inside namespace MemScan, so it can be deleted in one go.
+// Surface feel: the plugin reads which ground is under each tyre (namespace Surf) and gives gravel, snow, ice and soft
+//   ground their own road-vibration character. Tuned in the [Surface] section of ForceFX.ini; SurfaceFX=0 switches it off.
+// Branch "memory": also contains the temporary memory scanner (namespace MemScan) used to find the tyre objects; it can be
+//   deleted in one go (marked MEMSCAN) without touching the surface feel.
 //
 // Files next to the DLL: ForceFX.ini (settings, written with defaults on first run), ForceFXCars.ini (car
 //   profiles), ForceFX.log, and ForceFX_packet.txt (a dump of the first telemetry packet, handy for checking offsets).
@@ -1260,6 +1262,7 @@ struct Signals {
     // weight / suspension load, relative to this car's own static load (1 = at rest)
     float loadL = 1, loadR = 1, loadF = 1;
     float airborne = 0;   // 0 = wheels loaded, 1 = off the ground
+    int   surf = 0;       // ground class under the car (Surf::Cls); 0 = unknown, which changes nothing
     float thumpL = 0, thumpR = 0;   // compression / landing envelope per side
     unsigned evtSeq = 0;  // goes up by one for every landing or hard hit; the synth starts one boost per event
     float evtSev = 0;     // severity of the current event 0..1 (refined upward while a landing is still compressing)
@@ -1476,8 +1479,100 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 
 // -------------------------------------------------------------- synthesis
 // Turns the analysed signals into effect strengths and frequencies. Runs on the worker thread, about 100 times a second.
+// ====================================================================================================================
+// SURFACE CHARACTER: how the road vibration feels on each kind of ground.
+//
+// The game's contact data says which material is under the tyres (see the reader further down). Each class below
+// reshapes the existing road effect, so no new effects are added and the force stays zero-mean:
+//   gravel  sharp, irregular grain: deep dropouts between hits plus the odd hard "stone", fast release
+//   snow    soft and slow: low pitch, gentle attack and release, little randomness, a constant light bed
+//   ice     a quiet base with sparse, sharp, high-pitched cracks
+//   soft    grass, rough ground: a heavier, rounder grain
+//   tarmac / unknown   unchanged (the neutral values), so nothing changes where we aren't sure
+// Every value is in the [Surface] section of ForceFX.ini (written with defaults on first run).
+// ====================================================================================================================
+namespace Surf {
+
+enum Cls { C_NONE = 0, C_TARMAC, C_GRAVEL, C_SNOW, C_ICE, C_SOFT, C_COUNT };
+inline const char* ClsName(int c) {
+    static const char* const n[C_COUNT] = {"unknown", "tarmac", "gravel", "snow", "ice", "soft"};
+    return c >= 0 && c < C_COUNT ? n[c] : "?";
+}
+
+struct Feel {
+    float amp;        // multiplier on the road strength
+    float grainAdd;   // added to RoadGrain (0..1): how random the strength and pitch are
+    float dropout;    // extra drop of the weakest hits (0..0.6): gaps between grains
+    float hz;         // multiplier on the road pitch
+    float atk;        // how fast the effect rises (0.05..1)
+    float rel;        // multiplier on how fast it dies away (large = short, sharp hits)
+    float base;       // multiplier on the everyday strength between hits
+    float spark;      // chance per 12 ms and side of a single hard hit (a stone, a crack)
+    float sparkMul;   // strength of that hit
+    float floor;      // the least texture level: smooth ground still gives a faint feel
+};
+constexpr Feel kNeutral = {1.0f, 0.0f, 0.0f, 1.0f, 0.55f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f};
+
+bool  g_on = true;           // master switch ([Surface] SurfaceFX)
+float g_strength = 1.0f;     // 0 = no change at all, 1 = as tuned, up to 1.5
+float g_fade = 0.25f;        // seconds to cross-fade between two surfaces
+int   g_map[256];            // per-id override of the class, stored as class+1 (0 = use the built-in table)
+Feel  g_feel[C_COUNT] = {
+    kNeutral,                                                                          // unknown
+    kNeutral,                                                                          // tarmac
+    {1.00f,  0.10f, 0.25f, 1.10f, 0.60f, 1.8f, 1.00f, 0.07f, 1.6f, 0.20f},           // gravel
+    {0.55f, -0.70f, 0.00f, 0.50f, 0.12f, 0.3f, 0.90f, 0.00f, 1.0f, 0.22f},           // snow
+    {0.90f, -0.40f, 0.00f, 1.35f, 0.90f, 2.2f, 0.30f, 0.10f, 2.4f, 0.30f},           // ice
+    {0.90f, -0.20f, 0.05f, 0.80f, 0.35f, 0.5f, 1.00f, 0.00f, 1.0f, 0.18f}};          // soft
+
+inline const char* const* FeelKeys() {
+    static const char* const k[10] = {"Amp", "Grain", "Dropout", "Hz", "Attack", "Release", "Base", "Spark", "SparkMul", "Floor"};
+    return k;
+}
+inline float Feel::* const* FeelMembers() {
+    static float Feel::* const m[10] = {&Feel::amp, &Feel::grainAdd, &Feel::dropout, &Feel::hz, &Feel::atk,
+                                        &Feel::rel, &Feel::base, &Feel::spark, &Feel::sparkMul, &Feel::floor};
+    return m;
+}
+
+// Which class a material id belongs to. The ids up to 65 are verified against the game's material table; the rest come from
+// the order of that table and from driving (see ForceFX_surfaces.txt), so [Surface] Map= can correct any of them.
+inline int DefaultClass(int id) {
+    auto in = [id](int a, int b) { return id >= a && id <= b; };
+    if (id == 88) return C_SNOW;                                                                                  // seen only on a snow stage; not in any named family
+    if (in(1, 23) || in(33, 35) || in(41, 43) || in(49, 51) || in(153, 155) || in(177, 199)) return C_GRAVEL;   // gravel (US2 / BR2 sets too)
+    if (in(133, 135) || in(141, 143) || in(149, 151) || in(161, 163)) return C_GRAVEL;                            // dirt: packed, granular
+    if (in(37, 39) || in(45, 47) || in(53, 55) || in(69, 91)) return C_TARMAC;
+    if (in(101, 103)) return C_SNOW;                                                                              // snow on gravel
+    if (in(116, 118)) return C_ICE;                                                                               // snow on ice
+    if (in(93, 99) || in(105, 115) || in(121, 131) || in(137, 139)) return C_SOFT;                                // grass, rough
+    return C_NONE;                                                                                                // trees, rocks, walls, water, spectators...
+}
+inline int ClassOfId(int id) {
+    if (id < 0 || id > 255) return C_NONE;
+    return g_map[id] > 0 ? g_map[id] - 1 : DefaultClass(id);
+}
+
+// Weighted mix of the per-class values (w sums to 1), then scaled by the strength: 0 gives the neutral values back.
+inline Feel Blend(const float w[C_COUNT]) {
+    Feel r = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    float Feel::* const* m = FeelMembers();
+    for (int p = 0; p < 10; ++p) {
+        float v = 0;
+        for (int i = 0; i < C_COUNT; ++i) v += w[i] * g_feel[i].*m[p];
+        r.*m[p] = kNeutral.*m[p] + (v - kNeutral.*m[p]) * g_strength;
+    }
+    r.atk = clampf(r.atk, 0.05f, 1.0f); r.rel = clampf(r.rel, 0.05f, 4.0f); r.hz = clampf(r.hz, 0.3f, 2.0f);
+    r.dropout = clampf(r.dropout, 0.0f, 0.6f); r.spark = clampf(r.spark, 0.0f, 0.5f); r.floor = clampf(r.floor, 0.0f, 0.6f);
+    r.amp = std::max(0.0f, r.amp); r.base = std::max(0.0f, r.base); r.sparkMul = clampf(r.sparkMul, 0.5f, 3.0f);
+    return r;
+}
+
+}  // namespace Surf
+
 struct Synth {
     float sm[S_COUNT] = {};
+    float surfW[Surf::C_COUNT] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};     // cross-faded weight of each ground class
     float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
     float jAge = 5.0f, evAmp = 0.0f;                       // age and severity of the current landing event
     unsigned seenEvt = 0;
@@ -1534,19 +1629,29 @@ struct Synth {
         const float thump[2] = { s.thumpL, s.thumpR };
         const float sideTex[2] = { s.texL, s.texR };
         const float sideLoad[2] = { s.loadL, s.loadR };
+        // surface character: cross-fades between the per-surface values; with an unknown surface every value is neutral
+        Surf::Feel fe = Surf::kNeutral;
+        if (Surf::g_on) {
+            const float aw = alphaFor(dt, Surf::g_fade);
+            for (int i = 0; i < Surf::C_COUNT; ++i) surfW[i] += ((i == s.surf ? 1.0f : 0.0f) - surfW[i]) * aw;
+            fe = Surf::Blend(surfW);
+        }
         float texSide[2], loadGain[2];                                                // [0] = left, [1] = right
         for (int k2 = 0; k2 < 2; ++k2) {
             const float tm = texMono + (clamp01(sideTex[k2] + 0.9f * s.bump) - texMono) * c.roadDirectional;
             texSide[k2] = clamp01(tm + c.thumpGain * wf * thump[k2]);                 // a heavier car thumps harder on landing
+            texSide[k2] = std::max(texSide[k2], fe.floor);                            // smooth ground still gives a faint feel (snow, ice)
             loadGain[k2] = 1.0f + c.loadInfluence * (clampf(sideLoad[k2], 0.4f, 1.8f) - 1.0f);   // a more heavily loaded tyre transmits more
         }
         const float roadAir = 1.0f - c.airborneFade * s.airborne;                     // wheels off the ground: no road feel
         if (t >= nextJit) {                                                           // every ~12 ms, pick a new random strength and pitch per side
             for (int k2 = 0; k2 < 2; ++k2) {
                 const float tx = texSide[k2];
-                roadJit[k2] = 1.0f + (0.10f + 0.40f * c.roadGrain * (tx > 0.3f ? 1.0f : 0.5f)) * rnd();
-                const float lo = 1.0f - 0.65f * c.roadGrain;                          // strength varies between lo and 1
-                ampJit[k2] = lo + (1.0f - lo) * (rnd() * 0.5f + 0.5f);
+                const float gr = clamp01(c.roadGrain + fe.grainAdd);
+                roadJit[k2] = 1.0f + (0.10f + 0.40f * gr * (tx > 0.3f ? 1.0f : 0.5f)) * rnd();
+                const float lo = std::max(0.02f, 1.0f - 0.65f * gr - fe.dropout);     // strength varies between lo and 1
+                ampJit[k2] = (lo + (1.0f - lo) * (rnd() * 0.5f + 0.5f)) * fe.base;
+                if (fe.spark > 0.0f && rnd() * 0.5f + 0.5f < fe.spark) ampJit[k2] = fe.sparkMul;   // a stone, a crack: one hard hit
             }
             engJit = rnd(); engHzJit = rnd();
             nextJit = t + 0.012;
@@ -1554,8 +1659,10 @@ struct Synth {
         float t3[2];
         for (int k2 = 0; k2 < 2; ++k2) {
             const float spd = c.roadMinHz + (c.roadMaxHz - c.roadMinHz) * clamp01(0.35f * spN + 0.65f * texSide[k2]);
-            hz[k2 == 0 ? S_ROAD : S_ROADR] = spd * roadJit[k2] * (k2 ? 1.31f : 1.0f) / std::sqrt(wf);   // the two sides are detuned; heavier cars sound lower
-            t3[k2] = c.roadMaxMag * 0.7f * texSide[k2] * gSpd * ampJit[k2] * loadGain[k2] * roadAir;     // the two road effects share the road budget
+            float hzR = spd * roadJit[k2] * (k2 ? 1.31f : 1.0f) / std::sqrt(wf);                  // the two sides are detuned; heavier cars sound lower
+            if (fe.hz != 1.0f) hzR = clampf(hzR * fe.hz, 20.0f, kHardMaxHz);
+            hz[k2 == 0 ? S_ROAD : S_ROADR] = hzR;
+            t3[k2] = c.roadMaxMag * 0.7f * texSide[k2] * gSpd * ampJit[k2] * loadGain[k2] * roadAir * fe.amp;   // the two road effects share the road budget
         }
         // A has its sharp edge to the left, B to the right. By default a hit on the left tyre snaps left.
         const int sA = c.roadSideInvert ? 1 : 0, sB = 1 - sA;
@@ -1592,8 +1699,9 @@ struct Synth {
         follow(S_ENG1, t1, 0.35f, 0.15f);
         follow(S_ENG2, t2, 0.25f, 0.12f);
         const float roadDown = clampf(0.40f / wf, 0.15f, 0.70f);                     // heavier cars let the thump ring out longer
-        follow(S_ROAD,  c.fxRoad ? tRoadA : 0.0f, 0.55f, roadDown);
-        follow(S_ROADR, c.fxRoad ? tRoadB : 0.0f, 0.55f, roadDown);
+        const float roadRel = clampf(roadDown * fe.rel, 0.05f, 0.95f);              // gravel and ice let go fast, snow slowly
+        follow(S_ROAD,  c.fxRoad ? tRoadA : 0.0f, fe.atk, roadRel);
+        follow(S_ROADR, c.fxRoad ? tRoadB : 0.0f, fe.atk, roadRel);
         follow(S_BRAKE, c.fxBrake ? t4 : 0.0f, 0.50f, 0.20f);
         // Priority: road beats engine. A lower layer backs off while a higher one is active.
         const float pR = c.roadMaxMag > 0 ? clamp01(std::max(std::fabs(sm[S_ROAD]), std::fabs(sm[S_ROADR])) / (float)c.roadMaxMag) : 0.0f;
@@ -2869,6 +2977,300 @@ std::string Status(int k) { return g_scan ? g_scan->Status(k) : std::string(); }
 
 } // namespace MemScan
 
+// ====================================================================================================================
+// SURFACE READER: finds the tyre objects in RBR's memory and reports which kind of ground is under the car.
+//
+// Everything here only READS memory. The layout comes from the game's own code (see the MemScan notes): a tyre is an
+// object whose first dword is the vtable 0x74288C, and it holds three contact records at +0xC20, +0xC90 and +0xD00.
+// A record is { +0x00 flag, +0x34 blend weight, +0x38 material A, +0x3C material B }; when the weight is under 0.5
+// material A dominates. The objects are found once per stage (a scan of the game's heap, on this thread, at low
+// priority), then read about 50 times a second. If anything is missing, the surface is "unknown" and nothing changes.
+// ====================================================================================================================
+namespace Surf {
+
+class Reader {
+public:
+    std::atomic<int> cls{C_NONE};
+    std::atomic<int> ids[4];
+    std::atomic<int> nTyres{0};
+    std::atomic<int64_t> fed{0};
+    std::atomic<bool> stage{false};
+
+    Reader() { for (auto& a : ids) a = -1; }
+
+    void Begin(const std::string& dir, const std::string& iniPath) {
+        dir_ = dir; ini_ = iniPath;
+        for (int i = 0; i < 256; ++i) g_map[i] = 0;
+        Load();
+        if (!g_on) { Log("surface feel is off (SurfaceFX=0)"); return; }
+        Log("surface reader started");
+        run_ = true;
+        th_ = std::thread(&Reader::Loop, this);
+    }
+    void End() { run_ = false; if (th_.joinable()) th_.join(); }
+    std::string Status() const {
+        std::lock_guard<std::mutex> lk(sm_);
+        return status_;
+    }
+
+private:
+    struct Rec { uint32_t flag = 0; float w = 0; uint32_t a = 0, b = 0; };
+    struct Tyre { uintptr_t base = 0; Rec rec[3]; std::vector<uint8_t> blk; uint32_t blkChanges = 0; };
+    struct Range { uintptr_t lo, hi; };
+
+    static constexpr size_t kChunk = 4u << 20;
+    static constexpr int kRecOff = 0xC20, kRecStride = 0x70, kRecCount = 3, kFlag = 0x00, kWeight = 0x34, kMatA = 0x38, kMatB = 0x3C;
+
+    std::string dir_, ini_;
+    std::thread th_;
+    std::atomic<bool> run_{false};
+    mutable std::mutex sm_;
+    std::string status_ = "Surface: waiting for a stage";
+    uint32_t vt_ = 0;
+    int vtableCfg_ = 0x74288C;
+    int readHz_ = 50, commitMs_ = 150;
+    std::vector<Tyre> tyres_;
+    void* chunk_ = nullptr;
+    std::vector<Range> excl_;
+    Clock::time_point nextScan_ = Clock::now();
+    int retry_ = 0, committed_ = C_NONE, cand_ = C_NONE, candTicks_ = 0, noneTicks_ = 0;
+    uint32_t scans_ = 0;
+
+    void Log(const char* fmt, ...) {
+        char b[400];
+        va_list ap; va_start(ap, fmt);
+        vsnprintf(b, sizeof(b), fmt, ap);
+        va_end(ap);
+        FILE* f = fopen((dir_ + "ForceFX_surface.log").c_str(), "a");
+        if (f) { fprintf(f, "%s\n", b); fclose(f); }
+    }
+    void SetStatus(const char* fmt, ...) {
+        char b[300];
+        va_list ap; va_start(ap, fmt);
+        vsnprintf(b, sizeof(b), fmt, ap);
+        va_end(ap);
+        std::lock_guard<std::mutex> lk(sm_);
+        status_ = b;
+    }
+
+    // ---------------------------------------------------------------- settings ([Surface] in ForceFX.ini)
+    void Load() {
+        const char* K = "Surface";
+        char b[512];
+        GetPrivateProfileStringA(K, "SurfaceFX", "", b, sizeof(b), ini_.c_str());
+        const bool fresh = b[0] == 0;                                // first run: write every key with its default so it can be edited
+        auto Wr = [&](const char* k, const char* v) { WritePrivateProfileStringA(K, k, v, ini_.c_str()); };
+        auto I = [&](const char* k, int& v, bool hex = false) {
+            if (fresh) { char o[32]; snprintf(o, sizeof(o), hex ? "0x%X" : "%d", v); Wr(k, o); return; }
+            GetPrivateProfileStringA(K, k, "", b, sizeof(b), ini_.c_str()); if (b[0]) v = (int)strtol(b, nullptr, 0);
+        };
+        auto F = [&](const char* k, float& v) {
+            if (fresh) { char o[32]; snprintf(o, sizeof(o), "%g", v); Wr(k, o); return; }
+            GetPrivateProfileStringA(K, k, "", b, sizeof(b), ini_.c_str()); if (b[0]) v = (float)atof(b);
+        };
+        int on = g_on ? 1 : 0;
+        I("SurfaceFX", on); g_on = on != 0;
+        F("Strength", g_strength); F("FadeSeconds", g_fade);
+        I("ReadHz", readHz_); I("CommitMs", commitMs_); I("TyreVtable", vtableCfg_, true);
+        const char* names[C_COUNT] = {"", "Tarmac", "Gravel", "Snow", "Ice", "Soft"};
+        const char* const* keys = FeelKeys();
+        float Feel::* const* mem = FeelMembers();
+        for (int c = C_TARMAC; c < C_COUNT; ++c)
+            for (int p = 0; p < 10; ++p) F((std::string(names[c]) + keys[p]).c_str(), g_feel[c].*mem[p]);
+        std::string map;
+        if (fresh) Wr("Map", ""); else { GetPrivateProfileStringA(K, "Map", "", b, sizeof(b), ini_.c_str()); map = b; }
+        ParseMap(map);
+        g_strength = clampf(g_strength, 0.0f, 1.5f); g_fade = clampf(g_fade, 0.05f, 3.0f);
+        readHz_ = std::max(5, std::min(readHz_, 100)); commitMs_ = std::max(0, std::min(commitMs_, 2000));
+    }
+    // "88:snow,92:none,129:soft": correct the class of single ids
+    void ParseMap(const std::string& m) {
+        size_t p = 0;
+        while (p < m.size()) {
+            size_t q = m.find(',', p);
+            std::string t = m.substr(p, q == std::string::npos ? std::string::npos : q - p);
+            p = q == std::string::npos ? m.size() : q + 1;
+            const size_t c = t.find(':');
+            if (c == std::string::npos) continue;
+            const int id = atoi(t.substr(0, c).c_str());
+            std::string n = t.substr(c + 1);
+            n.erase(std::remove_if(n.begin(), n.end(), [](char ch) { return ch == ' ' || ch == '\t' || ch == '\r'; }), n.end());
+            n = LowerStr(n);
+            for (int k = 0; k < C_COUNT; ++k)
+                if (n == ClsName(k) || (k == C_NONE && n == "none")) { if (id >= 0 && id < 256) g_map[id] = k + 1; }
+        }
+    }
+
+    // ---------------------------------------------------------------- memory
+    static bool Rd(uintptr_t a, void* d, size_t n) {
+        SIZE_T got = 0;
+        return ReadProcessMemory(GetCurrentProcess(), (LPCVOID)a, d, n, &got) && got == n;
+    }
+    bool Excluded(uintptr_t a, size_t n) const {
+        for (const Range& e : excl_) if (a < e.hi && a + n > e.lo) return true;
+        return false;
+    }
+    bool ReadTyre(Tyre& t) {
+        uint32_t v = 0;
+        if (!Rd(t.base, &v, 4) || v != vt_) return false;                       // freed or reused
+        uint8_t blk[0x1A0];
+        const size_t need = (size_t)kRecStride * (kRecCount - 1) + 0x44;
+        if (need > sizeof(blk) || !Rd(t.base + kRecOff, blk, need)) return false;
+        if (t.blk.size() == need && std::memcmp(t.blk.data(), blk, need) != 0) ++t.blkChanges;
+        t.blk.assign(blk, blk + need);
+        for (int k = 0; k < kRecCount; ++k) {
+            const uint8_t* r = blk + (size_t)k * kRecStride;
+            std::memcpy(&t.rec[k].flag, r + kFlag, 4); std::memcpy(&t.rec[k].w, r + kWeight, 4);
+            std::memcpy(&t.rec[k].a, r + kMatA, 4);    std::memcpy(&t.rec[k].b, r + kMatB, 4);
+        }
+        return true;
+    }
+
+    static bool RegionOk(const MEMORY_BASIC_INFORMATION& m) {
+        if (m.State != MEM_COMMIT || m.Type == MEM_MAPPED) return false;
+        if (m.Protect & (PAGE_GUARD | PAGE_NOACCESS | PAGE_NOCACHE | PAGE_WRITECOMBINE)) return false;   // never driver or GPU mappings
+        const DWORD p = m.Protect & 0xFF;
+        return p == PAGE_READWRITE || p == PAGE_WRITECOPY;
+    }
+
+    void FindTyres() {
+        tyres_.clear(); ++scans_;
+        const uintptr_t exe = (uintptr_t)GetModuleHandleA(nullptr);
+        vt_ = (uint32_t)(exe + (uintptr_t)((uintptr_t)(unsigned)vtableCfg_ - 0x400000u));
+        SYSTEM_INFO si; GetSystemInfo(&si);
+        uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
+        const uintptr_t maxA = (uintptr_t)si.lpMaximumApplicationAddress;
+        std::vector<uintptr_t> hits;
+        size_t scanned = 0;
+        while (addr < maxA && hits.size() < 64) {
+            MEMORY_BASIC_INFORMATION m;
+            if (VirtualQuery((LPCVOID)addr, &m, sizeof(m)) != sizeof(m)) break;
+            const uintptr_t base = (uintptr_t)m.BaseAddress;
+            const size_t size = (size_t)m.RegionSize;
+            if (base + size <= addr) break;
+            addr = base + size;
+            if (!RegionOk(m) || size > ((size_t)64 << 20)) continue;
+            for (size_t done = 0; done < size && hits.size() < 64;) {
+                if (!run_ || stage.load()) return;
+                const size_t n = std::min<size_t>((size_t)kChunk, size - done) & ~(size_t)3;
+                if (!n) break;
+                if (Rd(base + done, chunk_, n)) {
+                    const uint32_t* p = static_cast<const uint32_t*>(chunk_);
+                    for (size_t i = 0; i < n / 4; ++i)
+                        if (p[i] == vt_ && !Excluded(base + done + i * 4, 4)) hits.push_back(base + done + i * 4);   // not our own copies
+                    scanned += n;
+                }
+                done += n;
+                Sleep(0);
+            }
+        }
+        for (uintptr_t a : hits) { Tyre t; t.base = a; if (ReadTyre(t)) tyres_.push_back(t); }
+        Log("scan %u: %u MB read, %u objects with the tyre vtable 0x%X", scans_, (unsigned)(scanned >> 20), (unsigned)hits.size(), (unsigned)vt_);
+        nTyres = (int)tyres_.size();
+    }
+
+    // ---------------------------------------------------------------- one reading
+    void Tick() {
+        int votes[C_COUNT] = {0};
+        int total = 0, alive = 0, shown = 0;
+        for (auto& a : ids) a = -1;
+        for (Tyre& t : tyres_) {
+            if (!ReadTyre(t)) { t.blkChanges = 0; continue; }
+            ++alive;
+            if (t.blkChanges == 0) continue;                                     // not proven live (a stale copy of an old stage never changes)
+            int last = -1;
+            for (int k = 0; k < kRecCount; ++k) {
+                const Rec& r = t.rec[k];
+                if (r.flag != 1 || r.a > 255 || r.b > 255) continue;
+                const int id = (int)(r.w < 0.5f ? r.a : r.b);
+                last = id;
+                const int c = ClassOfId(id);
+                if (c != C_NONE) { ++votes[c]; ++total; }
+            }
+            if (shown < 4) ids[shown++] = last;
+        }
+        if (alive == 0) {
+            tyres_.clear(); nTyres = 0;
+            retry_ = 0; nextScan_ = Clock::now() + std::chrono::seconds(3);
+            Commit(C_NONE, true);
+            return;
+        }
+        int best = C_NONE, bv = 0;
+        for (int c = C_TARMAC; c < C_COUNT; ++c) if (votes[c] > bv) { bv = votes[c]; best = c; }
+        Commit(total >= 2 ? best : C_NONE, false);
+    }
+
+    // a new class has to hold for CommitMs before it is used, so a single stray record can't flicker the feel
+    void Commit(int c, bool now) {
+        const int need = std::max(1, commitMs_ * readHz_ / 1000);
+        if (now) { committed_ = c; cand_ = c; candTicks_ = 0; cls = c; return; }
+        if (c == C_NONE) {                                                       // nothing readable: hold the last class for a second
+            if (++noneTicks_ >= readHz_) { committed_ = C_NONE; cls = C_NONE; }
+            return;
+        }
+        noneTicks_ = 0;
+        if (c == committed_) { cand_ = c; candTicks_ = 0; return; }
+        if (c != cand_) { cand_ = c; candTicks_ = 1; } else ++candTicks_;
+        if (candTicks_ >= (committed_ == C_NONE ? std::max(1, need / 2) : need)) { committed_ = c; cls = c; candTicks_ = 0; }
+    }
+
+    void Loop() {
+        try { LoopImpl(); } catch (...) { Log("the surface reader stopped after an exception"); }
+    }
+    void LoopImpl() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   // never compete with the game for CPU
+        chunk_ = VirtualAlloc(nullptr, kChunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!chunk_) { Log("couldn't allocate the scan buffer"); return; }
+        excl_.push_back(Range{(uintptr_t)chunk_, (uintptr_t)chunk_ + kChunk});                  // our own buffer holds copies of what we read
+        excl_.push_back(Range{(uintptr_t)this, (uintptr_t)this + sizeof(*this)});               // and this object holds the vtable value
+        typedef BOOL (WINAPI *LimitsFn)(PULONG_PTR, PULONG_PTR);
+        LimitsFn fn = (LimitsFn)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetCurrentThreadStackLimits");
+        ULONG_PTR slo = 0, shi = 0;
+        if (fn) { fn(&slo, &shi); if (shi > slo) excl_.push_back(Range{(uintptr_t)slo, (uintptr_t)shi}); }
+        while (run_) {
+            Sleep((DWORD)(1000 / readHz_));
+            const bool alive = NowMs() - fed.load() < 700;                       // telemetry only flows while a stage is running
+            if (stage.exchange(false)) {
+                tyres_.clear(); nTyres = 0; retry_ = 0; nextScan_ = Clock::now() + std::chrono::seconds(4);
+                Commit(C_NONE, true);
+            }
+            if (!alive) { if (cls.load() != C_NONE) Commit(C_NONE, true); SetStatus("Surface: waiting for a stage"); continue; }
+            if (tyres_.empty()) {
+                if (Clock::now() >= nextScan_) {
+                    FindTyres();
+                    if (tyres_.empty()) { ++retry_; nextScan_ = Clock::now() + std::chrono::seconds(std::min(30, 5 * retry_)); }
+                }
+                SetStatus("Surface: looking for the tyres");
+                continue;
+            }
+            Tick();
+            SetStatus("Surface: %s  (tyres %d, ids %d %d %d %d)", ClsName(cls.load()), (int)tyres_.size(), ids[0].load(), ids[1].load(), ids[2].load(), ids[3].load());
+        }
+        VirtualFree(chunk_, 0, MEM_RELEASE); chunk_ = nullptr;
+    }
+
+    static int64_t NowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+    }
+public:
+    static int64_t Now() { return NowMs(); }
+};
+
+Reader* g_reader = nullptr;
+
+void Start(const std::string& dir, const std::string& ini) {
+    if (g_reader) return;
+    g_reader = new Reader();
+    g_reader->Begin(dir, ini);
+}
+void Stop() { if (g_reader) { g_reader->End(); delete g_reader; g_reader = nullptr; } }
+void Feed() { if (g_reader) g_reader->fed = Reader::Now(); }          // called every loop pass: the stage is running
+void OnStage() { if (g_reader) g_reader->stage = true; }
+int  Current() { return g_reader && g_on ? g_reader->cls.load() : (int)C_NONE; }
+std::string Status() { return g_reader ? g_reader->Status() : std::string(); }
+
+}  // namespace Surf
+
 struct DeviceInfo { GUID guid; char name[MAX_PATH]; };
 
 class ForceFXPlugin : public IPlugin {
@@ -3220,6 +3622,7 @@ private:
             m_dTex = sig.texture; m_dRough = sig.rough; m_dBump = sig.bump;
             m_dDive = sig.dive; m_dLock = sig.lock;
             m_dStat = sig.staticLoad; m_dLoadL = sig.loadL; m_dLoadR = sig.loadR; m_dAir = sig.airborne;
+            if (!m_test) { Surf::Feed(); sig.surf = Surf::Current(); }                      // SURF
             if (!m_test) MemScan::Feed(sig.speed, sig.airborne, sig.rough, sig.texture);   // MEMSCAN
 
             PollHotkeys(now, base);
@@ -3491,6 +3894,7 @@ private:
                  (long long)PacketTap::g_calls.load(), (long long)PacketTap::g_taken.load(),
                  (long long)PacketTap::g_otherDest.load(), (long long)PacketTap::g_dropped.load());
         line(buf);
+        { const std::string ss = Surf::Status(); if (!ss.empty()) DrawWrapped(ss.c_str(), 70.0f, y, 90); }   // SURF
         for (int k = 0; k < 3; ++k) {                                   // MEMSCAN
             const std::string ms = MemScan::Status(k);
             if (!ms.empty()) DrawWrapped(ms.c_str(), 70.0f, y, 90);
@@ -3523,6 +3927,7 @@ public:
         if (!exists) SyncConfig(m_cfg, m_iniPath, true);     // first run: write an ini with every key and its default
         SyncConfig(m_cfg, m_iniPath, false);
         m_userGain = m_cfg.userGain;
+        Surf::Start(g_dir, m_iniPath);        // SURF: reads which ground is under the tyres
         MemScan::Start(g_dir, m_iniPath);     // MEMSCAN (temporary, branch "memory")
 
         if (m_cfg.telemetrySource != 2) {
@@ -3548,6 +3953,7 @@ public:
 
     ~ForceFXPlugin() {
         MemScan::Stop();                   // MEMSCAN
+        Surf::Stop();                      // SURF
         Disconnect();
         GameDeviceTap::I().Remove();       // put the original vtable entries back before our DLL goes away
         if (!PacketTap::Remove()) {
@@ -3697,7 +4103,7 @@ public:
     }
 
     void TickFrontEndPage(float) override {}
-    void StageStarted(int, const char*, bool) override { m_stageReset = true; m_carRescan = true; MemScan::OnStage(); }   // MEMSCAN
+    void StageStarted(int, const char*, bool) override { m_stageReset = true; m_carRescan = true; Surf::OnStage(); MemScan::OnStage(); }   // SURF, MEMSCAN
     void HandleResults(float, float, float, const char*) override {}
     void CheckPoint(float, int, const char*) override {}
 };
