@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 namespace Surf {
 
@@ -96,8 +97,24 @@ inline int ClassOfId(int id) {
     return IdMap()[id] > 0 ? IdMap()[id] - 1 : DefaultClass(id);
 }
 
+// A surface type typed in Map=, lower case. Accepts the class names and a few obvious alternatives. -1 = not a type.
+inline int ClassFromName(const std::string& n) {
+    struct Alias { const char* name; int cls; };
+    static const Alias a[] = {
+        {"none", C_NONE}, {"unknown", C_NONE},
+        {"tarmac", C_TARMAC}, {"asphalt", C_TARMAC}, {"road", C_TARMAC},
+        {"gravel", C_GRAVEL}, {"dirt", C_GRAVEL},
+        {"snow", C_SNOW}, {"ice", C_ICE}, {"soft", C_SOFT}, {"grass", C_SOFT},
+        {"cobble", C_COBBLE}, {"cobbles", C_COBBLE}, {"cobblestone", C_COBBLE}, {"cobblestones", C_COBBLE},
+        {"wood", C_WOOD}, {"wooden", C_WOOD}, {"bridge", C_WOOD}, {"woodenbridge", C_WOOD}, {"planks", C_WOOD}, {"timber", C_WOOD}};
+    for (const Alias& x : a) if (n == x.name) return x.cls;
+    return -1;
+}
+
 // "88:snow,92:none,129:soft,200:cobble": correct the class of single ids. Returns how many entries were applied.
-inline int ParseIdMap(const std::string& m) {
+// Entries that can't be used (no number, a number outside 0..255, a type that doesn't exist) are skipped and, when
+// `rejected` is given, listed there so the plugin can say so in the log instead of ignoring them silently.
+inline int ParseIdMap(const std::string& m, std::vector<std::string>* rejected = nullptr) {
     int applied = 0;
     size_t p = 0;
     while (p < m.size()) {
@@ -105,16 +122,18 @@ inline int ParseIdMap(const std::string& m) {
         std::string t = m.substr(p, q == std::string::npos ? std::string::npos : q - p);
         p = q == std::string::npos ? m.size() : q + 1;
         const size_t c = t.find(':');
-        if (c == std::string::npos) continue;
+        if (c == std::string::npos) { if (rejected && t.find_first_not_of(" \t\r") != std::string::npos) rejected->push_back(t + " (needs id:type)"); continue; }
         std::string idText = t.substr(0, c);
         idText.erase(std::remove_if(idText.begin(), idText.end(), [](char ch) { return ch == ' ' || ch == '\t' || ch == '\r'; }), idText.end());
-        if (idText.empty() || idText.size() > 3 || !std::all_of(idText.begin(), idText.end(), [](char ch) { return ch >= '0' && ch <= '9'; })) continue;   // the id must be a plain number
+        if (idText.empty() || idText.size() > 3 || !std::all_of(idText.begin(), idText.end(), [](char ch) { return ch >= '0' && ch <= '9'; })) { if (rejected) rejected->push_back(t + " (the id must be a number from 0 to 255)"); continue; }
         const int id = atoi(idText.c_str());
         std::string n = t.substr(c + 1);
         n.erase(std::remove_if(n.begin(), n.end(), [](char ch) { return ch == ' ' || ch == '\t' || ch == '\r'; }), n.end());
         for (char& ch : n) ch = (char)tolower((unsigned char)ch);
-        for (int k = 0; k < C_COUNT; ++k)
-            if (n == ClsName(k) || (k == C_NONE && n == "none")) { if (id >= 0 && id < 256) { IdMap()[id] = k + 1; ++applied; } }
+        const int k = ClassFromName(n);
+        if (k < 0) { if (rejected) rejected->push_back(t + " (unknown type '" + n + "')"); continue; }
+        if (id > 255) { if (rejected) rejected->push_back(t + " (the id must be a number from 0 to 255)"); continue; }
+        IdMap()[id] = k + 1; ++applied;
     }
     return applied;
 }

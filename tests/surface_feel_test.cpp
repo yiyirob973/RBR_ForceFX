@@ -152,6 +152,42 @@ TEST(ini_keys_cover_every_value_including_ridge) {
     CHECK(std::string(ClsName(C_COBBLE)) == "cobble" && std::string(ClsName(C_WOOD)) == "wood" && std::string(ClsName(99)) == "?");
 }
 
+// ---------------------------------------------------------------- Map= leniency and reporting
+TEST(map_accepts_everyday_names_for_the_types) {
+    resetMap();
+    CHECK(ParseIdMap("300:cobble,89:cobblestone,90:Cobbles,91:wooden,92:bridge,93:planks,94:asphalt,95:dirt,96:grass") == 8);   // eight valid, 300 is out of range
+    CHECK(ClassOfId(89) == C_COBBLE && ClassOfId(90) == C_COBBLE);
+    CHECK(ClassOfId(91) == C_WOOD && ClassOfId(92) == C_WOOD && ClassOfId(93) == C_WOOD);
+    CHECK(ClassOfId(94) == C_TARMAC && ClassOfId(95) == C_GRAVEL && ClassOfId(96) == C_SOFT);
+}
+TEST(class_from_name_rejects_unknown_types) {
+    CHECK(ClassFromName("cobble") == C_COBBLE && ClassFromName("none") == C_NONE);
+    CHECK(ClassFromName("marble") == -1 && ClassFromName("") == -1 && ClassFromName("Cobble") == -1);   // callers lower-case first
+}
+TEST(map_reports_every_entry_it_could_not_use) {
+    resetMap();
+    std::vector<std::string> bad;
+    const int n = ParseIdMap("89:cobble, 90:marble, 400:wood, x:wood, 91 wood, 92:wood", &bad);
+    CHECK(n == 2);                                                         // 89 and 92
+    CHECK(bad.size() == 4);
+    bool sawMarble = false, sawRange = false, sawNumber = false, sawFormat = false;
+    for (const std::string& b : bad) {
+        if (b.find("marble") != std::string::npos) sawMarble = true;
+        if (b.find("400") != std::string::npos) sawRange = true;
+        if (b.find("x:wood") != std::string::npos) sawNumber = true;
+        if (b.find("91 wood") != std::string::npos && b.find("id:type") != std::string::npos) sawFormat = true;
+    }
+    CHECK(sawMarble && sawRange && sawNumber && sawFormat);
+    CHECK(ClassOfId(89) == C_COBBLE && ClassOfId(92) == C_WOOD && ClassOfId(90) == C_NONE);
+}
+TEST(map_without_a_report_list_still_works_and_blank_entries_are_not_errors) {
+    resetMap();
+    std::vector<std::string> bad;
+    CHECK(ParseIdMap(" , ,89:cobble,", &bad) == 1);
+    CHECK(bad.empty());
+    CHECK(ParseIdMap("90:wood") == 1);
+}
+
 int main() {
     for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
     std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);

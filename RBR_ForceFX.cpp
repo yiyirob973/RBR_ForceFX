@@ -1807,7 +1807,12 @@ private:
         readHz_ = std::max(5, std::min(readHz_, 100)); commitMs_ = std::max(0, std::min(commitMs_, 2000));
     }
     // "88:snow,92:none,129:soft": correct the class of single ids
-    void ParseMap(const std::string& m) { ParseIdMap(m); }
+    void ParseMap(const std::string& m) {
+        std::vector<std::string> bad;
+        const int n = ParseIdMap(m, &bad);
+        if (n > 0) Log("Map: %d surface override(s) applied", n);
+        for (const std::string& b : bad) Log("Map: ignored '%s'. Types: tarmac, gravel, snow, ice, soft, cobble, wood, none", b.c_str());
+    }
 
     // ---------------------------------------------------------------- memory
     static bool Rd(uintptr_t a, void* d, size_t n) {
@@ -1885,10 +1890,19 @@ private:
         if (id < 0 || id > 255 || unmappedSeen_[id]) return;
         const rsa::MaterialInfo* known = nullptr;
         for (const rsa::MaterialInfo& m : rsa::kMaterials) if (m.id == id) { known = &m; break; }
-        if (known && known->cls < 0) return;                                   // trees, rocks, walls and so on: not ground
         unmappedSeen_[id] = true;
+        if (known && known->cls < 0) { Log("tyre contact id %d (%s) is an object or undefined, not ground; if this is a bridge or another special surface add Map=%d:wood (or cobble, gravel...) in [Surface]", id, known->name, id); return; }
         if (known) Log("ground material id %d (%s) has no surface class; add Map=%d:gravel (or tarmac, snow, ice, soft, cobble, wood) in [Surface] to give it one", id, known->name, id);
         else Log("ground material id %d is not in the game's table and has no surface class; if this is cobblestone or a wooden bridge add Map=%d:cobble (or wood) in [Surface]", id, id);
+    }
+
+    // A contact record the plugin can't use (not flagged as touching, or a material number outside the table). Logged a few
+    // times so a surface that reads as "unknown" can be explained instead of guessed at.
+    int skippedLogs_ = 0;
+    void NoteSkipped(int flag, uint32_t a, uint32_t b, float w) {
+        if (skippedLogs_ >= 12) return;
+        ++skippedLogs_;
+        Log("tyre contact record skipped: flag %d, materials %u / %u, weight %.2f", flag, (unsigned)a, (unsigned)b, (double)w);
     }
 
     // ---------------------------------------------------------------- one reading
@@ -1906,7 +1920,10 @@ private:
             int last = -1;
             for (int k = 0; k < kRecCount; ++k) {
                 const Rec& r = t.rec[k];
-                if (r.flag != 1 || r.a > 255 || r.b > 255) continue;
+                if (r.flag != 1 || r.a > 255 || r.b > 255) {
+                    if (r.flag > 1 || (r.flag == 1 && (r.a > 255 || r.b > 255))) NoteSkipped((int)r.flag, r.a, r.b, r.w);   // flag 0 is just an unused record; anything else is worth knowing about
+                    continue;
+                }
                 const int id = (int)(r.w < 0.5f ? r.a : r.b);
                 last = id;
                 const int c = ClassOfId(id);
