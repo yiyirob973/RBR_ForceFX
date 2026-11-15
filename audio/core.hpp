@@ -862,29 +862,30 @@ private:
         }
     }
 
+    // Stones fly when a tyre's surface moves over ground that gives way, so both inputs come straight from the telemetry:
+    //  - how loose the ground is under this tyre: what its own signals say (rough strut force, or slipping with little grip),
+    //    taken from the telemetry inference, never from a per-surface table, so snow, mud, gravel and verge all follow the physics;
+    //  - how fast the tyre surface moves: the faster of ground speed and the wheel's own speed, so wheelspin throws stones
+    //    from a standing start. There is no speed cut-off: the rate and the strength simply grow with surface speed.
     void stones(const TelemetryFrame& f, SurfaceAnalyzer& a, const Settings& s, double dt, IAudioSink& sink, const SetView& sv) {
-        // Gravel is thrown by the tyre surface, so each tyre sprays at the faster of ground speed and its own wheel speed
-        // (a spinning tyre on a standing start throws stones even though the car has not moved yet).
-        double weight[4], total = 0, fastest = 0, spray[4];
+        double weight[4], total = 0, spray[4];
         for (int w = 0; w < 4; ++w) {
-            const double* p = a.wheels[w].probs;
-            spray[w] = std::max(a.speedMs, a.wheels[w].contactSpeedMs()) * 3.6;
-            fastest = std::max(fastest, spray[w]);
-            double looseness = p[Loose] + 0.7 * p[Rough];
-            double slip = a.wheels[w].slipValid ? std::min(std::fabs(a.wheels[w].slip) * 4.0, 1.0)
-                          : (a.wheels[w].launchValid ? std::min(a.wheels[w].launchSlip * 4.0, 1.0) : 0.0);
-            weight[w] = looseness * (0.4 + 0.6 * std::max(slip, (double)f.throttle)) * clampd(spray[w] / 90.0, 0.0, 1.5);
-            if (spray[w] < 25) weight[w] = 0;
+            const WheelAnalyzer& wa = a.wheels[w];
+            spray[w] = std::max(a.speedMs, wa.contactSpeedMs()) * 3.6;                   // km/h
+            double loose = clampd(1.0 - wa.inferred[Tarmac], 0.0, 1.0);
+            double slip = wa.slipValid ? std::min(std::fabs(wa.slip) * 4.0, 1.0)
+                          : (wa.launchValid ? std::min(wa.launchSlip * 4.0, 1.0) : 0.0);
+            weight[w] = loose * (0.4 + 0.6 * std::max(slip, (double)f.throttle)) * clampd(spray[w] / 90.0, 0.0, 1.5);
             total += weight[w];
         }
-        if (fastest < 25 || total < 0.05) return;
+        if (total < 0.005) return;
         double r = s.stoneRate * (total / 4.0);
         if (rng_.next() > 1.0 - std::exp(-r * dt)) return;
         if (stoneCooldown_ > 0) return;
         stoneCooldown_ = 0.03;
         double pick = rng_.next() * total; int wheel = 0;
         for (int w = 0; w < 4; ++w) { pick -= weight[w]; if (pick <= 0) { wheel = w; break; } }
-        float gain = (float)(0.4 + 0.6 * rng_.next()) * (float)clampd(spray[wheel] / 100.0, 0.3, 1.0), l, rr;
+        float gain = (float)(0.4 + 0.6 * rng_.next()) * (float)clampd(spray[wheel] / 100.0, 0.15, 1.0), l, rr;
         panGains(kWheelPan[wheel], gain * kWheelScale[wheel], l, rr);
         sink.trigger(SoundEvent::StoneHit, sv.dominant(wheel), l, rr, rate(0.12));
     }
