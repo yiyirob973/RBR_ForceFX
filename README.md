@@ -14,6 +14,7 @@ ForceFX is a force-feedback plugin for Richard Burns Rally (RBR). It uses NGP te
 ## Features
 
 - Configurable engine, road/suspension, braking, and landing feedback.
+- Surface feel: the plugin reads which ground is under the tyres and gives gravel, snow, ice and grass their own road-vibration character (sharp grain on gravel, soft and slow on snow, hard cracks on ice).
 - An in-game menu for connecting a wheel, adjusting settings, and checking telemetry diagnostics.
 - Optional per-car profiles for tuning the feedback character of individual cars.
 - Output limits and gradual derating intended to reduce sustained load on the wheel.
@@ -40,6 +41,16 @@ ForceFX settings are stored in `ForceFX.ini`. The comments in that file describe
 
 `ForceFXCars.ini` contains optional per-car profiles. Profiles can adjust selected values and fall back to the global settings for unspecified values. You can edit or remove profiles, or disable per-car profiles in the configuration.
 
+## Surface feel
+
+ForceFX reads the contact data RBR keeps for each tyre (read-only; it never writes to the game) to tell what kind of ground the car is on, and reshapes the road vibration to match. Tarmac and unknown ground keep the plain road feel.
+
+- Switch it on or off, and set how strongly it applies, from **Plugins > ForceFX** (`Effect: Surface feel` and `Surface feel strength`) or with `EnableSurfaceFeel` and `SurfaceStrength` in `ForceFX.ini`. At 0% the road feels the same on every surface.
+- The `[Surface]` section of `ForceFX.ini` tunes each surface (gravel, snow, ice, soft ground) separately and can correct the surface type of a single material id with `Map=`. Edits there take effect when RBR starts.
+- The ground is read only while a stage is running. Finding the tyre data takes a short scan of the game's memory at the start of each stage, in the background.
+- The Diagnostics page shows the detected surface and the material ids under the four tyres. `ForceFX.log` records each surface change.
+- It relies on the memory layout of the RallySimFans `RichardBurnsRally_SSE.exe`. On a build with a different layout the plugin simply finds no tyre data and the road feels as it did before.
+
 ## Safety
 
 - ForceFX is developed for RallySimFans/NGP7 setups.
@@ -55,6 +66,7 @@ ForceFX settings are stored in `ForceFX.ini`. The comments in that file describe
 - **No telemetry is received:** Check that NGP UDP telemetry is enabled, then open the ForceFX menu. The telemetry line shows the packet count and where packets come from (NGP or the UDP port), and diagnostic information.
 - **The wheel does not connect or effects are unavailable:** Confirm force feedback is enabled in RBR and select the same DirectInput wheel that RBR uses. Check `ForceFX.log` for connection or device errors.
 - **Telemetry arrives but feedback is incorrect:** The telemetry layout may differ from the configured offsets or scaling. Review the advanced settings in `ForceFX.ini` and use the diagnostics page to inspect the received values.
+- **Surface feel does nothing:** Open the Diagnostics page. `Surface: looking for the tyres` means the tyre data was not found (check `ForceFX.log` for `Surface:` lines; a different RBR build can have a different layout). `Surface: unknown` means the ground under the car is not one the plugin recognises; the Diagnostics page shows the material ids, and `Map=` in `[Surface]` can assign them.
 - **Feedback is too strong or busy:** Lower the combined output ceiling or live level first, then adjust individual effect levels. Start conservatively and test one effect at a time.
 
 The plugin writes `ForceFX.log` and, after receiving telemetry, `ForceFX_packet.txt` beside the DLL. Include relevant log details and your NGP/telemetry setup when reporting a problem; remove any personal information before sharing logs.
