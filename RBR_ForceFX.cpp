@@ -86,6 +86,7 @@
 #define __SUPPORT_PLUGIN__ 1
 #include "IRBRGame.h"
 #include "IPlugin.h"
+#include "audio/dynamic_audio.hpp"   // dynamic surface audio (off until the menu switch is turned on)
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dinput8.lib")
@@ -151,6 +152,7 @@ struct Config {
 
     // effect switches (menu): 1 = on, 0 = off
     int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandBoost = 1, fxSurface = 1;
+    int   fxAudio = 0;               // dynamic surface audio (settings in ForceFXAudio.ini); off until switched on
 
     // per-layer ceilings (DirectInput units 0..10000), a combined ceiling, and one live level (userGain)
     int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 2000;
@@ -229,7 +231,7 @@ void ClampConfig(Config& c) {
     c.impactGain = clampf(c.impactGain, 0.0f, 3.0f);
     c.brakeHzScale = clampf(c.brakeHzScale, 0.5f, 2.0f);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
-    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0;
+    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0; c.fxAudio = c.fxAudio ? 1 : 0;
     c.landingBoost = clampf(c.landingBoost, 0.0f, 4.0f);
     c.landingAdd = clampf(c.landingAdd, 0.0f, 1.0f);
     c.landingThresh = clampf(c.landingThresh, 0.5f, 3.0f);
@@ -276,7 +278,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     F("ImpactGain", c.impactGain);
     F("BrakeHzScale", c.brakeHzScale); F("PriorityDuck", c.priorityDuck);
     I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("EnableBrake", c.fxBrake);
-    I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
+    I("EnableDynamicAudio", c.fxAudio); I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
@@ -2068,6 +2070,13 @@ void Feed(bool want) { if (g_reader) { g_reader->wanted = want; g_reader->fed = 
 void OnStage() { if (g_reader) g_reader->stage = true; }
 int  Current(int wheel) { return g_reader ? g_reader->clsWheel[wheel & 3].load() : (int)C_NONE; }   // 0 FL, 1 FR, 2 RL, 3 RR
 std::string Status() { return g_reader ? g_reader->Status() : std::string(); }
+// The material id under each tyre (0 FL, 1 FR, 2 RL, 3 RR). False until all four are known; the dynamic audio reads these.
+bool Ids(int out[4]) {
+    if (!g_reader) return false;
+    for (int i = 0; i < 4; ++i) { out[i] = g_reader->ids[i].load(); if (out[i] < 0) return false; }
+    return true;
+}
+bool Found() { return g_reader && g_reader->nTyres.load() >= 4; }
 
 }  // namespace Surf
 
@@ -2102,6 +2111,7 @@ private:
     std::atomic<int>   m_cfgRev{0};         // bumped by the menu whenever m_cfg changes
     std::atomic<float> m_dStat{0}, m_dLoadL{1}, m_dLoadR{1}, m_dAir{0};
     std::atomic<bool>  m_stageReset{false};
+    rsa::DynamicAudio  m_audio;            // sounds for the ground under each tyre; off until the menu switch is on
     std::atomic<bool>  m_carRescan{false};
     std::string m_carName, m_carPreset;    // guarded by m_mtx
     std::mutex m_mtx;
@@ -2309,6 +2319,7 @@ private:
 
         const auto t0 = Clock::now();
         auto lastRx = t0 - std::chrono::seconds(10);
+        bool audioQuiet = false;               // the audio has been told that telemetry stopped
         auto lastPkt = t0, lastApply = t0, nextTry = t0, tapLastRx = t0 - std::chrono::seconds(10), nextRescan = t0;
 
         // Which car is this? The name comes from RSF / RBR (see ResolveCarIdentity). We keep polling rather than relying on
@@ -2346,14 +2357,16 @@ private:
             m_packets++;
             m_source = source;
             const float pdt = std::max(0.0f, std::chrono::duration<float>(ts - lastPkt).count());
-            lastPkt = ts; lastRx = ts;
-            if (pdt > 1.0f) carForce = true;                   // telemetry is back after a pause: probably a new stage, maybe a new car
+            lastPkt = ts; lastRx = ts; audioQuiet = false;
+            if (pdt > 1.0f) { carForce = true; m_audio.telemetryLost(); }   // telemetry is back after a pause: probably a new stage, maybe a new car
             if (m_stageReset.exchange(false)) {                 // the car is at the start line: learn its static load again
+                m_audio.newStage();
                 for (int i = 0; i < 4; ++i) dsp.statRef[i] = Ema();
                 dsp.thumpL = dsp.thumpR = 0;
                 dsp.airT = 0; dsp.landWin = 0; dsp.totLow = 1.0f;
             }
             ParsePacket(eff, data, n, live, dsp, pdt);
+            m_audio.feed(data, n, std::chrono::duration<double>(ts.time_since_epoch()).count());
             if (live.carIndex >= 0 && live.carIndex != curSlot) { curSlot = live.carIndex; carForce = true; }
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
@@ -2363,6 +2376,7 @@ private:
             if (!dumped) { DumpPacket(data, n); dumped = true; }
         };
 
+        m_audio.setActive(base.fxAudio != 0);
         while (m_run) {
             // Wait for a packet from either source (or 20 ms), then handle everything that has arrived.
             if (nWait) {
@@ -2396,7 +2410,9 @@ private:
                 seenRev = m_cfgRev.load();
                 { std::lock_guard<std::mutex> lk(m_mtx); base = m_cfg; }
                 ApplyProfile(base, prof, eff);
+                m_audio.setActive(base.fxAudio != 0);
             }
+            if (!audioQuiet && std::chrono::duration<double>(now - lastRx).count() > 0.5) { audioQuiet = true; m_audio.telemetryLost(); }   // menus, pause, stage end: let the loops fade out
             if (m_carRescan.exchange(false)) carForce = true;
             if (carForce || now >= nextCarPoll) {
                 carForce = false;
@@ -2424,7 +2440,7 @@ private:
             m_dStat = sig.staticLoad; m_dLoadL = sig.loadL; m_dLoadR = sig.loadR; m_dAir = sig.airborne;
             {   // the ground class is only read while telemetry is flowing (a stage is running)
                 const bool telemLive = !m_test && std::chrono::duration<double>(now - lastRx).count() < 0.4;
-                if (telemLive) Surf::Feed(base.fxSurface != 0);
+                if (telemLive) Surf::Feed(base.fxSurface != 0 || base.fxAudio != 0);
                 for (int w = 0; w < 4; ++w) sig.surf[w] = telemLive ? Surf::Current(w) : 0;
             }
 
@@ -2500,6 +2516,7 @@ private:
             Sleep(30);
         }
         ff.Destroy();
+        m_audio.telemetryLost();
         if (useTap) PacketTap::Deactivate();
         if (sock != INVALID_SOCKET) {
             WSAEventSelect(sock, sockEvent, 0);
@@ -2527,6 +2544,7 @@ private:
     void BuildRows() {
         const float M = (float)kHardTotalMax;
         m_rows = {
+            {"Dynamic audio",                    "EnableDynamicAudio", &Config::fxAudio,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             // effect switches (turn effects off to feel the others on their own)
             {"Effect: Engine",                   "EnableEngine",       &Config::fxEngine,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Road texture",             "EnableRoad",         &Config::fxRoad,       nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
@@ -2622,6 +2640,7 @@ private:
     static const char* TipFor(const char* key) {
         struct T { const char* k; const char* t; };
         static const T tips[] = {
+            {"EnableDynamicAudio", "Plays tyre and ground sounds that follow each wheel: rolling noise, squeal, sliding, flying stones, bumps and landings, with the sound of each surface. Needs sound files in ForceFXAudio\\sounds and settings in ForceFXAudio.ini. Off by default; loading takes a moment when you switch it on."},
             {"EnableEngine",       "Turns the engine vibration on or off. Handy for feeling what each effect does on its own."},
             {"EnableRoad",         "Turns the road texture and bump vibration on or off."},
             {"EnableBrake",        "Turns the braking judder and front-wheel lock-up shake on or off."},
@@ -2689,6 +2708,7 @@ private:
                  m_dStat.load(), m_dLoadL.load(), m_dLoadR.load(), m_dAir.load(), m_dHeat.load());
         line(buf);
         line(Surf::Status().c_str());
+        line(m_audio.status().c_str());
         y += 6.0f;
 
         uint8_t pkt[2048]; int len;
@@ -2731,6 +2751,14 @@ public:
         SyncConfig(m_cfg, m_iniPath, false);
         m_userGain = m_cfg.userGain;
         Surf::Start(m_iniPath);               // reads which ground is under the tyres
+        {
+            rsa::DynamicAudio::Hooks h;
+            h.readIds = [](int ids[4]) { return Surf::Ids(ids); };
+            h.idsAvailable = []() { return Surf::Found(); };
+            h.idsStatus = []() { return Surf::Status(); };
+            h.log = [](const std::string& s) { Logf("%s", s.c_str()); };
+            m_audio.configure(g_dir, h);
+        }
 
         if (m_cfg.telemetrySource != 2) {
             const bool ok = PacketTap::Install(m_cfg.minPacket);
@@ -2754,8 +2782,9 @@ public:
     }
 
     ~ForceFXPlugin() {
+        Disconnect();                      // stops the telemetry thread, the only one that feeds the audio
+        m_audio.shutdown();
         Surf::Stop();
-        Disconnect();
         GameDeviceTap::I().Remove();       // put the original vtable entries back before our DLL goes away
         if (!PacketTap::Remove()) {
             PinThisDll();
