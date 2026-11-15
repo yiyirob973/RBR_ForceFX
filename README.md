@@ -47,6 +47,7 @@ ForceFX reads the contact data RBR keeps for each tyre (read-only; it never writ
 
 - Switch it on or off, and set how strongly it applies, from **Plugins > ForceFX** (`Effect: Surface feel` and `Surface feel strength`) or with `EnableSurfaceFeel` and `SurfaceStrength` in `ForceFX.ini`. At 0% the road feels the same on every surface.
 - The `[Surface]` section of `ForceFX.ini` tunes each surface (gravel, snow, ice, soft ground) separately and can correct the surface type of a single material id with `Map=`. Edits there take effect when RBR starts.
+- All four tyres are read separately, so a car with two wheels on grass and two on tarmac feels the difference on each side. Each side mixes its front and rear tyre (`FrontWeight`), and `TyreOrder` in the `[Surface]` section says which tyre object is which wheel.
 - The ground is read only while a stage is running. Finding the tyre data takes a short scan of the game's memory at the start of each stage, in the background.
 - The Diagnostics page shows the detected surface and the material ids under the four tyres. `ForceFX.log` records each surface change.
 - It relies on the memory layout of the RallySimFans `RichardBurnsRally_SSE.exe`. On a build with a different layout the plugin simply finds no tyre data and the road feels as it did before.

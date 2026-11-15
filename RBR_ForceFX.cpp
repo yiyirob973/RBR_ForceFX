@@ -70,6 +70,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdarg>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -1259,7 +1260,7 @@ struct Signals {
     // weight / suspension load, relative to this car's own static load (1 = at rest)
     float loadL = 1, loadR = 1, loadF = 1;
     float airborne = 0;   // 0 = wheels loaded, 1 = off the ground
-    int   surf = 0;       // ground class under the car (Surf::Cls); 0 = unknown, which changes nothing
+    int   surf[4] = {0, 0, 0, 0};   // ground class under each tyre, in the order FL, FR, RL, RR (Surf::Cls); 0 = unknown, which changes nothing
     float thumpL = 0, thumpR = 0;   // compression / landing envelope per side
     unsigned evtSeq = 0;  // goes up by one for every landing or hard hit; the synth starts one boost per event
     float evtSev = 0;     // severity of the current event 0..1 (refined upward while a landing is still compressing)
@@ -1512,6 +1513,7 @@ struct Feel {
 constexpr Feel kNeutral = {1.0f, 0.0f, 0.0f, 1.0f, 0.55f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f};
 
 float g_fade = 0.25f;        // seconds to cross-fade between two surfaces
+float g_front = 0.65f;       // share of a side's surface feel that comes from its front tyre (the rear tyre gets the rest)
 int   g_map[256];            // per-id override of the class, stored as class+1 (0 = use the built-in table)
 Feel  g_feel[C_COUNT] = {
     kNeutral,                                                                          // unknown
@@ -1569,7 +1571,7 @@ inline Feel Blend(const float w[C_COUNT], float strength) {
 
 struct Synth {
     float sm[S_COUNT] = {};
-    float surfW[Surf::C_COUNT] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};     // cross-faded weight of each ground class
+    float surfW[4][Surf::C_COUNT] = {{1.0f}, {1.0f}, {1.0f}, {1.0f}};      // cross-faded weight of each ground class, per tyre (FL, FR, RL, RR)
     float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
     float jAge = 5.0f, evAmp = 0.0f;                       // age and severity of the current landing event
     unsigned seenEvt = 0;
@@ -1627,23 +1629,32 @@ struct Synth {
         const float sideTex[2] = { s.texL, s.texR };
         const float sideLoad[2] = { s.loadL, s.loadR };
         // surface character: cross-fades between the per-surface values; with an unknown surface (or the switch off) every value is neutral
-        Surf::Feel fe = Surf::kNeutral;
+        // Every tyre has its own ground. Each side of the road effect mixes its front and rear tyre, the front weighing more
+        // because it is what the steering feels, so left tyres on grass and right tyres on tarmac feel different.
+        Surf::Feel fes[2] = {Surf::kNeutral, Surf::kNeutral};                        // [0] = left, [1] = right
         if (c.fxSurface) {
             const float aw = alphaFor(dt, Surf::g_fade);
-            for (int i = 0; i < Surf::C_COUNT; ++i) surfW[i] += ((i == s.surf ? 1.0f : 0.0f) - surfW[i]) * aw;
-            fe = Surf::Blend(surfW, c.surfaceStrength);
+            for (int w = 0; w < 4; ++w)
+                for (int i = 0; i < Surf::C_COUNT; ++i) surfW[w][i] += ((i == s.surf[w] ? 1.0f : 0.0f) - surfW[w][i]) * aw;
+            const float fw = Surf::g_front;
+            for (int k2 = 0; k2 < 2; ++k2) {                                          // front tyre of this side is wheel k2, rear tyre is wheel 2 + k2
+                float mix[Surf::C_COUNT];
+                for (int i = 0; i < Surf::C_COUNT; ++i) mix[i] = fw * surfW[k2][i] + (1.0f - fw) * surfW[2 + k2][i];
+                fes[k2] = Surf::Blend(mix, c.surfaceStrength);
+            }
         }
         float texSide[2], loadGain[2];                                                // [0] = left, [1] = right
         for (int k2 = 0; k2 < 2; ++k2) {
             const float tm = texMono + (clamp01(sideTex[k2] + 0.9f * s.bump) - texMono) * c.roadDirectional;
             texSide[k2] = clamp01(tm + c.thumpGain * wf * thump[k2]);                 // a heavier car thumps harder on landing
-            texSide[k2] = std::max(texSide[k2], fe.floor);                            // smooth ground still gives a faint feel (snow, ice)
+            texSide[k2] = std::max(texSide[k2], fes[k2].floor);                            // smooth ground still gives a faint feel (snow, ice)
             loadGain[k2] = 1.0f + c.loadInfluence * (clampf(sideLoad[k2], 0.4f, 1.8f) - 1.0f);   // a more heavily loaded tyre transmits more
         }
         const float roadAir = 1.0f - c.airborneFade * s.airborne;                     // wheels off the ground: no road feel
         if (t >= nextJit) {                                                           // every ~12 ms, pick a new random strength and pitch per side
             for (int k2 = 0; k2 < 2; ++k2) {
                 const float tx = texSide[k2];
+                const Surf::Feel& fe = fes[k2];
                 const float gr = clamp01(c.roadGrain + fe.grainAdd);
                 roadJit[k2] = 1.0f + (0.10f + 0.40f * gr * (tx > 0.3f ? 1.0f : 0.5f)) * rnd();
                 const float lo = std::max(0.02f, 1.0f - 0.65f * gr - fe.dropout);     // strength varies between lo and 1
@@ -1655,6 +1666,7 @@ struct Synth {
         }
         float t3[2];
         for (int k2 = 0; k2 < 2; ++k2) {
+            const Surf::Feel& fe = fes[k2];
             const float spd = c.roadMinHz + (c.roadMaxHz - c.roadMinHz) * clamp01(0.35f * spN + 0.65f * texSide[k2]);
             float hzR = spd * roadJit[k2] * (k2 ? 1.31f : 1.0f) / std::sqrt(wf);                  // the two sides are detuned; heavier cars sound lower
             if (fe.hz != 1.0f) hzR = clampf(hzR * fe.hz, 20.0f, kHardMaxHz);
@@ -1696,9 +1708,10 @@ struct Synth {
         follow(S_ENG1, t1, 0.35f, 0.15f);
         follow(S_ENG2, t2, 0.25f, 0.12f);
         const float roadDown = clampf(0.40f / wf, 0.15f, 0.70f);                     // heavier cars let the thump ring out longer
-        const float roadRel = clampf(roadDown * fe.rel, 0.05f, 0.95f);              // gravel and ice let go fast, snow slowly
-        follow(S_ROAD,  c.fxRoad ? tRoadA : 0.0f, fe.atk, roadRel);
-        follow(S_ROADR, c.fxRoad ? tRoadB : 0.0f, fe.atk, roadRel);
+        const Surf::Feel& feA = fes[sA]; const Surf::Feel& feB = fes[sB];            // each road effect follows its own side's ground
+        const float relA = clampf(roadDown * feA.rel, 0.05f, 0.95f), relB = clampf(roadDown * feB.rel, 0.05f, 0.95f);   // gravel and ice let go fast, snow slowly
+        follow(S_ROAD,  c.fxRoad ? tRoadA : 0.0f, feA.atk, relA);
+        follow(S_ROADR, c.fxRoad ? tRoadB : 0.0f, feB.atk, relB);
         follow(S_BRAKE, c.fxBrake ? t4 : 0.0f, 0.50f, 0.20f);
         // Priority: road beats engine. A lower layer backs off while a higher one is active.
         const float pR = c.roadMaxMag > 0 ? clamp01(std::max(std::fabs(sm[S_ROAD]), std::fabs(sm[S_ROADR])) / (float)c.roadMaxMag) : 0.0f;
@@ -1743,14 +1756,14 @@ namespace Surf {
 
 class Reader {
 public:
-    std::atomic<int> cls{C_NONE};
+    std::atomic<int> clsWheel[4];            // ground class under each tyre: FL, FR, RL, RR
     std::atomic<int> ids[4];
     std::atomic<int> nTyres{0};
     std::atomic<int64_t> fed{0};
     std::atomic<bool> stage{false};
     std::atomic<bool> wanted{true};          // the menu switch: when off, nothing is scanned or read
 
-    Reader() { for (auto& a : ids) a = -1; }
+    Reader() { for (auto& a : ids) a = -1; for (auto& a : clsWheel) a = C_NONE; }
 
     void Begin(const std::string& iniPath) {
         ini_ = iniPath;
@@ -1785,7 +1798,9 @@ private:
     void* chunk_ = nullptr;
     std::vector<Range> excl_;
     Clock::time_point nextScan_ = Clock::now();
-    int retry_ = 0, committed_ = C_NONE, cand_ = C_NONE, candTicks_ = 0, noneTicks_ = 0;
+    int retry_ = 0;
+    struct Wheel { int committed = C_NONE, cand = C_NONE, candTicks = 0, noneTicks = 0; } wheel_[4];
+    int wheelOf_[4] = {2, 3, 0, 1};          // which wheel (0 FL, 1 FR, 2 RL, 3 RR) each tyre object is, in the order the scan finds them
     uint32_t scans_ = 0;
     int failLogs_ = 0, classLogs_ = 0;
 
@@ -1820,8 +1835,25 @@ private:
             if (fresh) { char o[32]; snprintf(o, sizeof(o), "%g", v); Wr(k, o); return; }
             GetPrivateProfileStringA(K, k, "", b, sizeof(b), ini_.c_str()); if (b[0]) v = (float)atof(b);
         };
-        F("FadeSeconds", g_fade);
+        F("FadeSeconds", g_fade); F("FrontWeight", g_front);
         I("ReadHz", readHz_); I("CommitMs", commitMs_); I("TyreVtable", vtableCfg_, true);
+        {   // which wheel each tyre object is, in the order the scan finds them (measured on test drives: rear pair first, then front pair)
+            std::string order = "RL,RR,FL,FR";
+            if (fresh) Wr("TyreOrder", order.c_str());
+            else { GetPrivateProfileStringA(K, "TyreOrder", "", b, sizeof(b), ini_.c_str()); if (b[0]) order = b; }
+            int map[4], n = 0;
+            std::string tok;
+            for (size_t i = 0; i <= order.size() && n < 4; ++i) {
+                const char ch = i < order.size() ? (char)toupper((unsigned char)order[i]) : ',';
+                if (ch == ',' || ch == ' ' || ch == ';') {
+                    if (tok == "FL") map[n++] = 0; else if (tok == "FR") map[n++] = 1; else if (tok == "RL") map[n++] = 2; else if (tok == "RR") map[n++] = 3;
+                    tok.clear();
+                } else tok += ch;
+            }
+            bool ok = n == 4;
+            for (int a = 0; ok && a < 4; ++a) for (int c2 = a + 1; c2 < 4; ++c2) if (map[a] == map[c2]) ok = false;
+            if (ok) for (int a = 0; a < 4; ++a) wheelOf_[a] = map[a];
+        }
         const char* names[C_COUNT] = {"", "Tarmac", "Gravel", "Snow", "Ice", "Soft"};
         const char* const* keys = FeelKeys();
         float Feel::* const* mem = FeelMembers();
@@ -1830,7 +1862,7 @@ private:
         std::string map;
         if (fresh) Wr("Map", ""); else { GetPrivateProfileStringA(K, "Map", "", b, sizeof(b), ini_.c_str()); map = b; }
         ParseMap(map);
-        g_fade = clampf(g_fade, 0.05f, 3.0f);
+        g_fade = clampf(g_fade, 0.05f, 3.0f); g_front = clampf(g_front, 0.0f, 1.0f);
         readHz_ = std::max(5, std::min(readHz_, 100)); commitMs_ = std::max(0, std::min(commitMs_, 2000));
     }
     // "88:snow,92:none,129:soft": correct the class of single ids
@@ -1922,13 +1954,16 @@ private:
 
     // ---------------------------------------------------------------- one reading
     void Tick() {
-        int votes[C_COUNT] = {0};
-        int total = 0, alive = 0, shown = 0;
+        int votes[4][C_COUNT] = {{0}};
+        int total[4] = {0, 0, 0, 0};
+        int alive = 0, idx = 0;
         for (auto& a : ids) a = -1;
         for (Tyre& t : tyres_) {
+            const int w = idx < 4 ? wheelOf_[idx] : -1;
+            ++idx;
             if (!ReadTyre(t)) { t.blkChanges = 0; continue; }
             ++alive;
-            if (t.blkChanges == 0) continue;                                     // not proven live (a stale copy of an old stage never changes)
+            if (w < 0 || t.blkChanges == 0) continue;                            // not proven live (a stale copy of an old stage never changes)
             int last = -1;
             for (int k = 0; k < kRecCount; ++k) {
                 const Rec& r = t.rec[k];
@@ -1936,9 +1971,9 @@ private:
                 const int id = (int)(r.w < 0.5f ? r.a : r.b);
                 last = id;
                 const int c = ClassOfId(id);
-                if (c != C_NONE) { ++votes[c]; ++total; }
+                if (c != C_NONE) { ++votes[w][c]; ++total[w]; }
             }
-            if (shown < 4) ids[shown++] = last;
+            ids[w] = last;
         }
         if (alive == 0) {
             tyres_.clear(); nTyres = 0;
@@ -1946,28 +1981,35 @@ private:
             Commit(C_NONE, true);
             return;
         }
-        int best = C_NONE, bv = 0;
-        for (int c = C_TARMAC; c < C_COUNT; ++c) if (votes[c] > bv) { bv = votes[c]; best = c; }
-        Commit(total >= 2 ? best : C_NONE, false);
+        for (int w = 0; w < 4; ++w) {
+            int best = C_NONE, bv = 0;
+            for (int c = C_TARMAC; c < C_COUNT; ++c) if (votes[w][c] > bv) { bv = votes[w][c]; best = c; }
+            Commit(w, total[w] >= 1 ? best : C_NONE, false);
+        }
     }
 
     // a new class has to hold for CommitMs before it is used, so a single stray record can't flicker the feel
-    void Set(int c) {
-        if (c != committed_ && classLogs_ < 300) { ++classLogs_; Log("ground is now %s", ClsName(c)); }
-        committed_ = c; cls = c;
+    void Set(int w, int c) {
+        Wheel& S = wheel_[w];
+        static const char* const nm[4] = {"front left", "front right", "rear left", "rear right"};
+        if (c != S.committed && classLogs_ < 300) { ++classLogs_; Log("%s ground is now %s", nm[w], ClsName(c)); }
+        S.committed = c; clsWheel[w] = c;
     }
-    void Commit(int c, bool now) {
+    void Commit(int w, int c, bool now) {
+        Wheel& S = wheel_[w];
         const int need = std::max(1, commitMs_ * readHz_ / 1000);
-        if (now) { Set(c); cand_ = c; candTicks_ = 0; return; }
+        if (now) { Set(w, c); S.cand = c; S.candTicks = 0; return; }
         if (c == C_NONE) {                                                       // nothing readable: hold the last class for a second
-            if (++noneTicks_ >= readHz_) Set(C_NONE);
+            if (++S.noneTicks >= readHz_) Set(w, C_NONE);
             return;
         }
-        noneTicks_ = 0;
-        if (c == committed_) { cand_ = c; candTicks_ = 0; return; }
-        if (c != cand_) { cand_ = c; candTicks_ = 1; } else ++candTicks_;
-        if (candTicks_ >= (committed_ == C_NONE ? std::max(1, need / 2) : need)) { Set(c); candTicks_ = 0; }
+        S.noneTicks = 0;
+        if (c == S.committed) { S.cand = c; S.candTicks = 0; return; }
+        if (c != S.cand) { S.cand = c; S.candTicks = 1; } else ++S.candTicks;
+        if (S.candTicks >= (S.committed == C_NONE ? std::max(1, need / 2) : need)) { Set(w, c); S.candTicks = 0; }
     }
+    void Commit(int c, bool now) { for (int w = 0; w < 4; ++w) Commit(w, c, now); }
+    bool AnyClass() const { for (const auto& a : clsWheel) if (a.load() != C_NONE) return true; return false; }
 
     void Loop() {
         try { LoopImpl(); } catch (...) { Log("the surface reader stopped after an exception"); }
@@ -1985,12 +2027,12 @@ private:
         while (run_) {
             Sleep((DWORD)(1000 / readHz_));
             const bool alive = NowMs() - fed.load() < 700;                       // telemetry only flows while a stage is running
-            if (!wanted.load()) { if (cls.load() != C_NONE) Commit(C_NONE, true); SetStatus("Surface: off"); continue; }
+            if (!wanted.load()) { if (AnyClass()) Commit(C_NONE, true); SetStatus("Surface: off"); continue; }
             if (stage.exchange(false)) {
                 tyres_.clear(); nTyres = 0; retry_ = 0; nextScan_ = Clock::now() + std::chrono::seconds(4);
                 Commit(C_NONE, true);
             }
-            if (!alive) { if (cls.load() != C_NONE) Commit(C_NONE, true); SetStatus("Surface: waiting for a stage"); continue; }
+            if (!alive) { if (AnyClass()) Commit(C_NONE, true); SetStatus("Surface: waiting for a stage"); continue; }
             if (tyres_.empty()) {
                 if (Clock::now() >= nextScan_) {
                     FindTyres();
@@ -2000,7 +2042,7 @@ private:
                 continue;
             }
             Tick();
-            SetStatus("Surface: %s  (tyres %d, ids %d %d %d %d)", ClsName(cls.load()), (int)tyres_.size(), ids[0].load(), ids[1].load(), ids[2].load(), ids[3].load());
+            SetStatus("Surface: FL %s, FR %s, RL %s, RR %s  (tyres %d, ids FL %d FR %d RL %d RR %d)", ClsName(clsWheel[0].load()), ClsName(clsWheel[1].load()), ClsName(clsWheel[2].load()), ClsName(clsWheel[3].load()), (int)tyres_.size(), ids[0].load(), ids[1].load(), ids[2].load(), ids[3].load());
         }
         VirtualFree(chunk_, 0, MEM_RELEASE); chunk_ = nullptr;
     }
@@ -2024,7 +2066,7 @@ void Stop() { if (g_reader) { g_reader->End(); delete g_reader; g_reader = nullp
 // Called while telemetry is flowing (a stage is running); 'want' is the menu switch.
 void Feed(bool want) { if (g_reader) { g_reader->wanted = want; g_reader->fed = Reader::Now(); } }
 void OnStage() { if (g_reader) g_reader->stage = true; }
-int  Current() { return g_reader ? g_reader->cls.load() : (int)C_NONE; }
+int  Current(int wheel) { return g_reader ? g_reader->clsWheel[wheel & 3].load() : (int)C_NONE; }   // 0 FL, 1 FR, 2 RL, 3 RR
 std::string Status() { return g_reader ? g_reader->Status() : std::string(); }
 
 }  // namespace Surf
@@ -2383,7 +2425,7 @@ private:
             {   // the ground class is only read while telemetry is flowing (a stage is running)
                 const bool telemLive = !m_test && std::chrono::duration<double>(now - lastRx).count() < 0.4;
                 if (telemLive) Surf::Feed(base.fxSurface != 0);
-                sig.surf = telemLive ? Surf::Current() : 0;
+                for (int w = 0; w < 4; ++w) sig.surf[w] = telemLive ? Surf::Current(w) : 0;
             }
 
             PollHotkeys(now, base);
