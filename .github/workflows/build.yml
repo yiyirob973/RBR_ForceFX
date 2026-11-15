@@ -46,7 +46,13 @@ jobs:
           
           # Pass the zip's name on to the release step
           echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
-
+      - name: Upload build ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ForceFX-package
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+          
       - name: Create GitHub Release and Upload Zip
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
