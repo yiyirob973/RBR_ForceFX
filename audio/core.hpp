@@ -96,7 +96,8 @@ struct Settings {
     float masterVolume = 1.0f;
     float totalGain = 1.0f;            // final output gain, applied after the soft limiter (linear, 1.0 = unchanged)
     bool normalizeSounds = true;       // bring all sound files to a common loudness when loading
-    double eventLevel = 1.0, rumbleLevel = 1.0;   // one-shots (stones, impacts, landings) and road-edge rumble
+    double eventLevel = 1.0, rumbleLevel = 1.0;   // impacts and landings, and road-edge rumble
+    double stoneLevel = 2.0;           // stones and debris thrown at the car (separate from impacts: they are quick, light sounds that need more gain)
     double loopBoost = 2.0;            // extra rolling-noise gain at full slip / very rough ground (0 = flat level)
     double loopLevel = 0.25, squealLevel = 0.5, slideLevel = 0.5;   // mix levels per tyre (each of 4 tyres has its own)
     bool cabinEffect = true;           // sound as heard from inside the car: muffled, bassy, with cabin reflections
@@ -162,6 +163,7 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "NormalizeSounds") s.normalizeSounds = toBool(v);
     else if (key == "LoopLevel") s.loopLevel = d();
     else if (key == "EventLevel") s.eventLevel = clampd(d(), 0.0, 4.0);
+    else if (key == "StoneLevel") s.stoneLevel = clampd(d(), 0.0, 6.0);
     else if (key == "RumbleLevel") s.rumbleLevel = clampd(d(), 0.0, 4.0);
     else if (key == "LoopRoughBoost") s.loopBoost = clampd(d(), 0.0, 10.0);
     else if (key == "SquealLevel") s.squealLevel = d();

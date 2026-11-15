@@ -427,7 +427,7 @@ private:
 class MixerSink : public IAudioSink {
 public:
     // map = null: build one from the bank with the default material table.
-    MixerSink(Mixer& mixer, const SoundBank& bank, const Settings& s, const SoundSetMap* map = nullptr) : mixer_(mixer), bank_(bank), eventLevel_((float)s.eventLevel), rumbleLevel_((float)s.rumbleLevel) {
+    MixerSink(Mixer& mixer, const SoundBank& bank, const Settings& s, const SoundSetMap* map = nullptr) : mixer_(mixer), bank_(bank), eventLevel_((float)s.eventLevel), stoneLevel_((float)s.stoneLevel), rumbleLevel_((float)s.rumbleLevel) {
         if (!map) { ownTable_.reset(new MaterialTable()); own_.reset(new SoundSetMap(bank, *ownTable_, s)); map = own_.get(); }
         map_ = map;
         int n = map_->count();
@@ -463,8 +463,11 @@ public:
             case SoundEvent::Landing: v = bank_.get("debris_landing"); if (!v) v = bank_.get("debris_impact"); break;
         }
         if (!v || v->empty()) return;
-        mixer_.playOneShot(&(*v)[rng_() % v->size()], gl * eventLevel_, gr * eventLevel_, rate);
+        const float g = kind == SoundEvent::StoneHit ? stoneLevel_ * liveStone_.load() : eventLevel_ * liveImpact_.load();
+        mixer_.playOneShot(&(*v)[rng_() % v->size()], gl * g, gr * g, rate);
     }
+    // Live multipliers from the in-game menu, applied on top of StoneLevel / EventLevel. Safe to call from any thread.
+    void setLiveLevels(float stones, float impacts) { liveStone_ = stones; liveImpact_ = impacts; }
     void silence() override {
         for (int w = 0; w < 4; ++w)
             for (size_t i = 0; i < wheel_[w].size(); ++i) { set(wheel_[w], (int)i, 0, 0, 1); set(slide_[w], (int)i, 0, 0, 1); set(squeal_[w], (int)i, 0, 0, 1); }
@@ -476,7 +479,8 @@ private:
         v[i]->tgtL = gl; v[i]->tgtR = gr; v[i]->rate = rate;
     }
     Mixer& mixer_; const SoundBank& bank_;
-    float eventLevel_ = 1.0f, rumbleLevel_ = 1.0f;
+    float eventLevel_ = 1.0f, stoneLevel_ = 2.0f, rumbleLevel_ = 1.0f;
+    std::atomic<float> liveStone_{1.0f}, liveImpact_{1.0f};
     std::unique_ptr<MaterialTable> ownTable_; std::unique_ptr<SoundSetMap> own_;
     const SoundSetMap* map_ = nullptr;
     std::vector<LoopVoice*> wheel_[4], slide_[4], squeal_[4];

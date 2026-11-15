@@ -153,6 +153,8 @@ struct Config {
     // effect switches (menu): 1 = on, 0 = off
     int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandBoost = 1, fxSurface = 1;
     int   fxAudio = 0;               // dynamic surface audio (settings in ForceFXAudio.ini); off until switched on
+    float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in ForceFXAudio.ini)
+    float audioImpact = 1.0f;        // 0..4 live multiplier on impacts and landings (on top of EventLevel)
 
     // per-layer ceilings (DirectInput units 0..10000), a combined ceiling, and one live level (userGain)
     int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 2000;
@@ -232,6 +234,7 @@ void ClampConfig(Config& c) {
     c.brakeHzScale = clampf(c.brakeHzScale, 0.5f, 2.0f);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
     c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0; c.fxAudio = c.fxAudio ? 1 : 0;
+    c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f);
     c.landingBoost = clampf(c.landingBoost, 0.0f, 4.0f);
     c.landingAdd = clampf(c.landingAdd, 0.0f, 1.0f);
     c.landingThresh = clampf(c.landingThresh, 0.5f, 3.0f);
@@ -278,7 +281,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     F("ImpactGain", c.impactGain);
     F("BrakeHzScale", c.brakeHzScale); F("PriorityDuck", c.priorityDuck);
     I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("EnableBrake", c.fxBrake);
-    I("EnableDynamicAudio", c.fxAudio); I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
+    I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
@@ -2377,6 +2380,7 @@ private:
         };
 
         m_audio.setActive(base.fxAudio != 0);
+        m_audio.setLevels(base.audioDebris, base.audioImpact);
         while (m_run) {
             // Wait for a packet from either source (or 20 ms), then handle everything that has arrived.
             if (nWait) {
@@ -2411,6 +2415,7 @@ private:
                 { std::lock_guard<std::mutex> lk(m_mtx); base = m_cfg; }
                 ApplyProfile(base, prof, eff);
                 m_audio.setActive(base.fxAudio != 0);
+                m_audio.setLevels(base.audioDebris, base.audioImpact);
             }
             if (!audioQuiet && std::chrono::duration<double>(now - lastRx).count() > 0.5) { audioQuiet = true; m_audio.telemetryLost(); }   // menus, pause, stage end: let the loops fade out
             if (m_carRescan.exchange(false)) carForce = true;
@@ -2545,6 +2550,8 @@ private:
         const float M = (float)kHardTotalMax;
         m_rows = {
             {"Dynamic audio",                    "EnableDynamicAudio", &Config::fxAudio,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
+            {"Audio: debris level",              "AudioDebrisLevel",   nullptr, &Config::audioDebris, 0.0f,   4.0f, 0.1f,  'x', false},
+            {"Audio: impact / landing level",    "AudioImpactLevel",   nullptr, &Config::audioImpact, 0.0f,   4.0f, 0.1f,  'x', false},
             // effect switches (turn effects off to feel the others on their own)
             {"Effect: Engine",                   "EnableEngine",       &Config::fxEngine,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Road texture",             "EnableRoad",         &Config::fxRoad,       nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
@@ -2641,6 +2648,8 @@ private:
         struct T { const char* k; const char* t; };
         static const T tips[] = {
             {"EnableDynamicAudio", "Plays tyre and ground sounds that follow each wheel: rolling noise, squeal, sliding, flying stones, bumps and landings, with the sound of each surface. Needs sound files in ForceFXAudio\\sounds and settings in ForceFXAudio.ini. Off by default; loading takes a moment when you switch it on."},
+            {"AudioDebrisLevel",   "How loud the stones and debris thrown at the car are, on top of StoneLevel in ForceFXAudio.ini. Changes apply while you drive."},
+            {"AudioImpactLevel",   "How loud bump impacts and landings are, on top of EventLevel in ForceFXAudio.ini."},
             {"EnableEngine",       "Turns the engine vibration on or off. Handy for feeling what each effect does on its own."},
             {"EnableRoad",         "Turns the road texture and bump vibration on or off."},
             {"EnableBrake",        "Turns the braking judder and front-wheel lock-up shake on or off."},

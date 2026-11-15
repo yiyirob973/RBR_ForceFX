@@ -3,7 +3,10 @@
 #include <cstdio>
 #include <functional>
 #include <random>
+#include <filesystem>
+#include <fstream>
 #include "core.hpp"
+#include "audio.hpp"
 
 using namespace rsa;
 
@@ -84,6 +87,50 @@ TEST(no_per_surface_setting_is_involved) {
     // the same telemetry gives the same stones whatever the sound names say: nothing in Settings maps a surface to a stone level
     Settings a, b; b.surfaceNames[3] = "ice"; b.classVolume[3] = 0.1f;
     CHECK(run(20.0, 20.0, 0.5f, 0.5f, 15.0, a, 5) == run(20.0, 20.0, 0.5f, 0.5f, 15.0, b, 5));
+}
+
+// ---------------------------------------------------------------- stone loudness
+static void writeTestWav(const std::string& path, int samples, double amp) {     // 16-bit mono PCM, decaying burst
+    std::vector<int16_t> d(samples);
+    for (int i = 0; i < samples; ++i) d[i] = (int16_t)(32767.0 * amp * std::sin(i * 0.3) * (1.0 - (double)i / samples));
+    std::ofstream f(path, std::ios::binary);
+    auto w32 = [&](uint32_t v) { f.write((const char*)&v, 4); }; auto w16 = [&](uint16_t v) { f.write((const char*)&v, 2); };
+    f.write("RIFF", 4); w32(36 + samples * 2); f.write("WAVEfmt ", 8); w32(16); w16(1); w16(1); w32(kSampleRate); w32(kSampleRate * 2); w16(2); w16(16);
+    f.write("data", 4); w32(samples * 2); f.write((const char*)d.data(), samples * 2);
+}
+// Peak output after triggering one stone through a real mixer and sink.
+static float stonePeak(double stoneLevel, float live) {
+    std::string dir = (std::filesystem::temp_directory_path() / "stone_level_test").string();
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    writeTestWav(dir + "/debris_stone_1.wav", 4000, 0.8);
+    SoundBank bank; bank.load(dir); Settings st; st.stoneLevel = stoneLevel; Mixer mixer; mixer.master = 0.2f;   // low drive keeps the soft limiter linear
+    MixerSink sink(mixer, bank, st); sink.setLiveLevels(live, 1.0f);
+    sink.trigger(SoundEvent::StoneHit, 0, 0.5f, 0.5f, 1.0f);
+    std::vector<float> buf(2 * 512); float peak = 0;
+    for (int i = 0; i < 4; ++i) { mixer.read(buf.data(), 512); for (float x : buf) peak = std::max(peak, std::fabs(x)); }
+    std::filesystem::remove_all(dir);
+    return peak;
+}
+TEST(stone_level_scales_the_stone_loudness) {
+    float base = stonePeak(1.0, 1.0f), loud = stonePeak(2.0, 1.0f), off = stonePeak(0.0, 1.0f);
+    CHECK(base > 0.001f);
+    CHECK(loud > 1.6f * base && loud < 2.4f * base);
+    CHECK(off < 1e-6f);
+}
+TEST(live_menu_multiplier_stacks_on_the_ini_level) {
+    float base = stonePeak(1.0, 1.0f), half = stonePeak(1.0, 0.5f), triple = stonePeak(1.0, 3.0f);
+    CHECK(half > 0.4f * base && half < 0.6f * base);
+    CHECK(triple > 2.5f * base);
+}
+TEST(stone_level_ini_key_is_read_and_clamped) {
+    std::string p = (std::filesystem::temp_directory_path() / "stone_level.ini").string();
+    { std::ofstream f(p); f << "StoneLevel = 3.5\nEventLevel = 0.5\n"; }
+    Settings s; CHECK(loadSettings(p, s)); CHECK(s.stoneLevel > 3.49 && s.stoneLevel < 3.51); CHECK(s.eventLevel > 0.49 && s.eventLevel < 0.51);
+    { std::ofstream f(p); f << "StoneLevel = 99\n"; }
+    Settings s2; CHECK(loadSettings(p, s2)); CHECK(s2.stoneLevel <= 6.0);
+    { std::ofstream f(p); f << "# nothing\n"; }
+    Settings s3; CHECK(loadSettings(p, s3)); CHECK(s3.stoneLevel > 1.99 && s3.stoneLevel < 2.01);   // default is louder than the old shared level
+    std::filesystem::remove(p);
 }
 
 int main() {
