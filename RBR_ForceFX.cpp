@@ -155,6 +155,7 @@ struct Config {
     int   fxAudio = 0;               // dynamic surface audio (settings in ForceFXAudio.ini); off until switched on
     float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in ForceFXAudio.ini)
     float audioImpact = 1.0f;        // 0..4 live multiplier on impacts and landings (on top of EventLevel)
+    float audioSusp = 1.0f;          // 0..4 live multiplier on suspension creaks and bottoming out (on top of SqueakLevel / BottomOutLevel)
 
     // per-layer ceilings (DirectInput units 0..10000), a combined ceiling, and one live level (userGain)
     int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 2000;
@@ -234,7 +235,7 @@ void ClampConfig(Config& c) {
     c.brakeHzScale = clampf(c.brakeHzScale, 0.5f, 2.0f);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
     c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0; c.fxAudio = c.fxAudio ? 1 : 0;
-    c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f);
+    c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f);
     c.landingBoost = clampf(c.landingBoost, 0.0f, 4.0f);
     c.landingAdd = clampf(c.landingAdd, 0.0f, 1.0f);
     c.landingThresh = clampf(c.landingThresh, 0.5f, 3.0f);
@@ -281,7 +282,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     F("ImpactGain", c.impactGain);
     F("BrakeHzScale", c.brakeHzScale); F("PriorityDuck", c.priorityDuck);
     I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("EnableBrake", c.fxBrake);
-    I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
+    I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp); I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
@@ -1495,83 +1496,13 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 // The switch and the overall strength are in the menu (Plugins > ForceFX) and in ForceFX.ini; every per-surface value is in
 // the [Surface] section of ForceFX.ini.
 // ====================================================================================================================
+// The surface classes, their per-surface feel values and the id-to-class table live in surface_feel.hpp (testable on its own).
+// It is included here, inside the anonymous namespace, because the surface reader below extends the same Surf namespace.
+#include "surface_feel.hpp"
 namespace Surf {
-
-enum Cls { C_NONE = 0, C_TARMAC, C_GRAVEL, C_SNOW, C_ICE, C_SOFT, C_COUNT };
-inline const char* ClsName(int c) {
-    static const char* const n[C_COUNT] = {"unknown", "tarmac", "gravel", "snow", "ice", "soft"};
-    return c >= 0 && c < C_COUNT ? n[c] : "?";
-}
-
-struct Feel {
-    float amp;        // multiplier on the road strength
-    float grainAdd;   // added to RoadGrain (0..1): how random the strength and pitch are
-    float dropout;    // extra drop of the weakest hits (0..0.6): gaps between grains
-    float hz;         // multiplier on the road pitch
-    float atk;        // how fast the effect rises (0.05..1)
-    float rel;        // multiplier on how fast it dies away (large = short, sharp hits)
-    float base;       // multiplier on the everyday strength between hits
-    float spark;      // chance per 12 ms and side of a single hard hit (a stone, a crack)
-    float sparkMul;   // strength of that hit
-    float floor;      // the least texture level: smooth ground still gives a faint feel
-};
-constexpr Feel kNeutral = {1.0f, 0.0f, 0.0f, 1.0f, 0.55f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f};
-
-float g_fade = 0.25f;        // seconds to cross-fade between two surfaces
-float g_front = 0.65f;       // share of a side's surface feel that comes from its front tyre (the rear tyre gets the rest)
-int   g_map[256];            // per-id override of the class, stored as class+1 (0 = use the built-in table)
-Feel  g_feel[C_COUNT] = {
-    kNeutral,                                                                          // unknown
-    kNeutral,                                                                          // tarmac
-    {1.00f,  0.10f, 0.25f, 1.10f, 0.60f, 1.8f, 1.00f, 0.07f, 1.6f, 0.20f},           // gravel
-    {0.55f, -0.70f, 0.00f, 0.50f, 0.12f, 0.3f, 0.90f, 0.00f, 1.0f, 0.22f},           // snow
-    {0.90f, -0.40f, 0.00f, 1.35f, 0.90f, 2.2f, 0.30f, 0.10f, 2.4f, 0.30f},           // ice
-    {0.90f, -0.20f, 0.05f, 0.80f, 0.35f, 0.5f, 1.00f, 0.00f, 1.0f, 0.18f}};          // soft
-
-inline const char* const* FeelKeys() {
-    static const char* const k[10] = {"Amp", "Grain", "Dropout", "Hz", "Attack", "Release", "Base", "Spark", "SparkMul", "Floor"};
-    return k;
-}
-inline float Feel::* const* FeelMembers() {
-    static float Feel::* const m[10] = {&Feel::amp, &Feel::grainAdd, &Feel::dropout, &Feel::hz, &Feel::atk,
-                                        &Feel::rel, &Feel::base, &Feel::spark, &Feel::sparkMul, &Feel::floor};
-    return m;
-}
-
-// Which class a material id belongs to. The gravel and tarmac families up to 55 are verified against the game's material table;
-// the rest come from the table's order and from driving (see ForceFX_surfaces.txt), so [Surface] Map= can correct any of them.
-// Anything not listed is "unknown" and leaves the feel unchanged.
-inline int DefaultClass(int id) {
-    auto in = [id](int a, int b) { return id >= a && id <= b; };
-    if (id == 88) return C_SNOW;                                                                                  // snow wall base: only seen on snow stages
-    if (in(1, 23) || in(33, 35) || in(41, 43) || in(49, 51) || in(153, 155) || in(177, 199)) return C_GRAVEL;   // gravel (US2 / BR2 sets too)
-    if (in(133, 135) || in(141, 143) || in(149, 151) || in(161, 163)) return C_GRAVEL;                            // dirt / gravel roads
-    if (in(37, 39) || in(45, 47) || in(53, 55) || in(65, 87)) return C_TARMAC;                                    // six tarmac families of three: clean, sprinkled, covered
-    if (in(101, 103)) return C_SNOW;                                                                              // snow on gravel (shallow, medium, deep)
-    if (in(117, 119)) return C_ICE;                                                                               // snow on ice (shallow, medium, deep)
-    if (in(93, 99) || in(105, 115) || in(121, 131) || in(137, 139)) return C_SOFT;                                // grass, rough verge
-    return C_NONE;                                                                                                // unknown, trees, rocks, walls, water: nothing changes
-}
-inline int ClassOfId(int id) {
-    if (id < 0 || id > 255) return C_NONE;
-    return g_map[id] > 0 ? g_map[id] - 1 : DefaultClass(id);
-}
-
-// Weighted mix of the per-class values (w sums to 1), then scaled by the strength (0 = no change at all, 1 = as tuned, up to 1.5).
-inline Feel Blend(const float w[C_COUNT], float strength) {
-    Feel r = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    float Feel::* const* m = FeelMembers();
-    for (int p = 0; p < 10; ++p) {
-        float v = 0;
-        for (int i = 0; i < C_COUNT; ++i) v += w[i] * g_feel[i].*m[p];
-        r.*m[p] = kNeutral.*m[p] + (v - kNeutral.*m[p]) * strength;
-    }
-    r.atk = clampf(r.atk, 0.05f, 1.0f); r.rel = clampf(r.rel, 0.05f, 4.0f); r.hz = clampf(r.hz, 0.3f, 2.0f);
-    r.dropout = clampf(r.dropout, 0.0f, 0.6f); r.spark = clampf(r.spark, 0.0f, 0.5f); r.floor = clampf(r.floor, 0.0f, 0.6f);
-    r.amp = std::max(0.0f, r.amp); r.base = std::max(0.0f, r.base); r.sparkMul = clampf(r.sparkMul, 0.5f, 3.0f);
-    return r;
-}
-
+float g_fade = 0.25f;                // seconds to cross-fade between two surfaces
+float g_front = 0.65f;               // share of a side's surface feel that comes from its front tyre (the rear tyre gets the rest)
+Feel* const g_feel = DefaultFeels(); // per-class feel values (the ini's [Surface] section edits these)
 }  // namespace Surf
 
 struct Synth {
@@ -1675,6 +1606,10 @@ struct Synth {
             const float spd = c.roadMinHz + (c.roadMaxHz - c.roadMinHz) * clamp01(0.35f * spN + 0.65f * texSide[k2]);
             float hzR = spd * roadJit[k2] * (k2 ? 1.31f : 1.0f) / std::sqrt(wf);                  // the two sides are detuned; heavier cars sound lower
             if (fe.hz != 1.0f) hzR = clampf(hzR * fe.hz, 20.0f, kHardMaxHz);
+            if (fe.ridgeMix > 0.0f && fe.ridge > 0.0f) {                                          // cobbles, planks: the pitch is the speed over the ridge spacing
+                const float hzRidge = Surf::RidgeHz(s.speed, fe.ridge * (k2 ? 1.07f : 1.0f), c.roadMinHz, c.roadMaxHz);   // the sides differ a little: they never hit the same ridge together
+                hzR += (hzRidge - hzR) * fe.ridgeMix;
+            }
             hz[k2 == 0 ? S_ROAD : S_ROADR] = hzR;
             t3[k2] = c.roadMaxMag * 0.7f * texSide[k2] * gSpd * ampJit[k2] * loadGain[k2] * roadAir * fe.amp;   // the two road effects share the road budget
         }
@@ -1772,7 +1707,7 @@ public:
 
     void Begin(const std::string& iniPath) {
         ini_ = iniPath;
-        for (int i = 0; i < 256; ++i) g_map[i] = 0;
+        for (int i = 0; i < 256; ++i) IdMap()[i] = 0;
         Load();
         run_ = true;
         th_ = std::thread(&Reader::Loop, this);
@@ -1859,11 +1794,12 @@ private:
             for (int a = 0; ok && a < 4; ++a) for (int c2 = a + 1; c2 < 4; ++c2) if (map[a] == map[c2]) ok = false;
             if (ok) for (int a = 0; a < 4; ++a) wheelOf_[a] = map[a];
         }
-        const char* names[C_COUNT] = {"", "Tarmac", "Gravel", "Snow", "Ice", "Soft"};
         const char* const* keys = FeelKeys();
         float Feel::* const* mem = FeelMembers();
-        for (int c = C_TARMAC; c < C_COUNT; ++c)
-            for (int p = 0; p < 10; ++p) F((std::string(names[c]) + keys[p]).c_str(), g_feel[c].*mem[p]);
+        for (int c = C_TARMAC; c < C_COUNT; ++c) {
+            for (int p = 0; p < kFeelParams; ++p) F((std::string(ClsIniName(c)) + keys[p]).c_str(), g_feel[c].*mem[p]);
+            g_feel[c].ridge = g_feel[c].ridge <= 0.0f ? 0.0f : clampf(g_feel[c].ridge, kRidgeMin, kRidgeMax);
+        }
         std::string map;
         if (fresh) Wr("Map", ""); else { GetPrivateProfileStringA(K, "Map", "", b, sizeof(b), ini_.c_str()); map = b; }
         ParseMap(map);
@@ -1871,22 +1807,7 @@ private:
         readHz_ = std::max(5, std::min(readHz_, 100)); commitMs_ = std::max(0, std::min(commitMs_, 2000));
     }
     // "88:snow,92:none,129:soft": correct the class of single ids
-    void ParseMap(const std::string& m) {
-        size_t p = 0;
-        while (p < m.size()) {
-            size_t q = m.find(',', p);
-            std::string t = m.substr(p, q == std::string::npos ? std::string::npos : q - p);
-            p = q == std::string::npos ? m.size() : q + 1;
-            const size_t c = t.find(':');
-            if (c == std::string::npos) continue;
-            const int id = atoi(t.substr(0, c).c_str());
-            std::string n = t.substr(c + 1);
-            n.erase(std::remove_if(n.begin(), n.end(), [](char ch) { return ch == ' ' || ch == '\t' || ch == '\r'; }), n.end());
-            n = LowerStr(n);
-            for (int k = 0; k < C_COUNT; ++k)
-                if (n == ClsName(k) || (k == C_NONE && n == "none")) { if (id >= 0 && id < 256) g_map[id] = k + 1; }
-        }
-    }
+    void ParseMap(const std::string& m) { ParseIdMap(m); }
 
     // ---------------------------------------------------------------- memory
     static bool Rd(uintptr_t a, void* d, size_t n) {
@@ -1957,6 +1878,19 @@ private:
         else if (failLogs_++ < 2) Log("no tyre objects yet (scan %u, %u objects with vtable 0x%X); will keep looking while the stage loads", scans_, (unsigned)hits.size(), (unsigned)vt_);
     }
 
+    // The first time the car drives on a ground that has no class, say which id it is, so it can be assigned with Map=.
+    // (The game's own table has no cobblestone or wooden bridge entry, so this is how those ids are found.)
+    bool unmappedSeen_[256] = {};
+    void NoteUnmapped(int id) {
+        if (id < 0 || id > 255 || unmappedSeen_[id]) return;
+        const rsa::MaterialInfo* known = nullptr;
+        for (const rsa::MaterialInfo& m : rsa::kMaterials) if (m.id == id) { known = &m; break; }
+        if (known && known->cls < 0) return;                                   // trees, rocks, walls and so on: not ground
+        unmappedSeen_[id] = true;
+        if (known) Log("ground material id %d (%s) has no surface class; add Map=%d:gravel (or tarmac, snow, ice, soft, cobble, wood) in [Surface] to give it one", id, known->name, id);
+        else Log("ground material id %d is not in the game's table and has no surface class; if this is cobblestone or a wooden bridge add Map=%d:cobble (or wood) in [Surface]", id, id);
+    }
+
     // ---------------------------------------------------------------- one reading
     void Tick() {
         int votes[4][C_COUNT] = {{0}};
@@ -1977,6 +1911,7 @@ private:
                 last = id;
                 const int c = ClassOfId(id);
                 if (c != C_NONE) { ++votes[w][c]; ++total[w]; }
+                else NoteUnmapped(id);
             }
             ids[w] = last;
         }
@@ -2380,7 +2315,7 @@ private:
         };
 
         m_audio.setActive(base.fxAudio != 0);
-        m_audio.setLevels(base.audioDebris, base.audioImpact);
+        m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
         while (m_run) {
             // Wait for a packet from either source (or 20 ms), then handle everything that has arrived.
             if (nWait) {
@@ -2415,7 +2350,7 @@ private:
                 { std::lock_guard<std::mutex> lk(m_mtx); base = m_cfg; }
                 ApplyProfile(base, prof, eff);
                 m_audio.setActive(base.fxAudio != 0);
-                m_audio.setLevels(base.audioDebris, base.audioImpact);
+                m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
             }
             if (!audioQuiet && std::chrono::duration<double>(now - lastRx).count() > 0.5) { audioQuiet = true; m_audio.telemetryLost(); }   // menus, pause, stage end: let the loops fade out
             if (m_carRescan.exchange(false)) carForce = true;
@@ -2552,6 +2487,7 @@ private:
             {"Dynamic audio",                    "EnableDynamicAudio", &Config::fxAudio,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Audio: debris level",              "AudioDebrisLevel",   nullptr, &Config::audioDebris, 0.0f,   4.0f, 0.1f,  'x', false},
             {"Audio: impact / landing level",    "AudioImpactLevel",   nullptr, &Config::audioImpact, 0.0f,   4.0f, 0.1f,  'x', false},
+            {"Audio: suspension level",          "AudioSuspensionLevel", nullptr, &Config::audioSusp, 0.0f,   4.0f, 0.1f,  'x', false},
             // effect switches (turn effects off to feel the others on their own)
             {"Effect: Engine",                   "EnableEngine",       &Config::fxEngine,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Road texture",             "EnableRoad",         &Config::fxRoad,       nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
@@ -2650,6 +2586,7 @@ private:
             {"EnableDynamicAudio", "Plays tyre and ground sounds that follow each wheel: rolling noise, squeal, sliding, flying stones, bumps and landings, with the sound of each surface. Needs sound files in ForceFXAudio\\sounds and settings in ForceFXAudio.ini. Off by default; loading takes a moment when you switch it on."},
             {"AudioDebrisLevel",   "How loud the stones and debris thrown at the car are, on top of StoneLevel in ForceFXAudio.ini. Changes apply while you drive."},
             {"AudioImpactLevel",   "How loud bump impacts and landings are, on top of EventLevel in ForceFXAudio.ini."},
+            {"AudioSuspensionLevel", "How loud suspension creaks and bottoming-out thumps are, on top of SqueakLevel and BottomOutLevel in ForceFXAudio.ini."},
             {"EnableEngine",       "Turns the engine vibration on or off. Handy for feeling what each effect does on its own."},
             {"EnableRoad",         "Turns the road texture and bump vibration on or off."},
             {"EnableBrake",        "Turns the braking judder and front-wheel lock-up shake on or off."},

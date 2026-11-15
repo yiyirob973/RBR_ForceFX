@@ -97,6 +97,9 @@ struct Settings {
     float totalGain = 1.0f;            // final output gain, applied after the soft limiter (linear, 1.0 = unchanged)
     bool normalizeSounds = true;       // bring all sound files to a common loudness when loading
     double eventLevel = 1.0, rumbleLevel = 1.0;   // impacts and landings, and road-edge rumble
+    double squeakLevel = 1.0, bottomLevel = 1.0;   // suspension creaks and bump-stop thumps
+    double squeakSensitivity = 1.0;    // how readily slow, loaded suspension travel makes a creak (0 = never)
+    double bottomRatio = 2.2;          // a tyre's strut load above this multiple of its normal load counts as bottoming out
     double stoneLevel = 2.0;           // stones and debris thrown at the car (separate from impacts: they are quick, light sounds that need more gain)
     double loopBoost = 2.0;            // extra rolling-noise gain at full slip / very rough ground (0 = flat level)
     double loopLevel = 0.25, squealLevel = 0.5, slideLevel = 0.5;   // mix levels per tyre (each of 4 tyres has its own)
@@ -123,7 +126,7 @@ struct Settings {
     float classVolume[4] = {0.7f, 1.0f, 0.9f, 0.6f};
 
     bool enableWheelLoops = true, enableSlide = true, enableSqueal = true, enableStones = true,
-         enableImpacts = true, enableLandings = true, enableRumble = true;
+         enableImpacts = true, enableLandings = true, enableRumble = true, enableSuspension = true;
     double stoneRate = 10.0;
     double impactMinVelocity = 0.35;
     bool debugLog = false;
@@ -198,6 +201,11 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "EnableImpacts") s.enableImpacts = toBool(v);
     else if (key == "EnableLandings") s.enableLandings = toBool(v);
     else if (key == "EnableRumble") s.enableRumble = toBool(v);
+    else if (key == "EnableSuspension") s.enableSuspension = toBool(v);
+    else if (key == "SqueakLevel") s.squeakLevel = clampd(d(), 0.0, 6.0);
+    else if (key == "BottomOutLevel") s.bottomLevel = clampd(d(), 0.0, 6.0);
+    else if (key == "SqueakSensitivity") s.squeakSensitivity = clampd(d(), 0.0, 4.0);
+    else if (key == "BottomOutRatio") s.bottomRatio = clampd(d(), 1.2, 8.0);
     else if (key == "StoneRate") s.stoneRate = d();
     else if (key == "ImpactMinVelocity") s.impactMinVelocity = d();
     else if (key == "DebugLog") s.debugLog = toBool(v);
@@ -424,6 +432,7 @@ public:
     double inferred[4] = {1, 0, 0, 0};   // from telemetry only
     int wetness = 0;                     // 0 dry, 1 damp, 2 wet (only known from game memory)
     double load = 0, loadRef = 0, roughness = 0, pistonHp = 0, pistonRms = 0, pistonRefRms = 0;
+    double pistonRaw = 0;                // damper piston velocity as reported (m/s): slow strokes are what make suspension squeak
     double revRate = 0, slip = 0, slipAngle = 0, slipNorm = 0;
     bool slipValid = false;
     double speed_ = 0;                  // ground speed (the car's speed over the ground), m/s
@@ -457,6 +466,7 @@ public:
         double denom = std::max(std::max(ls, 0.3 * loadRef), 1e-6);
         roughness = std::sqrt(fv) / denom;
 
+        pistonRaw = w.pistonVelocity;
         pistonHp = hpPiston_.process(w.pistonVelocity, dt);
         pistonRms = std::sqrt(pistonVar_.update(pistonHp * pistonHp, dt));
         pistonRefRms = std::sqrt(pistonRef_.update(pistonHp * pistonHp, dt));
@@ -752,7 +762,7 @@ private:
 };
 
 // ------------------------------------------------------------------ audio sink
-enum class SoundEvent { StoneHit, Impact, Landing };
+enum class SoundEvent { StoneHit, Impact, Landing, SuspSqueak, SuspBottom };
 
 constexpr int kMaxSets = 64;
 
@@ -832,6 +842,7 @@ public:
         if (s.enableImpacts && !a.airborne) impacts(a, s, sink, sv);
         if (s.enableLandings && a.justLanded && a.landingAirTime > 0.15) landing(a, sink, sv);
         if (s.enableStones && !a.airborne) stones(f, a, s, dt, sink, sv);
+        if (s.enableSuspension && !a.airborne) suspension(a, s, dt, sink, sv);
         rumble(a, s, sink);
         tyres(a, s, sink, sv);
     }
@@ -840,6 +851,7 @@ private:
     Rng& rng_;
     double cooldown_[4] = {0, 0, 0, 0};
     double stoneCooldown_ = 0;
+    double travel_[4] = {0, 0, 0, 0}, squeakCool_[4] = {0, 0, 0, 0}, bottomCool_[4] = {0, 0, 0, 0}, prevRatio_[4] = {0, 0, 0, 0};
 
     float rate(double spread) { return (float)(1.0 + (rng_.next() * 2.0 - 1.0) * spread); }
 
@@ -890,6 +902,42 @@ private:
         float gain = (float)(0.4 + 0.6 * rng_.next()) * (float)clampd(spray[wheel] / 100.0, 0.15, 1.0), l, rr;
         panGains(kWheelPan[wheel], gain * kWheelScale[wheel], l, rr);
         sink.trigger(SoundEvent::StoneHit, sv.dominant(wheel), l, rr, rate(0.12));
+    }
+
+    // Suspension sounds, both from the damper and strut telemetry of each tyre:
+    //  - A creak comes from slow travel under load (body roll, weight shifting, easing over a bump): the stroke the damper
+    //    makes while moving gently, weighted by how loaded the tyre is. Fast strokes are impacts and make no creak.
+    //  - Bottoming out is a sharp rise of the strut load far above the tyre's own normal load (the bump stop taking the hit).
+    // Nothing here depends on the surface: it follows how the car moves.
+    void suspension(SurfaceAnalyzer& a, const Settings& s, double dt, IAudioSink& sink, const SetView&) {
+        for (int w = 0; w < 4; ++w) {
+            const WheelAnalyzer& wa = a.wheels[w];
+            if (squeakCool_[w] > 0) squeakCool_[w] -= dt;
+            if (bottomCool_[w] > 0) bottomCool_[w] -= dt;
+
+            const double v = std::fabs(wa.pistonRaw);
+            const double slowLimit = 0.25;                       // m/s: faster than this is a knock, not a creak
+            if (s.squeakSensitivity > 0 && a.speedMs > 1.0 && v > 0.01 && v < slowLimit)
+                travel_[w] += v * dt * wa.loadFraction() * s.squeakSensitivity;
+            else
+                travel_[w] = std::max(0.0, travel_[w] - 0.02 * dt);          // gentle decay so odd moments don't pile up
+            const double need = 0.012;                           // metres of loaded slow travel per creak
+            if (travel_[w] > need && squeakCool_[w] <= 0) {
+                float intensity = (float)clampd(0.3 + 0.7 * wa.loadFraction() * (0.5 + rng_.next()), 0.2, 1.0), l, r;
+                panGains(kWheelPan[w], intensity * kWheelScale[w], l, r);
+                sink.trigger(SoundEvent::SuspSqueak, w, l, r, rate(0.12));
+                travel_[w] = 0; squeakCool_[w] = 0.5 + 0.5 * rng_.next();
+            }
+
+            const double ratio = wa.loadRef > 1e-6 ? wa.load / wa.loadRef : 0.0;
+            if (ratio > s.bottomRatio && prevRatio_[w] <= s.bottomRatio && bottomCool_[w] <= 0 && a.speedMs > 2.0) {
+                float intensity = (float)clampd(0.35 + (ratio - s.bottomRatio) / s.bottomRatio, 0.35, 1.0), l, r;
+                panGains(kWheelPan[w], intensity * kWheelScale[w], l, r);
+                sink.trigger(SoundEvent::SuspBottom, w, l, r, rate(0.06));
+                bottomCool_[w] = 0.3;
+            }
+            prevRatio_[w] = ratio;
+        }
     }
 
     // Road-edge rumble deliberately compares the two sides of the car.

@@ -108,10 +108,10 @@ public:
     }
 
     // Live debris and impact multipliers from the menu (1 = as set in ForceFXAudio.ini). Safe from any thread.
-    void setLevels(float debris, float impacts) {
-        liveDebris_ = debris; liveImpacts_ = impacts;
+    void setLevels(float debris, float impacts, float suspension) {
+        liveDebris_ = debris; liveImpacts_ = impacts; liveSusp_ = suspension;
         std::lock_guard<std::mutex> lk(mu_);
-        if (s_) s_->sink->setLiveLevels(debris, impacts);
+        if (s_) s_->sink->setLiveLevels(debris, impacts, suspension);
     }
 
     State state() const { return state_.load(); }
@@ -150,7 +150,7 @@ private:
     std::unique_ptr<Session> s_;
     std::thread loader_;
     std::atomic<bool> wantOn_{false}, loading_{false};
-    std::atomic<float> liveDebris_{1.0f}, liveImpacts_{1.0f};
+    std::atomic<float> liveDebris_{1.0f}, liveImpacts_{1.0f}, liveSusp_{1.0f};
     std::atomic<State> state_{Off};
     std::string error_, setsText_;
     long long frames_ = 0;
@@ -209,7 +209,7 @@ private:
             s->matTable.loadOverrides(dataDir + "materials.csv");
             s->sets.reset(new SoundSetMap(*s->bank, s->matTable, st));
             s->sink.reset(new MixerSink(*s->mixer, *s->bank, st, s->sets.get()));
-            s->sink->setLiveLevels(liveDebris_.load(), liveImpacts_.load());
+            s->sink->setLiveLevels(liveDebris_.load(), liveImpacts_.load(), liveSusp_.load());
             s->controller.reset(new SurfaceAudioController(st, *s->sink));
             s->controller->setSurfaceMemory(&mem_);
             s->controller->materials().loadOverrides(dataDir + "materials.csv");
@@ -237,7 +237,7 @@ private:
                 log("Dynamic audio: " + std::to_string(s->sets->count()) + " sound sets (" + labels + (s->sets->count() > 8 ? ", ..." : "") + ")");
                 std::lock_guard<std::mutex> lk(mu_);
                 setsText_ = std::to_string(s->sets->count()) + " sound sets from " + std::to_string(s->bank->fileCount) + " files";
-                s->sink->setLiveLevels(liveDebris_.load(), liveImpacts_.load());
+                s->sink->setLiveLevels(liveDebris_.load(), liveImpacts_.load(), liveSusp_.load());
                 s_ = std::move(s);
             }
             if (!wantOn_.load()) { teardown(); state_ = Off; loading_ = false; return; }
