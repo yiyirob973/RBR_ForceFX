@@ -1896,6 +1896,32 @@ private:
         else Log("ground material id %d is not in the game's table and has no surface class; if this is cobblestone or a wooden bridge add Map=%d:cobble (or wood) in [Surface]", id, id);
     }
 
+    // Every ground id the tyres touch is listed once with the class it got, so a surface that is being read as the wrong class
+    // (cobbles that share a tarmac id, say) shows up in the log as well as one that isn't known at all.
+    bool idSeen_[256] = {};
+    void NoteIdSeen(int id, int cls) {
+        if (id < 0 || id > 255 || idSeen_[id]) return;
+        idSeen_[id] = true;
+        const rsa::MaterialInfo* known = nullptr;
+        for (const rsa::MaterialInfo& m : rsa::kMaterials) if (m.id == id) { known = &m; break; }
+        Log("ground id %d (%s) is read as %s", id, known ? known->name : "not in the game's table", ClsName(cls));
+    }
+
+    // A live tyre whose three contact records gave nothing usable. Logged once per distinct set of values (at most 10).
+    std::vector<uint64_t> noRecSeen_;
+    void NoteNoRecord(int w, const Rec* r) {
+        if (noRecSeen_.size() >= 10) return;
+        uint64_t sig = 1469598103934665603ULL;
+        for (int k = 0; k < kRecCount; ++k) for (uint32_t v : {r[k].flag, r[k].a, r[k].b}) sig = (sig ^ v) * 1099511628211ULL;
+        for (uint64_t s : noRecSeen_) if (s == sig) return;
+        noRecSeen_.push_back(sig);
+        static const char* const nm[4] = {"front left", "front right", "rear left", "rear right"};
+        Log("%s: no usable contact record. records: [flag %u weight %.2f materials %u/%u] [flag %u weight %.2f materials %u/%u] [flag %u weight %.2f materials %u/%u]", nm[w],
+            (unsigned)r[0].flag, (double)r[0].w, (unsigned)r[0].a, (unsigned)r[0].b, (unsigned)r[1].flag, (double)r[1].w, (unsigned)r[1].a, (unsigned)r[1].b,
+            (unsigned)r[2].flag, (double)r[2].w, (unsigned)r[2].a, (unsigned)r[2].b);
+    }
+    bool deadLogged_ = false;
+
     // A contact record the plugin can't use (not flagged as touching, or a material number outside the table). Logged a few
     // times so a surface that reads as "unknown" can be explained instead of guessed at.
     int skippedLogs_ = 0;
@@ -1917,7 +1943,7 @@ private:
             if (!ReadTyre(t)) { t.blkChanges = 0; continue; }
             ++alive;
             if (w < 0 || t.blkChanges == 0) continue;                            // not proven live (a stale copy of an old stage never changes)
-            int last = -1;
+            int last = -1, usable = 0;
             for (int k = 0; k < kRecCount; ++k) {
                 const Rec& r = t.rec[k];
                 if (r.flag != 1 || r.a > 255 || r.b > 255) {
@@ -1925,19 +1951,23 @@ private:
                     continue;
                 }
                 const int id = (int)(r.w < 0.5f ? r.a : r.b);
-                last = id;
+                last = id; ++usable;
                 const int c = ClassOfId(id);
+                NoteIdSeen(id, c);
                 if (c != C_NONE) { ++votes[w][c]; ++total[w]; }
                 else NoteUnmapped(id);
             }
+            if (usable == 0) NoteNoRecord(w, t.rec);
             ids[w] = last;
         }
         if (alive == 0) {
+            if (!deadLogged_) { deadLogged_ = true; Log("the tyre objects can't be read any more (the stage ended or was reloaded): ground is unknown until they are found again"); }
             tyres_.clear(); nTyres = 0;
             retry_ = 0; nextScan_ = Clock::now() + std::chrono::seconds(3);
             Commit(C_NONE, true);
             return;
         }
+        deadLogged_ = false;
         for (int w = 0; w < 4; ++w) {
             int best = C_NONE, bv = 0;
             for (int c = C_TARMAC; c < C_COUNT; ++c) if (votes[w][c] > bv) { bv = votes[w][c]; best = c; }
@@ -1949,7 +1979,7 @@ private:
     void Set(int w, int c) {
         Wheel& S = wheel_[w];
         static const char* const nm[4] = {"front left", "front right", "rear left", "rear right"};
-        if (c != S.committed && classLogs_ < 300) { ++classLogs_; Log("%s ground is now %s", nm[w], ClsName(c)); }
+        if (c != S.committed && classLogs_ < 300) { ++classLogs_; Log("%s ground is now %s (material id %d)", nm[w], ClsName(c), ids[w].load()); }
         S.committed = c; clsWheel[w] = c;
     }
     void Commit(int w, int c, bool now) {
@@ -2017,7 +2047,7 @@ void Start(const std::string& ini) {
     if (g_reader) return;
     g_reader = new Reader();
     g_reader->Begin(ini);
-    Logf("Surface feel: reader started");
+    Logf("Surface feel: reader started (logging v3: every ground id the tyres touch is listed once, with its class)");
 }
 void Stop() { if (g_reader) { g_reader->End(); delete g_reader; g_reader = nullptr; } }
 // Called while telemetry is flowing (a stage is running); 'want' is the menu switch.
