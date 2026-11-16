@@ -1504,10 +1504,14 @@ namespace Surf {
 float g_fade = 0.25f;                // seconds to cross-fade between two surfaces
 float g_front = 0.65f;               // share of a side's surface feel that comes from its front tyre (the rear tyre gets the rest)
 Feel* const g_feel = DefaultFeels(); // per-class feel values (the ini's [Surface] section edits these)
+int   g_cobbleDetect = 1;            // 1 = ground the game calls tarmac blends into the cobble feel when the telemetry says it is cobbled
+float g_cobbleLo = 0.5f;             // rough-per-speed level (x100) where that blend starts ...
+float g_cobbleHi = 1.0f;             // ... and where it is complete
 }  // namespace Surf
 
 struct Synth {
     float sm[S_COUNT] = {};
+    Surf::CobbleDetector cob;                              // telemetry check for cobbles on ground the game calls tarmac
     float surfW[4][Surf::C_COUNT] = {{1.0f}, {1.0f}, {1.0f}, {1.0f}};      // cross-faded weight of each ground class, per tyre (FL, FR, RL, RR)
     float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
     float jAge = 5.0f, evAmp = 0.0f;                       // age and severity of the current landing event
@@ -1571,8 +1575,15 @@ struct Synth {
         Surf::Feel fes[2] = {Surf::kNeutral, Surf::kNeutral};                        // [0] = left, [1] = right
         if (c.fxSurface) {
             const float aw = alphaFor(dt, Surf::g_fade);
+            const float cobScore = Surf::g_cobbleDetect ? cob.update(s.rough, s.speed, s.airborne > 0.5f, dt, Surf::g_cobbleLo, Surf::g_cobbleHi) : 0.0f;
             for (int w = 0; w < 4; ++w)
-                for (int i = 0; i < Surf::C_COUNT; ++i) surfW[w][i] += ((i == s.surf[w] ? 1.0f : 0.0f) - surfW[w][i]) * aw;
+                for (int i = 0; i < Surf::C_COUNT; ++i) {
+                    float target = i == s.surf[w] ? 1.0f : 0.0f;
+                    if (s.surf[w] == Surf::C_TARMAC) {                                   // tarmac that shakes like cobbles is cobbles
+                        if (i == Surf::C_TARMAC) target = 1.0f - cobScore; else if (i == Surf::C_COBBLE) target = cobScore;
+                    }
+                    surfW[w][i] += (target - surfW[w][i]) * aw;
+                }
             const float fw = Surf::g_front;
             for (int k2 = 0; k2 < 2; ++k2) {                                          // front tyre of this side is wheel k2, rear tyre is wheel 2 + k2
                 float mix[Surf::C_COUNT];
@@ -1777,6 +1788,7 @@ private:
             GetPrivateProfileStringA(K, k, "", b, sizeof(b), ini_.c_str()); if (b[0]) v = (float)atof(b);
         };
         F("FadeSeconds", g_fade); F("FrontWeight", g_front);
+        I("CobbleDetect", g_cobbleDetect); F("CobbleDetectLow", g_cobbleLo); F("CobbleDetectHigh", g_cobbleHi);
         I("ReadHz", readHz_); I("CommitMs", commitMs_); I("TyreVtable", vtableCfg_, true);
         {   // which wheel each tyre object is, in the order the scan finds them (measured on test drives: rear pair first, then front pair)
             std::string order = "RL,RR,FL,FR";
@@ -1805,6 +1817,7 @@ private:
         if (fresh) Wr("Map", ""); else { GetPrivateProfileStringA(K, "Map", "", b, sizeof(b), ini_.c_str()); map = b; }
         ParseMap(map);
         g_fade = clampf(g_fade, 0.05f, 3.0f); g_front = clampf(g_front, 0.0f, 1.0f);
+        g_cobbleDetect = g_cobbleDetect ? 1 : 0; g_cobbleLo = clampf(g_cobbleLo, 0.0f, 20.0f); g_cobbleHi = clampf(g_cobbleHi, g_cobbleLo + 0.05f, 40.0f);
         readHz_ = std::max(5, std::min(readHz_, 100)); commitMs_ = std::max(0, std::min(commitMs_, 2000));
     }
     // "88:snow,92:none,129:soft": correct the class of single ids

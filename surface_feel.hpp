@@ -170,4 +170,29 @@ inline float RidgeHz(float speedMs, float ridgeM, float minHz, float maxHz) {
     return detail::clampf(hz, minHz, maxHz);
 }
 
+// Spots cobbles (and anything else hard but made of separate ridges) on ground the game calls tarmac, from the telemetry alone:
+// how rough the tyres' strut force is for the speed the car is doing. A probe drive on a cobbled stage (ground id 77) against plain
+// tarmac (id 37) gave a rough-per-speed level (x100) of about 0.4 on tarmac (75% of it under 0.5) and about 1.0 on cobbles
+// (75% of it above 0.8), the two cleanly apart once smoothed over about a second, so 0.5 to 1.0 is the default ramp.
+// Roughness means little at crawling speed and nothing in the air, so below 8 m/s the detector resets and in the air it holds.
+struct CobbleDetector {
+    float ema = 0.0f;
+    bool init = false;
+    static constexpr float kMinSpeedMs = 8.0f;
+    static float Ramp(float x, float lo, float hi) {
+        if (!(hi > lo)) hi = lo + 0.01f;
+        return x <= lo ? 0.0f : (x >= hi ? 1.0f : (x - lo) / (hi - lo));
+    }
+    // Returns 0 (plain tarmac) .. 1 (cobbles). dt in seconds, tau is the smoothing time.
+    float update(float rough, float speedMs, bool airborne, float dt, float lo, float hi, float tau = 0.8f) {
+        if (!std::isfinite(rough) || !std::isfinite(speedMs) || !(speedMs >= kMinSpeedMs)) { ema = 0.0f; init = false; return 0.0f; }
+        if (!airborne) {
+            const float x = std::max(0.0f, rough) / speedMs * 100.0f;
+            if (!init) { ema = x; init = true; }
+            else if (dt > 0.0f && std::isfinite(dt)) ema += (x - ema) * (1.0f - std::exp(-dt / std::max(0.05f, tau)));
+        }
+        return init ? Ramp(ema, lo, hi) : 0.0f;
+    }
+};
+
 }  // namespace Surf

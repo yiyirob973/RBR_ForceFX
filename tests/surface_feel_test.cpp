@@ -188,6 +188,59 @@ TEST(map_without_a_report_list_still_works_and_blank_entries_are_not_errors) {
     CHECK(ParseIdMap("90:wood") == 1);
 }
 
+// ---------------------------------------------------------------- telemetry cobble detection
+static float settle(CobbleDetector& d, float rough, float speed, int ticks, bool air = false) {
+    float s = 0; for (int i = 0; i < ticks; ++i) s = d.update(rough, speed, air, 0.01f, 0.5f, 1.0f); return s;
+}
+TEST(detector_reads_plain_tarmac_as_not_cobbled) {
+    CobbleDetector d;
+    CHECK(settle(d, 0.06f, 30.0f, 600) < 0.01f);                                            // 0.06 at 30 m/s -> 0.2: smooth tarmac
+}
+TEST(detector_levels_match_the_probe_drive) {
+    CobbleDetector t, c;
+    CHECK(settle(t, 0.12f, 30.0f, 600) < 0.05f);      // 0.12 at 30 m/s -> 0.4: tarmac
+    CHECK(settle(c, 0.30f, 30.0f, 600) > 0.95f);      // 0.30 at 30 m/s -> 1.0: cobbles
+}
+TEST(detector_ramps_smoothly_between_the_edges) {
+    float last = -1;
+    for (float r = 0.12f; r <= 0.33f; r += 0.03f) { CobbleDetector d; const float s = settle(d, r, 30.0f, 800); CHECK(s >= last); last = s; }
+    CobbleDetector m; const float mid = settle(m, 0.225f, 30.0f, 800);                       // 0.75: halfway
+    CHECK(mid > 0.4f && mid < 0.6f);
+}
+TEST(detector_does_not_jump_on_a_single_spike) {
+    CobbleDetector d; settle(d, 0.12f, 30.0f, 600);
+    const float s = d.update(3.0f, 30.0f, false, 0.01f, 0.5f, 1.0f);                         // one huge reading
+    CHECK(s < 0.2f);                                                                         // smoothing keeps it from flipping to cobble
+}
+TEST(detector_needs_time_to_settle_and_then_follows_the_ground) {
+    CobbleDetector d; settle(d, 0.12f, 30.0f, 600);
+    const float soon = settle(d, 0.30f, 30.0f, 10), later = settle(d, 0.30f, 30.0f, 400);    // 0.1 s, then 4 s more
+    CHECK(soon < 0.5f && later > 0.9f);
+    const float back = settle(d, 0.12f, 30.0f, 800);
+    CHECK(back < 0.1f);
+}
+TEST(detector_ignores_crawling_speed_and_resets) {
+    CobbleDetector d; settle(d, 0.30f, 30.0f, 600);
+    CHECK(settle(d, 0.30f, 5.0f, 5) == 0.0f);                                                // too slow to say
+    CHECK(d.init == false);
+    CHECK(d.update(0.30f, 0.0f, false, 0.01f, 0.5f, 1.0f) == 0.0f);                          // standing still
+}
+TEST(detector_holds_while_airborne) {
+    CobbleDetector d; const float before = settle(d, 0.30f, 30.0f, 600);
+    const float air = settle(d, 0.0f, 30.0f, 300, true);                                     // no roughness in the air must not read as smooth tarmac
+    CHECK(near(air, before, 1e-4f));
+}
+TEST(detector_is_safe_with_bad_numbers) {
+    CobbleDetector d;
+    CHECK(d.update(NAN, 30.0f, false, 0.01f, 0.5f, 1.0f) == 0.0f);
+    CHECK(d.update(0.3f, INFINITY, false, 0.01f, 0.5f, 1.0f) == 0.0f);
+    CHECK(d.update(-1.0f, 30.0f, false, 0.01f, 0.5f, 1.0f) == 0.0f);                         // negative roughness counts as none
+    CHECK(d.update(0.3f, 30.0f, false, 0.0f, 0.5f, 1.0f) >= 0.0f);                           // zero dt: no division, no change
+    CHECK(d.update(0.3f, 30.0f, false, -1.0f, 0.5f, 1.0f) <= 1.0f);
+    CHECK(near(CobbleDetector::Ramp(0.7f, 1.0f, 0.5f), 0.0f));                               // edges the wrong way round don't divide by zero
+    CHECK(near(CobbleDetector::Ramp(2.0f, 1.0f, 1.0f), 1.0f));
+}
+
 int main() {
     for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
     std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);
