@@ -152,6 +152,7 @@ struct Config {
 
     // effect switches (menu): 1 = on, 0 = off
     int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandBoost = 1, fxSurface = 1;
+    int   probe = 0;                 // 1 = write ForceFX_probe.csv (ground ids and road signals ten times a second) for tuning surfaces; read at start only
     int   fxAudio = 0;               // dynamic surface audio (settings in ForceFXAudio.ini); off until switched on
     float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in ForceFXAudio.ini)
     float audioImpact = 1.0f;        // 0..4 live multiplier on impacts and landings (on top of EventLevel)
@@ -282,7 +283,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     F("ImpactGain", c.impactGain);
     F("BrakeHzScale", c.brakeHzScale); F("PriorityDuck", c.priorityDuck);
     I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("EnableBrake", c.fxBrake);
-    I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp); I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
+    I("SurfaceProbe", c.probe); I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp); I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
@@ -1964,7 +1965,7 @@ private:
             if (!deadLogged_) { deadLogged_ = true; Log("the tyre objects can't be read any more (the stage ended or was reloaded): ground is unknown until they are found again"); }
             tyres_.clear(); nTyres = 0;
             retry_ = 0; nextScan_ = Clock::now() + std::chrono::seconds(3);
-            Commit(C_NONE, true);
+            ResetUnknown();
             return;
         }
         deadLogged_ = false;
@@ -1979,7 +1980,11 @@ private:
     void Set(int w, int c) {
         Wheel& S = wheel_[w];
         static const char* const nm[4] = {"front left", "front right", "rear left", "rear right"};
-        if (c != S.committed && classLogs_ < 300) { ++classLogs_; Log("%s ground is now %s (material id %d)", nm[w], ClsName(c), ids[w].load()); }
+        if (c != S.committed && classLogs_ < 300) {
+            ++classLogs_;
+            if (ids[w].load() >= 0) Log("%s ground is now %s (material id %d)", nm[w], ClsName(c), ids[w].load());
+            else Log("%s ground is now %s (no material read: telemetry stopped, the stage ended or was reset)", nm[w], ClsName(c));
+        }
         S.committed = c; clsWheel[w] = c;
     }
     void Commit(int w, int c, bool now) {
@@ -1996,6 +2001,9 @@ private:
         if (S.candTicks >= (S.committed == C_NONE ? std::max(1, need / 2) : need)) { Set(w, c); S.candTicks = 0; }
     }
     void Commit(int c, bool now) { for (int w = 0; w < 4; ++w) Commit(w, c, now); }
+    // Telemetry stopped or the stage was reset: every tyre goes back to unknown. The ids are cleared first so the log doesn't
+    // print the last ids it happened to read as if the car had just driven onto an unknown surface.
+    void ResetUnknown() { for (auto& a : ids) a = -1; Commit(C_NONE, true); }
     bool AnyClass() const { for (const auto& a : clsWheel) if (a.load() != C_NONE) return true; return false; }
 
     void Loop() {
@@ -2014,12 +2022,12 @@ private:
         while (run_) {
             Sleep((DWORD)(1000 / readHz_));
             const bool alive = NowMs() - fed.load() < 700;                       // telemetry only flows while a stage is running
-            if (!wanted.load()) { if (AnyClass()) Commit(C_NONE, true); SetStatus("Surface: off"); continue; }
+            if (!wanted.load()) { if (AnyClass()) ResetUnknown(); SetStatus("Surface: off"); continue; }
             if (stage.exchange(false)) {
                 tyres_.clear(); nTyres = 0; retry_ = 0; nextScan_ = Clock::now() + std::chrono::seconds(4);
-                Commit(C_NONE, true);
+                ResetUnknown();
             }
-            if (!alive) { if (AnyClass()) Commit(C_NONE, true); SetStatus("Surface: waiting for a stage"); continue; }
+            if (!alive) { if (AnyClass()) ResetUnknown(); SetStatus("Surface: waiting for a stage"); continue; }
             if (tyres_.empty()) {
                 if (Clock::now() >= nextScan_) {
                     FindTyres();
@@ -2062,6 +2070,10 @@ bool Ids(int out[4]) {
     return true;
 }
 bool Found() { return g_reader && g_reader->nTyres.load() >= 4; }
+// The raw ids and classes of the four tyres for the probe log (-1 = none).
+void Raw(int id[4], int cls[4]) {
+    for (int i = 0; i < 4; ++i) { id[i] = g_reader ? g_reader->ids[i].load() : -1; cls[i] = g_reader ? g_reader->clsWheel[i].load() : 0; }
+}
 
 }  // namespace Surf
 
@@ -2096,6 +2108,8 @@ private:
     std::atomic<int>   m_cfgRev{0};         // bumped by the menu whenever m_cfg changes
     std::atomic<float> m_dStat{0}, m_dLoadL{1}, m_dLoadR{1}, m_dAir{0};
     std::atomic<bool>  m_stageReset{false};
+    FILE*              m_probe = nullptr;   // ForceFX_probe.csv, only while SurfaceProbe=1
+    std::chrono::steady_clock::time_point m_probeT{};
     rsa::DynamicAudio  m_audio;            // sounds for the ground under each tyre; off until the menu switch is on
     std::atomic<bool>  m_carRescan{false};
     std::string m_carName, m_carPreset;    // guarded by m_mtx
@@ -2399,6 +2413,7 @@ private:
                 m_audio.setActive(base.fxAudio != 0);
                 m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
             }
+            if (base.probe) WriteProbe(live, now);
             if (!audioQuiet && std::chrono::duration<double>(now - lastRx).count() > 0.5) { audioQuiet = true; m_audio.telemetryLost(); }   // menus, pause, stage end: let the loops fade out
             if (m_carRescan.exchange(false)) carForce = true;
             if (carForce || now >= nextCarPoll) {
@@ -2774,7 +2789,25 @@ public:
         }
     }
 
+    // One line ten times a second while SurfaceProbe=1: what the tyres touch and what the road signals do there.
+    // Drive tarmac, then a cobbled stretch, then a bridge, and the columns show how they differ.
+    void WriteProbe(const Signals& s, std::chrono::steady_clock::time_point now) {
+        if (now - m_probeT < std::chrono::milliseconds(100)) return;
+        m_probeT = now;
+        if (!m_probe) {
+            m_probe = fopen((g_dir + "ForceFX_probe.csv").c_str(), "w");
+            if (!m_probe) return;
+            fprintf(m_probe, "t_s,speed_ms,id_fl,id_fr,id_rl,id_rr,cls_fl,cls_fr,cls_rl,cls_rr,rough,piston,texture,texL,texR,bump,airborne,loadL,loadR\n");
+        }
+        int id[4], cls[4]; Surf::Raw(id, cls);
+        fprintf(m_probe, "%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.3f,%.3f\n",
+                std::chrono::duration<double>(now.time_since_epoch()).count(), (double)s.speed, id[0], id[1], id[2], id[3], cls[0], cls[1], cls[2], cls[3],
+                (double)s.rough, (double)s.piston, (double)s.texture, (double)s.texL, (double)s.texR, (double)s.bump, (double)s.airborne, (double)s.loadL, (double)s.loadR);
+        fflush(m_probe);
+    }
+
     ~ForceFXPlugin() {
+        if (m_probe) { fclose(m_probe); m_probe = nullptr; }
         Disconnect();                      // stops the telemetry thread, the only one that feeds the audio
         m_audio.shutdown();
         Surf::Stop();
