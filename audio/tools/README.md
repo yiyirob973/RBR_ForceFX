@@ -3,11 +3,25 @@
 This folder comes with the **audio** build of ForceFX (`ForceFX-<version>.zip`). The no-audio build
 (`ForceFX-<version>-NoAudio.zip`) does not need it.
 
-ForceFX plays its tyre and ground sounds from WAV files in `Plugins\ForceFXAudio\sounds`.
-`Copy-RbrSounds.bat` fills that folder from your RBR installation. It reads the game's own tyre sounds in
-`Audio\Surfaces` (`Normal` = rolling, `Skid` = sliding) and copies them under the names ForceFX looks for, for example
-`Normal\gravel.wav` becomes `gravel_loop.wav` and `Skid\gravel.wav` becomes `gravel_squeal.wav` and `gravel_slide.wav`.
-RBR's own files are never changed.
+ForceFX plays its sounds from WAV files in `Plugins\ForceFXAudio\sounds`, found by name.
+`Copy-RbrSounds.bat` fills that folder from your RBR installation. It only reads RBR's `Audio` folder and never changes it.
+
+| From RBR's `Audio` folder | Copied as |
+|---|---|
+| `Surfaces\Normal` (tarmac, gravel, snow, water) | `<surface>_loop` |
+| `Surfaces\Skid` (tarmac, gravel, snow, water) | `<surface>_squeal` and `<surface>_slide` |
+| `Surfaces\Normal` and `Skid` `generic` | `grass_loop`, `grass_squeal`, `grass_slide` |
+| `Impact\Grus` | `debris_stone_1`, `_2`, ... (flying stones) |
+| `Impact\Medium` | `debris_impact_1`, `_2`, ... (bumps) |
+| `Impact\Heavy` | `debris_landing_1`, `_2`, ... (landings) |
+| `Cars\Effects\rumble.wav` | `debris_rumble` |
+| `Cars\Effects\SuspSqee` | `susp_squeak_1`, `_2`, ... (suspension creaks) |
+| `Cars\Effects\Suspen` | `susp_bottom_1`, `_2`, ... (bottoming out) |
+
+Where RBR has two versions of a surface sound (such as `gravel.wav` and `normgravel.wav`), the script uses the one that
+`Audio\Cars\Effects.ini` points at, so you get what the game itself plays. RBR has one skid sound per surface, so it
+serves as both the squeal and the slide. The stone, impact and landing sounds are picked by folder name, so if one
+sounds wrong, replace the matching `debris_*` files with your own.
 
 ## Run it
 

@@ -1,13 +1,25 @@
 <#
 .SYNOPSIS
-    Copies Richard Burns Rally's own tyre sounds into the ForceFX dynamic audio sounds folder.
+    Copies Richard Burns Rally's own sounds into the ForceFX dynamic audio sounds folder.
 
 .DESCRIPTION
-    RBR keeps its ground sounds in  <RBR>\Audio\Surfaces:
-        Normal\<surface>.wav   the sound of a tyre rolling on that surface
-        Skid\<surface>.wav     the sound of a tyre sliding on it
-    ForceFX looks for  <surface>_loop.wav  (rolling)  and  <surface>_squeal.wav / <surface>_slide.wav  (sliding),
-    so each file is copied under that name into  <this folder>\sounds.  RBR's own files are only read, never changed.
+    ForceFX plays WAV files from  <this folder>\sounds  and finds them by name (see audio\surfaces.md).
+    This script takes the matching sounds from RBR's Audio folder and copies them there under those names.
+    RBR's own files are only read, never changed.
+
+        RBR (under <RBR>\Audio)                      ForceFX name
+        Surfaces\Normal\<surface>                    <surface>_loop
+        Surfaces\Skid\<surface>                      <surface>_squeal and <surface>_slide
+        Impact\Grus\*                                debris_stone_1, _2 ...
+        Impact\Medium\*                              debris_impact_1, _2 ...
+        Impact\Heavy\*                               debris_landing_1, _2 ...
+        Cars\Effects\rumble.wav                      debris_rumble
+        Cars\Effects\SuspSqee\*                      susp_squeak_1, _2 ...
+        Cars\Effects\Suspen\*                        susp_bottom_1, _2 ...
+
+    Surfaces are tarmac, gravel, snow and water, plus RBR's "generic" ground sound, which becomes grass.
+    Where RBR has two versions of a surface sound (for example gravel.wav and normgravel.wav), the one that
+    Audio\Cars\Effects.ini points at is used, so you get what the game itself plays.
 
     Run it through Copy-RbrSounds.bat, or directly:
         powershell -ExecutionPolicy Bypass -File Copy-RbrSounds.ps1 -RbrDir "C:\Games\RichardBurnsRally"
@@ -33,76 +45,147 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# ---- What to copy -----------------------------------------------------------------------------------------------
+# Surface sounds: ForceFX name -> RBR file names to try, best first (without .wav, inside Surfaces\Normal or Surfaces\Skid).
+# Whatever Effects.ini names for that surface is tried before these.
+$surfaceFiles = [ordered]@{
+    'tarmac' = @{ Normal = @('normtarmac');           Skid = @('skidtarmac', 'tarm') }
+    'gravel' = @{ Normal = @('normgravel', 'gravel'); Skid = @('skidgravel', 'gravel') }
+    'snow'   = @{ Normal = @('normsnow', 'snow');     Skid = @('skidsnow', 'snow') }
+    'water'  = @{ Normal = @('normwater', 'water');   Skid = @('skidwater') }
+    'grass'  = @{ Normal = @('generic');              Skid = @('generic') }
+}
+# Rolling sound gets one name, the skid sound gets two (RBR has a single skid sound per surface).
+$surfaceSuffixes = @{ Normal = @('loop'); Skid = @('squeal', 'slide') }
+
+# Sets of variants: ForceFX name -> folder under Audio. Every .wav in it is copied as <name>_1, <name>_2 ...
+$variantSets = @(
+    @{ Name = 'debris_stone';   Folder = 'Impact\Grus' },
+    @{ Name = 'debris_impact';  Folder = 'Impact\Medium' },
+    @{ Name = 'debris_landing'; Folder = 'Impact\Heavy' },
+    @{ Name = 'susp_squeak';    Folder = 'Cars\Effects\SuspSqee' },
+    @{ Name = 'susp_bottom';    Folder = 'Cars\Effects\Suspen' }
+)
+$maxVariants = 32
+
+# Single files: ForceFX name -> file under Audio.
+$singleFiles = @(
+    @{ Name = 'debris_rumble'; File = 'Cars\Effects\rumble.wav' }
+)
+
+# ---- Helpers ----------------------------------------------------------------------------------------------------
 function Say([string]$text, [string]$color = '') {
     if ($color) { Write-Host $text -ForegroundColor $color } else { Write-Host $text }
 }
 
-# Rolling sound -> <name>_loop, sliding sound -> <name>_squeal and <name>_slide. RBR has one skid sound per surface,
-# and ForceFX blends between a squeal (light slip) and a slide (locked or sliding hard), so the one file serves both.
-$jobs = @(
-    @{ Folder = 'Normal'; Suffixes = @('loop') },
-    @{ Folder = 'Skid';   Suffixes = @('squeal', 'slide') }
-)
+$script:copied = 0
+$script:kept = 0
+
+function Put([string]$sourceFile, [string]$destName) {
+    $target = Join-Path $SoundsDir ($destName + '.wav')
+    $shortSource = $sourceFile.Substring($audio.Length + 1)
+    if ($OnlyMissing -and (Test-Path -LiteralPath $target)) {
+        Say ("  kept    {0}" -f (Split-Path $target -Leaf)); $script:kept++; return
+    }
+    if (-not $DryRun) { Copy-Item -LiteralPath $sourceFile -Destination $target -Force }
+    $verb = 'copied'; if ($DryRun) { $verb = 'would' }
+    Say ("  {0,-7} {1}  ->  {2}" -f $verb, $shortSource, (Split-Path $target -Leaf))
+    $script:copied++
+}
+
+# Numbers in a name sort as numbers, so 2.wav comes before 10.wav.
+function NaturalKey([string]$name) {
+    [regex]::Replace($name, '\d+', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $m.Value.PadLeft(8, '0') })
+}
 
 try {
     if (-not (Test-Path -LiteralPath $RbrDir -PathType Container)) {
         throw "The folder '$RbrDir' does not exist."
     }
-    $audio = Join-Path $RbrDir 'Audio'
-    if (-not (Test-Path -LiteralPath $audio -PathType Container)) {
+    $audio = (Resolve-Path -LiteralPath (Join-Path $RbrDir 'Audio') -ErrorAction SilentlyContinue)
+    if (-not $audio) {
         throw ("There is no Audio folder in '$RbrDir'. Pick the folder that contains RichardBurnsRally.exe. " +
                "If RBR only has an Audio.dat file there, extract it first (for example with the RBR DAT tool) so the Audio folder exists.")
     }
-    $surfaces = Join-Path $audio 'Surfaces'
-    if (-not (Test-Path -LiteralPath $surfaces -PathType Container)) {
-        throw "There is no Surfaces folder in '$audio', so there are no tyre sounds to copy."
-    }
+    $audio = $audio.Path.TrimEnd('\')
 
     if (-not $SoundsDir) { $SoundsDir = Join-Path $PSScriptRoot 'sounds' }
     if (-not $DryRun -and -not (Test-Path -LiteralPath $SoundsDir)) {
         New-Item -ItemType Directory -Path $SoundsDir | Out-Null
     }
 
-    Say "RBR sounds : $surfaces"
+    Say "RBR audio  : $audio"
     Say "Copying to : $SoundsDir"
     if ($DryRun) { Say 'Dry run: nothing will be copied.' 'Yellow' }
-    Say ''
 
-    $copied = 0; $skipped = 0; $notWav = @()
-    foreach ($job in $jobs) {
-        $src = Join-Path $surfaces $job.Folder
-        if (-not (Test-Path -LiteralPath $src -PathType Container)) {
-            Say "No $($job.Folder) folder in Surfaces, skipping it." 'Yellow'
-            continue
-        }
-        foreach ($file in Get-ChildItem -LiteralPath $src -File) {
-            if ($file.Extension -ne '.wav') { $notWav += $file.FullName; continue }
-            $name = ($file.BaseName.ToLowerInvariant() -replace '[^a-z0-9]+', '_').Trim('_')
-            if (-not $name) { continue }
-            foreach ($suffix in $job.Suffixes) {
-                $target = Join-Path $SoundsDir ("{0}_{1}.wav" -f $name, $suffix)
-                if ($OnlyMissing -and (Test-Path -LiteralPath $target)) {
-                    Say ("  kept     {0}" -f (Split-Path $target -Leaf)); $skipped++; continue
-                }
-                if (-not $DryRun) { Copy-Item -LiteralPath $file.FullName -Destination $target -Force }
-                Say ("  {0,-8} {1}\{2}  ->  {3}" -f $(if ($DryRun) { 'would' } else { 'copied' }), $job.Folder, $file.Name, (Split-Path $target -Leaf))
-                $copied++
+    # What the game itself plays for each surface: lines like  NormalGravel = Audio\Surfaces\Normal\gravel
+    $fromIni = @{}
+    $iniPath = Join-Path $audio 'Cars\Effects.ini'
+    if (Test-Path -LiteralPath $iniPath) {
+        foreach ($line in Get-Content -LiteralPath $iniPath) {
+            if ($line -match '^\s*(Normal|Skid)([A-Za-z0-9]+)\s*=\s*(\S.*?)\s*(;.*)?$') {
+                $kind = $Matches[1]; $surface = $Matches[2].ToLowerInvariant(); $path = $Matches[3]
+                if ($surface -eq 'generic') { $surface = 'grass' }
+                $leaf = ($path -replace '/', '\').Split('\')[-1]
+                if ($leaf.ToLowerInvariant().EndsWith('.wav')) { $leaf = $leaf.Substring(0, $leaf.Length - 4) }
+                $fromIni["$kind/$surface"] = $leaf
             }
         }
     }
 
-    Say ''
-    if ($notWav.Count -gt 0) {
-        Say ("{0} file(s) were not WAV and were skipped, because ForceFX only reads WAV files:" -f $notWav.Count) 'Yellow'
-        $notWav | ForEach-Object { Say "  $_" 'Yellow' }
+    # Surfaces
+    foreach ($kind in @('Normal', 'Skid')) {
         Say ''
+        Say "Surface sounds ($kind)"
+        $dir = Join-Path $audio "Surfaces\$kind"
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+            Say "  No Surfaces\$kind folder, skipping." 'Yellow'; continue
+        }
+        foreach ($surface in $surfaceFiles.Keys) {
+            $candidates = @()
+            if ($fromIni.ContainsKey("$kind/$surface")) { $candidates += $fromIni["$kind/$surface"] }
+            $candidates += $surfaceFiles[$surface][$kind]
+            $found = $null
+            foreach ($c in $candidates) {
+                $p = Join-Path $dir ($c + '.wav')
+                if (Test-Path -LiteralPath $p -PathType Leaf) { $found = $p; break }
+            }
+            if (-not $found) { Say "  none     $surface (no matching file in Surfaces\$kind)" 'Yellow'; continue }
+            foreach ($suffix in $surfaceSuffixes[$kind]) { Put $found ("{0}_{1}" -f $surface, $suffix) }
+        }
     }
-    if ($copied -eq 0 -and $skipped -eq 0) {
-        Say 'No sounds were found to copy. Check that Audio\Surfaces\Normal and Audio\Surfaces\Skid contain .wav files.' 'Red'
+
+    # Sets of variants
+    foreach ($set in $variantSets) {
+        Say ''
+        Say ("{0}  (from {1})" -f $set.Name, $set.Folder)
+        $dir = Join-Path $audio $set.Folder
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+            Say "  No $($set.Folder) folder, skipping." 'Yellow'; continue
+        }
+        $files = @(Get-ChildItem -LiteralPath $dir -File | Where-Object { $_.Extension -eq '.wav' } | Sort-Object { NaturalKey $_.Name })
+        if ($files.Count -eq 0) { Say '  No .wav files there.' 'Yellow'; continue }
+        if ($files.Count -gt $maxVariants) { $files = $files[0..($maxVariants - 1)] }
+        $n = 0
+        foreach ($f in $files) { $n++; Put $f.FullName ("{0}_{1}" -f $set.Name, $n) }
+    }
+
+    # Single files
+    Say ''
+    Say 'Other'
+    foreach ($single in $singleFiles) {
+        $p = Join-Path $audio $single.File
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { Say "  none     $($single.Name) ($($single.File) not found)" 'Yellow'; continue }
+        Put $p $single.Name
+    }
+
+    Say ''
+    if ($script:copied -eq 0 -and $script:kept -eq 0) {
+        Say 'No sounds were found to copy. Check that the Audio folder is RBR''s own (it should contain Surfaces, Impact and Cars).' 'Red'
         exit 1
     }
-    $verb = if ($DryRun) { 'would be copied' } else { 'copied' }
-    Say ("Done. {0} file(s) {1}, {2} left as they were." -f $copied, $verb, $skipped) 'Green'
+    $word = 'copied'; if ($DryRun) { $word = 'would be copied' }
+    Say ("Done. {0} file(s) {1}, {2} left as they were." -f $script:copied, $word, $script:kept) 'Green'
     if (-not $DryRun) { Say 'Start RBR and switch Dynamic audio on in the ForceFX menu.' }
 }
 catch {
