@@ -86,7 +86,8 @@
 #define __SUPPORT_PLUGIN__ 1
 #include "IRBRGame.h"
 #include "IPlugin.h"
-#include "audio/dynamic_audio.hpp"   // dynamic surface audio (off until the menu switch is turned on)
+#include "materials.hpp"      // ground material table, shared by the surface feel and the audio
+#include "audio_module.hpp"   // dynamic surface audio: only built in when FORCEFX_AUDIO is defined (off until the menu switch is turned on)
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dinput8.lib")
@@ -153,10 +154,12 @@ struct Config {
     // effect switches (menu): 1 = on, 0 = off
     int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandBoost = 1, fxSurface = 1;
     int   probe = 0;                 // 1 = write ForceFX_probe.csv (ground ids and road signals ten times a second) for tuning surfaces; read at start only
+#ifdef FORCEFX_AUDIO
     int   fxAudio = 0;               // dynamic surface audio (settings in ForceFXAudio.ini); off until switched on
     float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in ForceFXAudio.ini)
     float audioImpact = 1.0f;        // 0..4 live multiplier on impacts and landings (on top of EventLevel)
     float audioSusp = 1.0f;          // 0..4 live multiplier on suspension creaks and bottoming out (on top of SqueakLevel / BottomOutLevel)
+#endif
 
     // per-layer ceilings (DirectInput units 0..10000), a combined ceiling, and one live level (userGain)
     int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 2000;
@@ -235,8 +238,11 @@ void ClampConfig(Config& c) {
     c.impactGain = clampf(c.impactGain, 0.0f, 3.0f);
     c.brakeHzScale = clampf(c.brakeHzScale, 0.5f, 2.0f);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
-    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0; c.fxAudio = c.fxAudio ? 1 : 0;
+    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0;
+#ifdef FORCEFX_AUDIO
+    c.fxAudio = c.fxAudio ? 1 : 0;
     c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f);
+#endif
     c.landingBoost = clampf(c.landingBoost, 0.0f, 4.0f);
     c.landingAdd = clampf(c.landingAdd, 0.0f, 1.0f);
     c.landingThresh = clampf(c.landingThresh, 0.5f, 3.0f);
@@ -283,7 +289,11 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     F("ImpactGain", c.impactGain);
     F("BrakeHzScale", c.brakeHzScale); F("PriorityDuck", c.priorityDuck);
     I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("EnableBrake", c.fxBrake);
-    I("SurfaceProbe", c.probe); I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp); I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
+    I("SurfaceProbe", c.probe);
+#ifdef FORCEFX_AUDIO
+    I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp);
+#endif
+    I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
@@ -2121,9 +2131,10 @@ private:
     std::atomic<int>   m_cfgRev{0};         // bumped by the menu whenever m_cfg changes
     std::atomic<float> m_dStat{0}, m_dLoadL{1}, m_dLoadR{1}, m_dAir{0};
     std::atomic<bool>  m_stageReset{false};
+    std::atomic<float> m_cobScore{0.0f}, m_cobLevel{0.0f};   // telemetry cobble detection, for the Diagnostics page, the log and the probe file
     FILE*              m_probe = nullptr;   // ForceFX_probe.csv, only while SurfaceProbe=1
     std::chrono::steady_clock::time_point m_probeT{};
-    rsa::DynamicAudio  m_audio;            // sounds for the ground under each tyre; off until the menu switch is on
+    ffx::Audio         m_audio;            // sounds for the ground under each tyre; off until the menu switch is on (empty stand-in without FORCEFX_AUDIO)
     std::atomic<bool>  m_carRescan{false};
     std::string m_carName, m_carPreset;    // guarded by m_mtx
     std::mutex m_mtx;
@@ -2331,6 +2342,7 @@ private:
 
         const auto t0 = Clock::now();
         auto lastRx = t0 - std::chrono::seconds(10);
+        bool cobOn = false; int cobLogs = 0;     // cobble detection state, for the log
         bool audioQuiet = false;               // the audio has been told that telemetry stopped
         auto lastPkt = t0, lastApply = t0, nextTry = t0, tapLastRx = t0 - std::chrono::seconds(10), nextRescan = t0;
 
@@ -2369,7 +2381,7 @@ private:
             m_packets++;
             m_source = source;
             const float pdt = std::max(0.0f, std::chrono::duration<float>(ts - lastPkt).count());
-            lastPkt = ts; lastRx = ts; audioQuiet = false;
+            lastPkt = ts; lastRx = ts;
             if (pdt > 1.0f) { carForce = true; m_audio.telemetryLost(); }   // telemetry is back after a pause: probably a new stage, maybe a new car
             if (m_stageReset.exchange(false)) {                 // the car is at the start line: learn its static load again
                 m_audio.newStage();
@@ -2388,8 +2400,10 @@ private:
             if (!dumped) { DumpPacket(data, n); dumped = true; }
         };
 
+#ifdef FORCEFX_AUDIO
         m_audio.setActive(base.fxAudio != 0);
         m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
+#endif
         while (m_run) {
             // Wait for a packet from either source (or 20 ms), then handle everything that has arrived.
             if (nWait) {
@@ -2423,11 +2437,24 @@ private:
                 seenRev = m_cfgRev.load();
                 { std::lock_guard<std::mutex> lk(m_mtx); base = m_cfg; }
                 ApplyProfile(base, prof, eff);
+#ifdef FORCEFX_AUDIO
                 m_audio.setActive(base.fxAudio != 0);
                 m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
+#endif
+            }
+            {   // telemetry cobble detection: copy its state for the Diagnostics page and log when it switches on and off
+                m_cobScore = synth.cob.score; m_cobLevel = synth.cob.ema;
+                if (!cobOn && synth.cob.score > 0.6f) {
+                    cobOn = true;
+                    if (++cobLogs <= 200) Logf("Cobbles detected from the telemetry (roughness per speed %.2f, %.0f km/h): tarmac tyres now get the cobble feel", (double)synth.cob.ema, (double)(live.speed * 3.6f));
+                } else if (cobOn && synth.cob.score < 0.3f) {
+                    cobOn = false;
+                    if (++cobLogs <= 200) Logf("Cobbles no longer detected (roughness per speed %.2f)", (double)synth.cob.ema);
+                }
             }
             if (base.probe) WriteProbe(live, now);
-            if (!audioQuiet && std::chrono::duration<double>(now - lastRx).count() > 0.5) { audioQuiet = true; m_audio.telemetryLost(); }   // menus, pause, stage end: let the loops fade out
+            if (m_audio.msSinceFrame() > 500) { if (!audioQuiet) { audioQuiet = true; m_audio.telemetryLost(); } }   // menus, pause, stage end, or packets that are not real telemetry: let the loops fade out
+            else audioQuiet = false;
             if (m_carRescan.exchange(false)) carForce = true;
             if (carForce || now >= nextCarPoll) {
                 carForce = false;
@@ -2455,7 +2482,11 @@ private:
             m_dStat = sig.staticLoad; m_dLoadL = sig.loadL; m_dLoadR = sig.loadR; m_dAir = sig.airborne;
             {   // the ground class is only read while telemetry is flowing (a stage is running)
                 const bool telemLive = !m_test && std::chrono::duration<double>(now - lastRx).count() < 0.4;
-                if (telemLive) Surf::Feed(base.fxSurface != 0 || base.fxAudio != 0);
+                if (telemLive) Surf::Feed(base.fxSurface != 0
+#ifdef FORCEFX_AUDIO
+                                       || base.fxAudio != 0
+#endif
+                                      );
                 for (int w = 0; w < 4; ++w) sig.surf[w] = telemLive ? Surf::Current(w) : 0;
             }
 
@@ -2559,10 +2590,12 @@ private:
     void BuildRows() {
         const float M = (float)kHardTotalMax;
         m_rows = {
+#ifdef FORCEFX_AUDIO
             {"Dynamic audio",                    "EnableDynamicAudio", &Config::fxAudio,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Audio: debris level",              "AudioDebrisLevel",   nullptr, &Config::audioDebris, 0.0f,   4.0f, 0.1f,  'x', false},
             {"Audio: impact / landing level",    "AudioImpactLevel",   nullptr, &Config::audioImpact, 0.0f,   4.0f, 0.1f,  'x', false},
             {"Audio: suspension level",          "AudioSuspensionLevel", nullptr, &Config::audioSusp, 0.0f,   4.0f, 0.1f,  'x', false},
+#endif
             // effect switches (turn effects off to feel the others on their own)
             {"Effect: Engine",                   "EnableEngine",       &Config::fxEngine,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Road texture",             "EnableRoad",         &Config::fxRoad,       nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
@@ -2658,10 +2691,12 @@ private:
     static const char* TipFor(const char* key) {
         struct T { const char* k; const char* t; };
         static const T tips[] = {
+#ifdef FORCEFX_AUDIO
             {"EnableDynamicAudio", "Plays tyre and ground sounds that follow each wheel: rolling noise, squeal, sliding, flying stones, bumps and landings, with the sound of each surface. Needs sound files in ForceFXAudio\\sounds and settings in ForceFXAudio.ini. Off by default; loading takes a moment when you switch it on."},
             {"AudioDebrisLevel",   "How loud the stones and debris thrown at the car are, on top of StoneLevel in ForceFXAudio.ini. Changes apply while you drive."},
             {"AudioImpactLevel",   "How loud bump impacts and landings are, on top of EventLevel in ForceFXAudio.ini."},
             {"AudioSuspensionLevel", "How loud suspension creaks and bottoming-out thumps are, on top of SqueakLevel and BottomOutLevel in ForceFXAudio.ini."},
+#endif
             {"EnableEngine",       "Turns the engine vibration on or off. Handy for feeling what each effect does on its own."},
             {"EnableRoad",         "Turns the road texture and bump vibration on or off."},
             {"EnableBrake",        "Turns the braking judder and front-wheel lock-up shake on or off."},
@@ -2729,7 +2764,12 @@ private:
                  m_dStat.load(), m_dLoadL.load(), m_dLoadR.load(), m_dAir.load(), m_dHeat.load());
         line(buf);
         line(Surf::Status().c_str());
+#ifdef FORCEFX_AUDIO
         line(m_audio.status().c_str());
+#endif
+        { char cb[160]; snprintf(cb, sizeof(cb), "Cobble detection: %s, roughness per speed %.2f (blend starts %.1f, full at %.1f), cobble feel %d%%",
+                                 Surf::g_cobbleDetect ? "on" : "off", (double)m_cobLevel.load(), (double)Surf::g_cobbleLo, (double)Surf::g_cobbleHi, (int)(m_cobScore.load() * 100.0f + 0.5f));
+          line(cb); }
         y += 6.0f;
 
         uint8_t pkt[2048]; int len;
@@ -2772,8 +2812,13 @@ public:
         SyncConfig(m_cfg, m_iniPath, false);
         m_userGain = m_cfg.userGain;
         Surf::Start(m_iniPath);               // reads which ground is under the tyres
+#ifdef FORCEFX_AUDIO
+        Logf("Build: with dynamic audio module");
+#else
+        Logf("Build: without dynamic audio module");
+#endif
         {
-            rsa::DynamicAudio::Hooks h;
+            ffx::Audio::Hooks h;
             h.readIds = [](int ids[4]) { return Surf::Ids(ids); };
             h.idsAvailable = []() { return Surf::Found(); };
             h.idsStatus = []() { return Surf::Status(); };
@@ -2810,12 +2855,12 @@ public:
         if (!m_probe) {
             m_probe = fopen((g_dir + "ForceFX_probe.csv").c_str(), "w");
             if (!m_probe) return;
-            fprintf(m_probe, "t_s,speed_ms,id_fl,id_fr,id_rl,id_rr,cls_fl,cls_fr,cls_rl,cls_rr,rough,piston,texture,texL,texR,bump,airborne,loadL,loadR\n");
+            fprintf(m_probe, "t_s,speed_ms,id_fl,id_fr,id_rl,id_rr,cls_fl,cls_fr,cls_rl,cls_rr,rough,piston,texture,texL,texR,bump,airborne,loadL,loadR,cobble_level,cobble_score\n");
         }
         int id[4], cls[4]; Surf::Raw(id, cls);
-        fprintf(m_probe, "%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.3f,%.3f\n",
+        fprintf(m_probe, "%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.3f,%.3f,%.3f,%.3f\n",
                 std::chrono::duration<double>(now.time_since_epoch()).count(), (double)s.speed, id[0], id[1], id[2], id[3], cls[0], cls[1], cls[2], cls[3],
-                (double)s.rough, (double)s.piston, (double)s.texture, (double)s.texL, (double)s.texR, (double)s.bump, (double)s.airborne, (double)s.loadL, (double)s.loadR);
+                (double)s.rough, (double)s.piston, (double)s.texture, (double)s.texL, (double)s.texR, (double)s.bump, (double)s.airborne, (double)s.loadL, (double)s.loadR, (double)m_cobLevel.load(), (double)m_cobScore.load());
         fflush(m_probe);
     }
 

@@ -50,7 +50,8 @@ constexpr int kBlendParams = 10;    // the first ten blend linearly; Ridge is co
 constexpr float kRidgeMin = 0.03f, kRidgeMax = 1.0f;   // metres: the range the ini may set
 
 // Default values per class. Hard ground that is not smooth gets a ridge so its pitch follows speed:
-//   cobble: small stones, a hit every ~12 cm, crisp and regular, strong even with little suspension movement (floor)
+//   cobble: small stones, a hit every ~12 cm, crisp and regular, strong even with little suspension movement (floor); real cobbles
+//           are very obvious through the wheel, so this is a lot stronger than any other surface
 //   wood:   planks across the road, a hit every ~25 cm, rounder and a little hollow
 inline Feel* DefaultFeels() {
     static Feel f[C_COUNT] = {
@@ -60,8 +61,8 @@ inline Feel* DefaultFeels() {
         {0.55f, -0.70f, 0.00f, 0.50f, 0.12f, 0.3f, 0.90f, 0.00f, 1.0f, 0.22f, 0.0f, 0.0f},           // snow
         {0.90f, -0.40f, 0.00f, 1.35f, 0.90f, 2.2f, 0.30f, 0.10f, 2.4f, 0.30f, 0.0f, 0.0f},           // ice
         {0.90f, -0.20f, 0.05f, 0.80f, 0.35f, 0.5f, 1.00f, 0.00f, 1.0f, 0.18f, 0.0f, 0.0f},           // soft
-        {1.25f, -0.60f, 0.00f, 1.00f, 0.90f, 2.5f, 1.00f, 0.04f, 1.5f, 0.40f, 0.12f, 0.0f},          // cobble
-        {1.00f, -0.50f, 0.00f, 1.00f, 0.70f, 1.2f, 1.00f, 0.00f, 1.0f, 0.30f, 0.25f, 0.0f}};         // wood
+        {2.40f, -0.60f, 0.00f, 1.00f, 1.00f, 3.0f, 1.25f, 0.07f, 2.2f, 0.60f, 0.12f, 0.0f},          // cobble
+        {1.60f, -0.50f, 0.00f, 1.00f, 0.80f, 1.5f, 1.10f, 0.00f, 1.0f, 0.40f, 0.25f, 0.0f}};         // wood
     return f;
 }
 
@@ -176,7 +177,8 @@ inline float RidgeHz(float speedMs, float ridgeM, float minHz, float maxHz) {
 // (75% of it above 0.8), the two cleanly apart once smoothed over about a second, so 0.5 to 1.0 is the default ramp.
 // Roughness means little at crawling speed and nothing in the air, so below 8 m/s the detector resets and in the air it holds.
 struct CobbleDetector {
-    float ema = 0.0f;
+    float ema = 0.0f;                    // smoothed rough-per-speed level (x100)
+    float score = 0.0f;                  // the last result, 0..1, kept so the plugin can show and log it
     bool init = false;
     static constexpr float kMinSpeedMs = 8.0f;
     static float Ramp(float x, float lo, float hi) {
@@ -185,13 +187,14 @@ struct CobbleDetector {
     }
     // Returns 0 (plain tarmac) .. 1 (cobbles). dt in seconds, tau is the smoothing time.
     float update(float rough, float speedMs, bool airborne, float dt, float lo, float hi, float tau = 0.8f) {
-        if (!std::isfinite(rough) || !std::isfinite(speedMs) || !(speedMs >= kMinSpeedMs)) { ema = 0.0f; init = false; return 0.0f; }
+        if (!std::isfinite(rough) || !std::isfinite(speedMs) || !(speedMs >= kMinSpeedMs)) { ema = 0.0f; init = false; score = 0.0f; return 0.0f; }
         if (!airborne) {
             const float x = std::max(0.0f, rough) / speedMs * 100.0f;
             if (!init) { ema = x; init = true; }
             else if (dt > 0.0f && std::isfinite(dt)) ema += (x - ema) * (1.0f - std::exp(-dt / std::max(0.05f, tau)));
         }
-        return init ? Ramp(ema, lo, hi) : 0.0f;
+        score = init ? Ramp(ema, lo, hi) : 0.0f;
+        return score;
     }
 };
 

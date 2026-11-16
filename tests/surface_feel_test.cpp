@@ -240,6 +240,19 @@ TEST(detector_is_safe_with_bad_numbers) {
     CHECK(near(CobbleDetector::Ramp(0.7f, 1.0f, 0.5f), 0.0f));                               // edges the wrong way round don't divide by zero
     CHECK(near(CobbleDetector::Ramp(2.0f, 1.0f, 1.0f), 1.0f));
 }
+TEST(detector_keeps_its_last_score_for_display_and_resets_it) {
+    CobbleDetector d;
+    const float s = settle(d, 0.30f, 30.0f, 600);
+    CHECK(near(d.score, s) && d.ema > 0.9f);
+    d.update(0.30f, 2.0f, false, 0.01f, 0.5f, 1.0f);                                        // slows to a crawl
+    CHECK(d.score == 0.0f && d.ema == 0.0f);
+}
+TEST(cobble_feel_is_much_stronger_than_the_other_surfaces) {
+    float wc[C_COUNT], wg[C_COUNT], wt[C_COUNT]; weights(wc, C_COBBLE, 1.0f); weights(wg, C_GRAVEL, 1.0f); weights(wt, C_TARMAC, 1.0f);
+    const Feel c = Blend(wc, 1.0f), g = Blend(wg, 1.0f), t = Blend(wt, 1.0f);
+    CHECK(c.amp >= 2.0f && c.amp > 1.8f * g.amp && c.amp > 1.8f * t.amp);                  // real cobbles are very obvious through the wheel
+    CHECK(c.floor >= 0.5f);                                                               // and never fade to nothing between hits
+}
 
 int main() {
     for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }

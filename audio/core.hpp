@@ -10,7 +10,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include "materials.hpp"
+#include "../materials.hpp"
 
 namespace rsa {
 
@@ -97,9 +97,7 @@ struct Settings {
     float totalGain = 1.0f;            // final output gain, applied after the soft limiter (linear, 1.0 = unchanged)
     bool normalizeSounds = true;       // bring all sound files to a common loudness when loading
     double eventLevel = 1.0, rumbleLevel = 1.0;   // impacts and landings, and road-edge rumble
-    double squeakLevel = 1.0, bottomLevel = 1.0;   // suspension creaks and bump-stop thumps
-    double squeakSensitivity = 1.0;    // how readily slow, loaded suspension travel makes a creak (0 = never)
-    double bottomRatio = 2.2;          // a tyre's strut load above this multiple of its normal load counts as bottoming out
+    double squeakLevel = 0.6, bottomLevel = 0.8;   // suspension creaks and bump-stop thumps
     double stoneLevel = 2.0;           // stones and debris thrown at the car (separate from impacts: they are quick, light sounds that need more gain)
     double loopBoost = 2.0;            // extra rolling-noise gain at full slip / very rough ground (0 = flat level)
     double loopLevel = 0.25, squealLevel = 0.5, slideLevel = 0.5;   // mix levels per tyre (each of 4 tyres has its own)
@@ -127,9 +125,9 @@ struct Settings {
 
     bool enableWheelLoops = true, enableSlide = true, enableSqueal = true, enableStones = true,
          enableImpacts = true, enableLandings = true, enableRumble = true, enableSuspension = true;
-    double stoneRate = 10.0;
     double impactMinVelocity = 0.35;
     bool debugLog = false;
+    bool memCrossCheck = true;         // distrust the game surface when it says tarmac but the suspension is hammered. For a blind memory scanner; ForceFX turns it off because its reader is exact (cobbles are tarmac to the game)
     bool startupBeep = true;           // short test tone when the plugin starts: proves the audio output path
 
     bool autoDiscover = true;            // let the plugin find the surface value in memory by itself (read-only)
@@ -204,9 +202,6 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "EnableSuspension") s.enableSuspension = toBool(v);
     else if (key == "SqueakLevel") s.squeakLevel = clampd(d(), 0.0, 6.0);
     else if (key == "BottomOutLevel") s.bottomLevel = clampd(d(), 0.0, 6.0);
-    else if (key == "SqueakSensitivity") s.squeakSensitivity = clampd(d(), 0.0, 4.0);
-    else if (key == "BottomOutRatio") s.bottomRatio = clampd(d(), 1.2, 8.0);
-    else if (key == "StoneRate") s.stoneRate = d();
     else if (key == "ImpactMinVelocity") s.impactMinVelocity = d();
     else if (key == "DebugLog") s.debugLog = toBool(v);
     else if (key == "StartupBeep") s.startupBeep = toBool(v);
@@ -432,6 +427,7 @@ public:
     double inferred[4] = {1, 0, 0, 0};   // from telemetry only
     int wetness = 0;                     // 0 dry, 1 damp, 2 wet (only known from game memory)
     double load = 0, loadRef = 0, roughness = 0, pistonHp = 0, pistonRms = 0, pistonRefRms = 0;
+    double loadSmooth = 0;               // strut load smoothed over about 0.4 s: weight transfer from body roll, braking and crests, without the bumps
     double pistonRaw = 0;                // damper piston velocity as reported (m/s): slow strokes are what make suspension squeak
     double revRate = 0, slip = 0, slipAngle = 0, slipNorm = 0;
     bool slipValid = false;
@@ -458,6 +454,7 @@ public:
         speed_ = speedMs;   // true ground speed
         load = std::fabs(w.strutForce);
         double ls = loadShort_.update(load, dt);
+        loadSmooth = loadQuick_.update(load, dt);
         if (load > 0) loadLong_.update(load, dt);
         loadRef = loadLong_.value();
 
@@ -530,7 +527,7 @@ public:
 
 private:
     HighPass hpForce_{0.12}, hpPiston_{0.12};
-    Ema loadShort_{2.0}, loadLong_{8.0}, forceVar_{0.35}, pistonVar_{0.35}, pistonRef_{4.0};
+    Ema loadShort_{2.0}, loadQuick_{0.4}, loadLong_{8.0}, forceVar_{0.35}, pistonVar_{0.35}, pistonRef_{4.0};
     Ema revRate_{0.12}, rollRatio_{3.0}, slipSmooth_{0.25}, slipNorm_{0.05}, launchSmooth_{0.05};
     uint32_t lastSeg_ = 0; bool haveSeg_ = false;
     double transition_ = 0;
@@ -632,6 +629,7 @@ public:
     // Optional game-memory input, set by the controller before update(): per tyre class (0..3) and wetness.
     bool memValid[4] = {false, false, false, false};
     int memClass[4] = {0, 0, 0, 0}, memWet[4] = {0, 0, 0, 0};
+    double memLoose[4] = {-1, -1, -1, -1};   // how much loose material the game says is under each tyre (-1 = not known)
     double speedMs = 0, landingAirTime = 0;   // speedMs = true ground speed
     double fieldMs = 0, drivenMs = 0;         // the Speed field (speedometer) and the driven-wheel road speed derived from it
     bool groundFromVelocity = true;
@@ -739,7 +737,7 @@ public:
         ring_[pos_] = readOk && recognised; pos_ = (pos_ + 1) % kN; if (n_ < kN) ++n_;
 
         // Cross-check against suspension data (only the clear-cut case: tarmac while the tyre is hammered).
-        for (int w = 0; w < 4; ++w) {
+        for (int w = 0; s.memCrossCheck && w < 4; ++w) {
             bool clash = readOk && table.cls(ids[w]) == Tarmac && a.speedMs > 8.0 &&
                          a.wheels[w].roughness > 3.0 * s.roughThreshold;
             mismatch_[w] = clash ? mismatch_[w] + dt : std::max(0.0, mismatch_[w] - 0.5 * dt);
@@ -839,10 +837,10 @@ public:
     void update(const TelemetryFrame& f, SurfaceAnalyzer& a, const Settings& s, double dt, IAudioSink& sink, const SetView& sv) {
         for (double& c : cooldown_) if (c > 0) c -= dt;
         if (stoneCooldown_ > 0) stoneCooldown_ -= dt;
+        if (s.enableSuspension && !a.airborne) suspension(a, s, dt, sink, sv);     // before impacts: a bottom-out replaces the plain impact sound
         if (s.enableImpacts && !a.airborne) impacts(a, s, sink, sv);
         if (s.enableLandings && a.justLanded && a.landingAirTime > 0.15) landing(a, sink, sv);
         if (s.enableStones && !a.airborne) stones(f, a, s, dt, sink, sv);
-        if (s.enableSuspension && !a.airborne) suspension(a, s, dt, sink, sv);
         rumble(a, s, sink);
         tyres(a, s, sink, sv);
     }
@@ -852,6 +850,7 @@ private:
     double cooldown_[4] = {0, 0, 0, 0};
     double stoneCooldown_ = 0;
     double travel_[4] = {0, 0, 0, 0}, squeakCool_[4] = {0, 0, 0, 0}, bottomCool_[4] = {0, 0, 0, 0}, prevRatio_[4] = {0, 0, 0, 0};
+    double squeakGap_ = 0, bottomGap_ = 0;     // the whole car: creaks and thumps are separate events, never a stream
 
     float rate(double spread) { return (float)(1.0 + (rng_.next() * 2.0 - 1.0) * spread); }
 
@@ -876,24 +875,30 @@ private:
         }
     }
 
-    // Stones fly when a tyre's surface moves over ground that gives way, so both inputs come straight from the telemetry:
-    //  - how loose the ground is under this tyre: what its own signals say (rough strut force, or slipping with little grip),
-    //    taken from the telemetry inference, never from a per-surface table, so snow, mud, gravel and verge all follow the physics;
-    //  - how fast the tyre surface moves: the faster of ground speed and the wheel's own speed, so wheelspin throws stones
-    //    from a standing start. There is no speed cut-off: the rate and the strength simply grow with surface speed.
-    void stones(const TelemetryFrame& f, SurfaceAnalyzer& a, const Settings& s, double dt, IAudioSink& sink, const SetView& sv) {
+    // Stones fly when a tyre's surface moves over ground that has something loose to throw, and how many depends on how hard
+    // the tyre works that ground. Surface and telemetry each decide one half:
+    //  - the ground: how much loose material is there. The game's own material says it (clean tarmac: none, tarmac with gravel
+    //    sprinkled or spread over it: some, gravel, dirt, rough ground and snow: plenty). Without the game's material the telemetry's
+    //    own reading of the ground (rough strut force, slipping with little grip) stands in for it;
+    //  - the tyre: how fast its surface moves (the faster of ground speed and the wheel's own speed, so wheelspin from a standing
+    //    start throws stones too) and how hard it is pushed (slip and throttle). There is no speed cut-off: rate and strength grow
+    //    with surface speed.
+    // The rate is not a setting. On clean tarmac the ground half is zero, so nothing is thrown whatever the car does.
+    void stones(const TelemetryFrame& f, SurfaceAnalyzer& a, const Settings&, double dt, IAudioSink& sink, const SetView& sv) {
+        constexpr double kStonesPerSecond = 10.0;      // what a gravel road gives at 90 km/h with the tyres working: fixed, not a setting
         double weight[4], total = 0, spray[4];
         for (int w = 0; w < 4; ++w) {
             const WheelAnalyzer& wa = a.wheels[w];
             spray[w] = std::max(a.speedMs, wa.contactSpeedMs()) * 3.6;                   // km/h
-            double loose = clampd(1.0 - wa.inferred[Tarmac], 0.0, 1.0);
+            double ground = a.memValid[w] && a.memLoose[w] >= 0.0 ? a.memLoose[w]
+                                                                   : 0.8 * clampd(1.0 - wa.inferred[Tarmac], 0.0, 1.0);
             double slip = wa.slipValid ? std::min(std::fabs(wa.slip) * 4.0, 1.0)
                           : (wa.launchValid ? std::min(wa.launchSlip * 4.0, 1.0) : 0.0);
-            weight[w] = loose * (0.4 + 0.6 * std::max(slip, (double)f.throttle)) * clampd(spray[w] / 90.0, 0.0, 1.5);
+            weight[w] = ground * (0.4 + 0.6 * std::max(slip, (double)f.throttle)) * clampd(spray[w] / 90.0, 0.0, 1.5);
             total += weight[w];
         }
         if (total < 0.005) return;
-        double r = s.stoneRate * (total / 4.0);
+        double r = kStonesPerSecond * (total / 4.0);
         if (rng_.next() > 1.0 - std::exp(-r * dt)) return;
         if (stoneCooldown_ > 0) return;
         stoneCooldown_ = 0.03;
@@ -904,37 +909,48 @@ private:
         sink.trigger(SoundEvent::StoneHit, sv.dominant(wheel), l, rr, rate(0.12));
     }
 
-    // Suspension sounds, both from the damper and strut telemetry of each tyre:
-    //  - A creak comes from slow travel under load (body roll, weight shifting, easing over a bump): the stroke the damper
-    //    makes while moving gently, weighted by how loaded the tyre is. Fast strokes are impacts and make no creak.
-    //  - Bottoming out is a sharp rise of the strut load far above the tyre's own normal load (the bump stop taking the hit).
-    // Nothing here depends on the surface: it follows how the car moves.
+    // Suspension sounds from the damper and strut telemetry of each tyre. Both are rare, deliberate events, not texture:
+    //  - A creak is the suspension articulating slowly while it carries real weight transfer: body roll in a hard corner, the nose
+    //    dropping under braking, a slow roll over a crest. That needs the tyre's smoothed load to be well away from its normal
+    //    load (a quarter or more) AND a few centimetres of slow stroke. Normal driving, small bumps and fast strokes make none.
+    //  - Bottoming out is the strut load jumping to several times its normal value in one hard compression: the bump stop taking
+    //    a real hit. It replaces the plain impact sound for that tyre, and the car makes at most one at a time.
+    // Nothing here depends on the surface or on a setting: it follows how the car moves.
     void suspension(SurfaceAnalyzer& a, const Settings& s, double dt, IAudioSink& sink, const SetView&) {
+        constexpr double kStressMin = 0.25;       // smoothed load this far from normal (25%) before a creak is possible
+        constexpr double kSlowMax = 0.25;         // m/s: faster strokes are knocks, not creaks
+        constexpr double kTravelNeeded = 0.08;    // metres of slow, loaded stroke per creak
+        constexpr double kBottomRatio = 3.0;      // instantaneous load as a multiple of the normal load
+        if (squeakGap_ > 0) squeakGap_ -= dt;
+        if (bottomGap_ > 0) bottomGap_ -= dt;
         for (int w = 0; w < 4; ++w) {
             const WheelAnalyzer& wa = a.wheels[w];
             if (squeakCool_[w] > 0) squeakCool_[w] -= dt;
             if (bottomCool_[w] > 0) bottomCool_[w] -= dt;
+            const bool haveRef = wa.loadRef > 1e-6;
+            const double stress = haveRef ? std::fabs(wa.loadSmooth / wa.loadRef - 1.0) : 0.0;
 
             const double v = std::fabs(wa.pistonRaw);
-            const double slowLimit = 0.25;                       // m/s: faster than this is a knock, not a creak
-            if (s.squeakSensitivity > 0 && a.speedMs > 1.0 && v > 0.01 && v < slowLimit)
-                travel_[w] += v * dt * wa.loadFraction() * s.squeakSensitivity;
+            if (a.speedMs > 1.0 && stress > kStressMin && v > 0.01 && v < kSlowMax && cooldown_[w] <= 0)
+                travel_[w] += v * dt;
             else
-                travel_[w] = std::max(0.0, travel_[w] - 0.02 * dt);          // gentle decay so odd moments don't pile up
-            const double need = 0.012;                           // metres of loaded slow travel per creak
-            if (travel_[w] > need && squeakCool_[w] <= 0) {
-                float intensity = (float)clampd(0.3 + 0.7 * wa.loadFraction() * (0.5 + rng_.next()), 0.2, 1.0), l, r;
+                travel_[w] = std::max(0.0, travel_[w] - 0.05 * dt);
+            if (travel_[w] > kTravelNeeded && squeakCool_[w] <= 0 && squeakGap_ <= 0) {
+                float intensity = (float)clampd(0.25 + 0.6 * (stress - kStressMin) / 0.75 + 0.15 * rng_.next(), 0.2, 0.8), l, r;
                 panGains(kWheelPan[w], intensity * kWheelScale[w], l, r);
                 sink.trigger(SoundEvent::SuspSqueak, w, l, r, rate(0.12));
-                travel_[w] = 0; squeakCool_[w] = 0.5 + 0.5 * rng_.next();
+                travel_[w] = 0; squeakCool_[w] = 3.0; squeakGap_ = 1.5;
             }
 
-            const double ratio = wa.loadRef > 1e-6 ? wa.load / wa.loadRef : 0.0;
-            if (ratio > s.bottomRatio && prevRatio_[w] <= s.bottomRatio && bottomCool_[w] <= 0 && a.speedMs > 2.0) {
-                float intensity = (float)clampd(0.35 + (ratio - s.bottomRatio) / s.bottomRatio, 0.35, 1.0), l, r;
+            const double ratio = haveRef ? wa.load / wa.loadRef : 0.0;
+            const double hit = std::fabs(wa.pistonHp);
+            const bool hard = hit > std::max(2.0 * s.impactMinVelocity, 6.0 * wa.pistonRefRms);   // a real, fast compression too
+            if (ratio > kBottomRatio && prevRatio_[w] <= kBottomRatio && hard && bottomCool_[w] <= 0 && bottomGap_ <= 0 && a.speedMs > 2.0) {
+                float intensity = (float)clampd(0.4 + (ratio - kBottomRatio) / (2.0 * kBottomRatio), 0.4, 1.0), l, r;
                 panGains(kWheelPan[w], intensity * kWheelScale[w], l, r);
                 sink.trigger(SoundEvent::SuspBottom, w, l, r, rate(0.06));
-                bottomCool_[w] = 0.3;
+                bottomCool_[w] = 1.0; bottomGap_ = 0.5;
+                cooldown_[w] = std::max(cooldown_[w], 0.3);                    // the plain impact sound would double it
             }
             prevRatio_[w] = ratio;
         }
@@ -1046,6 +1062,7 @@ public:
             analyzer.memValid[w] = useMem && health_.usable() && cls >= 0;   // objects / unknown ids: no info for this tyre
             analyzer.memClass[w] = cls >= 0 ? cls : 0;
             analyzer.memWet[w] = readOk ? table_.wet(ids[w]) : 0;
+            analyzer.memLoose[w] = readOk ? table_.looseness(ids[w]) : -1.0;
         }
 
         analyzer.update(f, dt);

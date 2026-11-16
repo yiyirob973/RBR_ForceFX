@@ -31,7 +31,7 @@ A standard RBR installation without NGP telemetry is not sufficient. ForceFX doe
 
 ## Install and configure
 
-1. Download the release archive from the repository's [Releases](https://github.com/yiyirob973/RBR_ForceFX/releases) page.
+1. Download a release archive from the repository's [Releases](https://github.com/yiyirob973/RBR_ForceFX/releases) page. There are two: `ForceFX-<version>.zip` includes the optional dynamic surface audio, and `ForceFX-<version>-NoAudio.zip` is force feedback only. Use one or the other, not both.
 2. Copy the files from the archive into RBR's `Plugins` folder. Keep the DLL and its configuration files together.
 3. Enable NGP UDP telemetry in your RBR/NGP setup. The destination does not matter: ForceFX picks the packets up inside the RBR process as NGP sends them, so you can leave NGP pointed at SimHub or another telemetry application.
 4. Start RBR and open **Plugins > ForceFX**. Select the wheel RBR is using and connect. Enable `AutoConnect` in `ForceFX.ini` if you want ForceFX to connect automatically to the saved wheel on startup.
@@ -56,13 +56,18 @@ ForceFX reads the contact data RBR keeps for each tyre (read-only; it never writ
 
 ## Dynamic surface audio
 
+The dynamic audio is an optional module that is only in the audio build (`ForceFX-<version>.zip`). In the `-NoAudio` build it is left out of the DLL entirely: no audio menu entries, no audio settings and no sound code.
+
 ForceFX can also play tyre and ground sounds that follow each wheel: rolling noise, squeal, sliding, flying stones, bumps and landings, with the sound of whatever surface each tyre is on. It is **off by default**. Turn it on with the first switch in **Plugins > ForceFX** (`Dynamic audio`) or with `EnableDynamicAudio=1` in `ForceFX.ini`.
 
 - It uses the same telemetry and the same ground detection as the surface feel, so there is no extra UDP port to set up. The ground is read per tyre; when the exact material isn't known it falls back to what the telemetry suggests.
-- Put your sounds in `Plugins\ForceFXAudio\sounds` (WAV files, any subfolders). Names follow the surface, for example `gravel_loop`, `gravel_squeal`, `gravel_slide`, `gravel_hit`, plus `debris_stone`, `debris_impact`, `debris_landing` and `debris_rumble`. A plain pack of `tarmac`, `gravel`, `grass` and `snow` covers every surface; add finer names (`gravel_wet`, `ice`, `dirt`...) to make single surfaces distinct. `audio/surfaces.md` in the repository lists the exact search order for every material.
+- To fill the sounds folder from your RBR installation, run `Plugins\ForceFXAudio\Copy-RbrSounds.bat` (it copies RBR's own tyre sounds; see the short readme beside it). You can also put your own sounds in `Plugins\ForceFXAudio\sounds` (WAV files, any subfolders). Names follow the surface, for example `gravel_loop`, `gravel_squeal`, `gravel_slide`, `gravel_hit`, plus `debris_stone`, `debris_impact`, `debris_landing` and `debris_rumble`. A plain pack of `tarmac`, `gravel`, `grass` and `snow` covers every surface; add finer names (`gravel_wet`, `ice`, `dirt`...) to make single surfaces distinct. `audio/surfaces.md` in the repository lists the exact search order for every material.
 - Mix levels, the cabin sound and the output device are in `ForceFXAudio.ini`, read each time the audio is switched on.
 - Sounds load in the background when you switch it on, so the wheel never waits. Switching it off frees everything again.
 - The audio runs from ForceFX's telemetry loop, which starts when ForceFX is connected to a wheel.
+- **Stones and debris come from the ground and the tyres, not from a setting.** The game's own material says how much loose material there is (clean tarmac: none, tarmac with gravel sprinkled or spread on it: some, gravel, dirt, rough ground, snow over gravel: plenty), and the telemetry says how hard each tyre works it (surface speed, slip, throttle). Clean tarmac throws nothing whatever the car does; with no game surface the telemetry decides alone. `StoneLevel` (and the menu's debris level) only set the volume.
+- **Suspension sounds are rare events, not texture.** A creak needs real weight transfer (the tyre's load well away from normal) together with a slow stroke of a few centimetres, and the car makes one at most every 1.5 s. A bottom-out thump needs the load to jump to about three times normal in one fast compression, at most one at a time, and it replaces the plain impact sound. Normal driving, small bumps and rough ground with fast strokes make neither. They have no rate setting; `SqueakLevel`, `BottomOutLevel` and the menu's suspension level set the volume.
+- **A sound that sticks:** the audio now goes quiet half a second after the last real telemetry frame, not after the last packet of any kind. If something still sticks, set `DebugLog = 1` in `ForceFXAudio.ini`: ForceFX.log gets a line a second with the speed, each tyre's slip and the loop levels, which shows what the sound is being told.
 
 ## Safety
 
@@ -86,9 +91,16 @@ The plugin writes `ForceFX.log` and, after receiving telemetry, `ForceFX_packet.
 
 ## Build from source
 
-The build workflow compiles a 32-bit DLL on Windows using the MSVC toolchain and packages it with the configuration files. To build locally, use an x86 Visual Studio developer command prompt with the required MSVC tools installed.
+The audio is a build-time module. Everything audio-related sits behind one define, `FORCEFX_AUDIO`, and `audio_module.hpp` is the only place the plugin touches it. Without the define the plugin compiles against an empty stand-in, so the audio code and `winmm.lib` are not part of the DLL.
 
-Pushing a version tag beginning with `v` creates a release archive. Pushing to the `noudp` branch (the telemetry hook work) or the `audio` branch builds the plugin and attaches the zip to the workflow run as a downloadable artifact.
+The build workflow compiles both variants as 32-bit DLLs on Windows with MSVC and packages each with its configuration files:
+
+- `ForceFX-<version>.zip`: built with `/DFORCEFX_AUDIO`. Includes `ForceFXAudio.ini` and the `ForceFXAudio` folder with the sound-copy script.
+- `ForceFX-<version>-NoAudio.zip`: built without it. Force feedback and surface feel only.
+
+To build both locally, open an x86 Visual Studio developer command prompt and run `build.bat`. The DLLs land in `out\audio` and `out\noaudio`. To build one by hand, use the `cl` line from `build.bat` and add or leave out `/DFORCEFX_AUDIO` (and `winmm.lib`).
+
+Pushing a version tag beginning with `v` creates a release with both archives. Pushing to the `audio` branch builds both and attaches them to the workflow run as a downloadable artifact.
 
 ## Credits and warranty
 

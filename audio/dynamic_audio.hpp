@@ -91,6 +91,15 @@ public:
         if (!parsePacket(d, (size_t)n, t, f, s_->settings.packet)) return;
         s_->controller->onFrame(f);
         ++frames_;
+        lastFrameNs_ = nowNs();
+        if (s_->settings.debugLog && lastFrameNs_ >= nextDebugNs_) { nextDebugNs_ = lastFrameNs_ + 1000000000LL; debugLine(); }
+    }
+
+    // Milliseconds since the last frame that was actually parsed and played. Packets that arrive but are not usable telemetry
+    // don't count, so the caller can silence the loops when real frames stop, not only when packets stop.
+    long long msSinceFrame() const {
+        const long long last = lastFrameNs_.load();
+        return last == 0 ? 1000000LL : (nowNs() - last) / 1000000LL;
     }
 
     // Telemetry stopped for a while: let the loops fade out instead of droning on.
@@ -151,6 +160,20 @@ private:
     std::thread loader_;
     std::atomic<bool> wantOn_{false}, loading_{false};
     std::atomic<float> liveDebris_{1.0f}, liveImpacts_{1.0f}, liveSusp_{1.0f};
+    std::atomic<long long> lastFrameNs_{0};
+    long long nextDebugNs_ = 0;
+    static long long nowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+    // DebugLog=1 in ForceFXAudio.ini: once a second, what the tyre sounds are being told, so a sound that sticks can be traced.
+    void debugLine() {          // caller holds mu_
+        const SurfaceAnalyzer& a = s_->controller->analyzer;
+        char b[400];
+        snprintf(b, sizeof(b), "audio: %.1f m/s air %d | slip FL %.2f FR %.2f RL %.2f RR %.2f | launch %.2f %.2f %.2f %.2f | loops %.2f peak %.2f shots %zu | %s",
+                 a.speedMs, a.airborne ? 1 : 0, a.wheels[0].slipNorm, a.wheels[1].slipNorm, a.wheels[2].slipNorm, a.wheels[3].slipNorm,
+                 a.wheels[0].launchSlip, a.wheels[1].launchSlip, a.wheels[2].launchSlip, a.wheels[3].launchSlip,
+                 (double)s_->mixer->targetSum(), (double)s_->mixer->takePeak(), s_->mixer->activeShots(), s_->controller->surfaceSourceText().c_str());
+        log(b);
+    }
     std::atomic<State> state_{Off};
     std::string error_, setsText_;
     long long frames_ = 0;
@@ -187,6 +210,7 @@ private:
             if (!loadSettings(ini, st)) log("Dynamic audio: no ForceFXAudio.ini found, using defaults");
             st.enabled = true;
             st.surfaceMode = 0;                  // surface comes from ForceFX's reader; telemetry inference is the fallback
+            st.memCrossCheck = false;            // the reader is exact: a rough road the game calls tarmac (cobbles, a bridge) is still tarmac to it, so never throw the surface away because the suspension is busy
             st.autoDiscover = false;             // ForceFX finds the tyres itself, so the audio code never scans memory
             st.memProfiles.clear();
             st.rejectedProfiles.clear();

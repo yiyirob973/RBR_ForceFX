@@ -18,14 +18,14 @@ struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back(
 #define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 struct FakeSink : IAudioSink {
-    int stones = 0;
+    int stones = 0, leftStones = 0, rightStones = 0;
     float lastStoneGain = 0, maxStoneGain = 0;
     void setWheelLoop(int, int, float, float, float) override {}
     void setSlideLoop(int, int, float, float, float) override {}
     void setSquealLoop(int, int, float, float, float) override {}
     void setRumble(float, float) override {}
     void trigger(SoundEvent k, int, float gl, float gr, float) override {
-        if (k == SoundEvent::StoneHit) { ++stones; lastStoneGain = gl + gr; maxStoneGain = std::max(maxStoneGain, gl + gr); }
+        if (k == SoundEvent::StoneHit) { ++stones; if (gl > gr) ++leftStones; else if (gr > gl) ++rightStones; lastStoneGain = gl + gr; maxStoneGain = std::max(maxStoneGain, gl + gr); }
     }
     void silence() override {}
 };
@@ -37,9 +37,22 @@ static TelemetryFrame gframe(double t, double groundMs, double drivenMs, float s
     return f;
 }
 
+// The settings ForceFX gives the audio: the game surface is trusted even when the suspension is busy on a road it calls tarmac.
+static Settings ff() { Settings s; s.memCrossCheck = false; return s; }
+
+// The game's own material id under each tyre (LF, RF, LB, RB), as the plugin's surface reader would report it.
+struct FakeSurface : ISurfaceMemory {
+    int ids[4] = {37, 37, 37, 37};
+    bool readMaterials(int out[4]) override { for (int i = 0; i < 4; ++i) out[i] = ids[i]; return true; }
+    bool configured() const override { return true; }
+    std::string statusText() const override { return "fake"; }
+};
+
 // Drives for `seconds` at a steady speed. rough = 0 is a smooth strut force (tarmac); rough > 0 adds noise (loose ground).
-static int run(double groundMs, double drivenMs, float throttle, float rough, double seconds, Settings st = Settings(), uint32_t seed = 1) {
-    FakeSink sink; SurfaceAudioController c(st, sink, seed); double t = 0;
+// mem = null: no game surface, the controller has only the telemetry to go on.
+static int run(double groundMs, double drivenMs, float throttle, float rough, double seconds, Settings st = Settings(), uint32_t seed = 1,
+               ISurfaceMemory* mem = nullptr, FakeSink* out = nullptr) {
+    FakeSink own; FakeSink& sink = out ? *out : own; SurfaceAudioController c(st, sink, seed); if (mem) c.setSurfaceMemory(mem); double t = 0;
     std::mt19937 g(9); std::normal_distribution<float> n(0, 1);
     for (int i = 0, N = (int)(seconds * 60); i < N; ++i) { t += 1.0 / 60; c.onFrame(gframe(t, groundMs, drivenMs, -3500.f * (1.f + rough * n(g)), throttle)); }
     return sink.stones;
@@ -75,18 +88,95 @@ TEST(standing_wheelspin_still_throws_stones) {
 TEST(standing_still_with_no_wheelspin_throws_nothing) {
     CHECK(run(0.0, 0.0, 0.0f, 0.5f, 10.0) == 0);
 }
-TEST(stones_can_be_switched_off_and_the_rate_scales_with_the_setting) {
+TEST(stones_can_be_switched_off) {
     Settings off; off.enableStones = false;
     CHECK(run(25.0, 25.0, 0.5f, 0.5f, 15.0, off) == 0);
-    Settings none; none.stoneRate = 0.0;
-    CHECK(run(25.0, 25.0, 0.5f, 0.5f, 15.0, none) == 0);
-    Settings few, many; few.stoneRate = 3.0; many.stoneRate = 20.0;
-    CHECK(run(25.0, 25.0, 0.5f, 0.5f, 30.0, few) < run(25.0, 25.0, 0.5f, 0.5f, 30.0, many));
+    CHECK(run(25.0, 25.0, 0.5f, 0.5f, 15.0) > 0);
 }
 TEST(no_per_surface_setting_is_involved) {
     // the same telemetry gives the same stones whatever the sound names say: nothing in Settings maps a surface to a stone level
     Settings a, b; b.surfaceNames[3] = "ice"; b.classVolume[3] = 0.1f;
     CHECK(run(20.0, 20.0, 0.5f, 0.5f, 15.0, a, 5) == run(20.0, 20.0, 0.5f, 0.5f, 15.0, b, 5));
+}
+
+// ---------------------------------------------------------------- surface decides what there is to throw
+TEST(looseness_comes_from_the_game_material_names) {
+    MaterialTable t;
+    CHECK(t.looseness(37) == 0.0 && t.looseness(38) == 0.0 && t.looseness(65) == 0.0 && t.looseness(69) == 0.0);   // clean tarmac, dry or damp, any grain
+    CHECK(t.looseness(45) > 0.2 && t.looseness(45) < 0.5);                                                          // gravel sprinkled on tarmac
+    CHECK(t.looseness(53) > t.looseness(45) && t.looseness(53) < 0.9);                                              // covered in it
+    CHECK(t.looseness(1) > 0.7 && t.looseness(35) >= t.looseness(1));                                               // gravel, deeper = more
+    CHECK(t.looseness(101) > 0.4 && t.looseness(117) < 0.3);                                                        // snow over gravel throws some, over ice little
+    CHECK(t.looseness(113) < 0.5);                                                                                  // grass: clods, not stones
+    CHECK(t.looseness(30) == -1.0 && t.looseness(63) == -1.0);                                                      // a tree, a pole: not ground
+    CHECK(t.looseness(250) == -1.0 && t.looseness(-1) == -1.0 && t.looseness(999) == -1.0);                        // not in the table at all
+}
+TEST(looseness_of_an_override_follows_its_class) {
+    std::string p = (std::filesystem::temp_directory_path() / "loose_override.csv").string();
+    { std::ofstream f(p); f << "250,1,0\n251,0,0\n"; }
+    MaterialTable t; CHECK(t.loadOverrides(p));
+    CHECK(t.looseness(250) > 0.7);                                         // added as loose ground
+    CHECK(t.looseness(251) < 0.2);                                         // added as tarmac
+    std::filesystem::remove(p);
+}
+TEST(clean_tarmac_throws_nothing_however_hard_the_car_works_it) {
+    FakeSurface m; for (int& i : m.ids) i = 37;
+    CHECK(run(30.0, 30.0, 1.0f, 0.5f, 20.0, ff(), 1, &m) == 0);      // rough telemetry, full throttle, fast
+    CHECK(run(2.0, 14.0, 1.0f, 0.5f, 20.0, ff(), 1, &m) == 0);       // wheelspin from a standing start
+}
+TEST(the_more_gravel_on_the_road_the_more_is_thrown) {
+    int counts[4]; int id[4] = {37, 45, 53, 1};                             // clean, sprinkled, covered, gravel
+    for (int k = 0; k < 4; ++k) { FakeSurface m; for (int& i : m.ids) i = id[k]; counts[k] = run(25.0, 25.0, 0.5f, 0.5f, 30.0, ff(), 1, &m); }
+    CHECK(counts[0] == 0);
+    CHECK(counts[1] > 0 && counts[1] < counts[2] && counts[2] < counts[3]);
+}
+TEST(snow_over_gravel_still_throws_while_snow_over_ice_barely_does) {
+    FakeSurface sg, si; for (int& i : sg.ids) i = 102; for (int& i : si.ids) i = 117;
+    const int onGravel = run(25.0, 25.0, 0.5f, 0.5f, 30.0, ff(), 1, &sg), onIce = run(25.0, 25.0, 0.5f, 0.5f, 30.0, ff(), 1, &si);
+    CHECK(onGravel > 0 && onGravel > 2 * onIce);
+}
+TEST(an_object_id_gives_no_ground_information_so_the_telemetry_decides) {
+    FakeSurface m; for (int& i : m.ids) i = 30;                            // a tree: not ground, nothing to read from it
+    CHECK(run(25.0, 25.0, 0.5f, 0.0f, 20.0, ff(), 1, &m) == 0);            // smooth telemetry: no stones
+    CHECK(run(25.0, 25.0, 0.5f, 0.5f, 20.0, ff(), 1, &m) == run(25.0, 25.0, 0.5f, 0.5f, 20.0, ff(), 1, nullptr));   // rough: same as with no surface at all
+}
+TEST(gravel_throws_more_with_speed_and_from_wheelspin_at_a_standstill) {
+    FakeSurface m; for (int& i : m.ids) i = 1;
+    const int slow = run(5.0, 5.0, 0.5f, 0.5f, 30.0, ff(), 1, &m), fast = run(30.0, 30.0, 0.5f, 0.5f, 30.0, ff(), 1, &m);
+    CHECK(slow > 0 && fast > 2 * slow);
+    CHECK(run(1.0, 14.0, 1.0f, 0.5f, 15.0, ff(), 1, &m) > 0);
+    CHECK(run(0.0, 0.0, 0.0f, 0.5f, 10.0, ff(), 1, &m) == 0);        // parked
+}
+TEST(each_tyre_throws_from_its_own_ground) {
+    FakeSurface m; m.ids[0] = 1; m.ids[2] = 1; m.ids[1] = 37; m.ids[3] = 37;   // left tyres on gravel, right tyres on clean tarmac
+    FakeSink sink; run(25.0, 25.0, 0.5f, 0.5f, 30.0, ff(), 1, &m, &sink);
+    CHECK(sink.stones > 20);
+    CHECK(sink.leftStones > 9 * sink.rightStones);                         // the stones come from the left side
+}
+TEST(without_the_game_surface_the_telemetry_decides_alone) {
+    CHECK(run(25.0, 25.0, 0.5f, 0.0f, 20.0) == 0);                          // smooth: nothing
+    CHECK(run(25.0, 25.0, 0.5f, 0.5f, 20.0) > 0);                           // rough: stones
+}
+TEST(there_is_no_stone_rate_setting_any_more) {
+    std::string p = (std::filesystem::temp_directory_path() / "legacy_rate.ini").string();
+    { std::ofstream f(p); f << "StoneRate = 500\nStoneLevel = 3\n"; }
+    Settings s = ff(); CHECK(loadSettings(p, s)); CHECK(s.stoneLevel > 2.99 && s.stoneLevel < 3.01);        // the old key is ignored, the level still reads
+    FakeSurface m; for (int& i : m.ids) i = 1;
+    CHECK(run(25.0, 25.0, 0.5f, 0.5f, 30.0, s, 1, &m) == run(25.0, 25.0, 0.5f, 0.5f, 30.0, s, 1, &m));
+    std::filesystem::remove(p);
+}
+TEST(rough_road_that_the_game_calls_tarmac_keeps_its_surface) {
+    // cobbles and bridges: the game says tarmac, the suspension is busy. The audio must not decide the game is wrong.
+    FakeSurface m; for (int& i : m.ids) i = 77;
+    FakeSink sink; Settings st = ff(); SurfaceAudioController c(st, sink, 1); c.setSurfaceMemory(&m);
+    std::mt19937 g(9); std::normal_distribution<float> n(0, 1); double t = 0;
+    for (int i = 0; i < 60 * 25; ++i) { t += 1.0 / 60; c.onFrame(gframe(t, 25.0, 25.0, -3500.f * (1.f + 0.8f * n(g)), 0.5f)); }
+    CHECK(c.usingMemory());                                                                                   // 25 s of heavy roughness later
+    CHECK(c.analyzer.wheels[0].dominant() == Tarmac);
+    Settings scanner; scanner.memCrossCheck = true;                                                           // the blind-scanner default does what it always did
+    FakeSink sink2; SurfaceAudioController c2(scanner, sink2, 1); c2.setSurfaceMemory(&m); t = 0;
+    for (int i = 0; i < 60 * 25; ++i) { t += 1.0 / 60; c2.onFrame(gframe(t, 25.0, 25.0, -3500.f * (1.f + 0.8f * n(g)), 0.5f)); }
+    CHECK(!c2.usingMemory() || c2.analyzer.wheels[0].dominant() != Tarmac);
 }
 
 // ---------------------------------------------------------------- stone loudness
