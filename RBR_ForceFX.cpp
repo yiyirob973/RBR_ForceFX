@@ -90,6 +90,7 @@
 #include "IPlugin.h"
 #include "materials.hpp"      // ground material table, shared by the surface feel and the audio
 #include "audio_module.hpp"   // dynamic surface audio: only built in when FORCEFX_AUDIO is defined (off until the menu switch is turned on)
+#include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dinput8.lib")
@@ -1290,7 +1291,6 @@ struct Hp  { float y = 0, x = 0; bool init = false;
 struct Ema { float v = 0; bool init = false;
              float step(float in, float a) { if (!init) { v = in; init = true; } else v += (in - v) * a; return v; } };
 
-#include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
 
 // Analysis state that carries over from packet to packet. NGP wheel order: LF, RF, LB, RB.
 struct Dsp {
