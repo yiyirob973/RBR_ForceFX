@@ -90,10 +90,6 @@
 #include "IPlugin.h"
 #include "materials.hpp"      // ground material table, shared by the surface feel and the audio
 #include "audio_module.hpp"   // dynamic surface audio: only built in when FORCEFX_AUDIO is defined (off until the menu switch is turned on)
-#include "surface_feel.hpp"
-#include "road_feel.hpp"   // how the ground and what the car is doing shape the road vibration
-#include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
-
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dinput8.lib")
@@ -1293,6 +1289,25 @@ struct Hp  { float y = 0, x = 0; bool init = false;
              float step(float in, float a) { if (!init) { x = in; init = true; y = 0; return 0; } y = a * (y + in - x); x = in; return y; } };
 struct Ema { float v = 0; bool init = false;
              float step(float in, float a) { if (!init) { v = in; init = true; } else v += (in - v) * a; return v; } };
+// -------------------------------------------------------------- synthesis
+// Turns the analysed signals into effect strengths and frequencies. Runs on the worker thread, about 100 times a second.
+// ====================================================================================================================
+// ROAD FEEL: how the road vibration is shaped by the ground and by what the car is doing.
+//
+// There is no list of "gravel feels like this, tarmac like that". The game's contact data names the material under each tyre
+// (for example Gravel_Coarse_Deep_Wet), and road_feel.hpp turns that name into a few physical properties: how hard the ground
+// is, how much loose material lies on it, how coarse it is and how slippery. The road effect then follows from those together
+// with the telemetry: the measured roughness of the tyres sets how strong it is, speed and wheel slip decide how hard loose
+// ground is worked (stones flung, grain), and tyres that shake in a regular pattern on hard ground are cobbles. Everything
+// reshapes the existing road effect, so no new effects are added and the force stays zero-mean. Unknown ground is plain hard
+// ground. The one setting for all of it is the road gain; the switch is in the menu (Plugins > ForceFX).
+// ====================================================================================================================
+// The surface classes and the id-to-class table live in surface_feel.hpp, the ground model in road_feel.hpp (both testable on
+// their own). surface_feel.hpp is included here, inside the anonymous namespace, because the surface reader below extends the
+// same Surf namespace.
+#include "surface_feel.hpp"
+#include "road_feel.hpp"   // how the ground and what the car is doing shape the road vibration
+#include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
 
 // Analysis state that carries over from packet to packet. NGP wheel order: LF, RF, LB, RB.
 struct Dsp {
@@ -1512,22 +1527,6 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
     }
 }
 
-// -------------------------------------------------------------- synthesis
-// Turns the analysed signals into effect strengths and frequencies. Runs on the worker thread, about 100 times a second.
-// ====================================================================================================================
-// ROAD FEEL: how the road vibration is shaped by the ground and by what the car is doing.
-//
-// There is no list of "gravel feels like this, tarmac like that". The game's contact data names the material under each tyre
-// (for example Gravel_Coarse_Deep_Wet), and road_feel.hpp turns that name into a few physical properties: how hard the ground
-// is, how much loose material lies on it, how coarse it is and how slippery. The road effect then follows from those together
-// with the telemetry: the measured roughness of the tyres sets how strong it is, speed and wheel slip decide how hard loose
-// ground is worked (stones flung, grain), and tyres that shake in a regular pattern on hard ground are cobbles. Everything
-// reshapes the existing road effect, so no new effects are added and the force stays zero-mean. Unknown ground is plain hard
-// ground. The one setting for all of it is the road gain; the switch is in the menu (Plugins > ForceFX).
-// ====================================================================================================================
-// The surface classes and the id-to-class table live in surface_feel.hpp, the ground model in road_feel.hpp (both testable on
-// their own). surface_feel.hpp is included here, inside the anonymous namespace, because the surface reader below extends the
-// same Surf namespace.
 
 namespace Surf {
 float g_fade = 0.25f;                // seconds to cross-fade between two surfaces
