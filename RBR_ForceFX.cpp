@@ -90,6 +90,10 @@
 #include "IPlugin.h"
 #include "materials.hpp"      // ground material table, shared by the surface feel and the audio
 #include "audio_module.hpp"   // dynamic surface audio: only built in when FORCEFX_AUDIO is defined (off until the menu switch is turned on)
+#include "surface_feel.hpp"
+#include "road_feel.hpp"   // how the ground and what the car is doing shape the road vibration
+#include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
+
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dinput8.lib")
@@ -1524,9 +1528,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 // The surface classes and the id-to-class table live in surface_feel.hpp, the ground model in road_feel.hpp (both testable on
 // their own). surface_feel.hpp is included here, inside the anonymous namespace, because the surface reader below extends the
 // same Surf namespace.
-#include "surface_feel.hpp"
-#include "road_feel.hpp"   // how the ground and what the car is doing shape the road vibration
-#include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
+
 namespace Surf {
 float g_fade = 0.25f;                // seconds to cross-fade between two surfaces
 float g_front = 0.65f;               // share of a side's ground that comes from its front tyre (the rear tyre gets the rest)
