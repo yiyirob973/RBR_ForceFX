@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include "../materials.hpp"
+#include "../wheel_slip.hpp"   // wheel slip from the segment counter (shared with the road feel)
 
 namespace rsa {
 
@@ -72,6 +73,7 @@ struct MemoryProfile {
 // Override with "Packet.<Name> = <offset>" in the ini if a future NGP changes the layout.
 struct PacketLayout {
     int minLength = 664;
+    int steps = 0;                                    // totalSteps_: NGP's own step counter, a clean clock for the wheel counters (-1 = not there)
     int steering = 24, throttle = 28, brake = 32, handbrake = 36, gear = 44;
     int speed = 60, velSurge = 88, velSway = 92, velHeave = 96, yawRate = 108;
     int accSurge = 112, accSway = 116, accHeave = 120;
@@ -79,7 +81,7 @@ struct PacketLayout {
     int springDeflection = 0, rollbarForce = 4, springForce = 8, damperForce = 12, strutForce = 16;
     int pistonVelocity = 28, brakeDiskTemp = 36, tirePressure = 44, tireTemp = 48, tireTreadTemp = 56, currentSegment = 60;
     int neededLength() const {
-        int m = std::max({steering, throttle, brake, handbrake, gear, speed, velSurge, velSway, velHeave, yawRate,
+        int m = std::max({steps, steering, throttle, brake, handbrake, gear, speed, velSurge, velSway, velHeave, yawRate,
                           accSurge, accSway, accHeave});
         int inBlock = std::max({springDeflection, rollbarForce, springForce, damperForce, strutForce, pistonVelocity,
                                 brakeDiskTemp, tirePressure, tireTemp, tireTreadTemp, currentSegment});
@@ -101,6 +103,9 @@ struct Settings {
     double stoneLevel = 2.0;           // stones and debris thrown at the car (separate from impacts: they are quick, light sounds that need more gain)
     double loopBoost = 2.0;            // extra rolling-noise gain at full slip / very rough ground (0 = flat level)
     double loopLevel = 0.25, squealLevel = 0.5, slideLevel = 0.5;   // mix levels per tyre (each of 4 tyres has its own)
+    // Where the squeal and the slide begin, in units of the tyre's grip limit (1 = the limit, from PeakSlipRatio / PeakSlipAngleDeg).
+    // A tyre only squeals once it is at or near its limit, and slides beyond it.
+    double squealStart = 0.8, slideStart = 1.3;
     bool cabinEffect = true;           // sound as heard from inside the car: muffled, bassy, with cabin reflections
     double cabinLowpassHz = 2600, cabinBassDb = 6, cabinReverb = 0.2;
     bool speedIsKph = true;
@@ -169,6 +174,8 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "LoopRoughBoost") s.loopBoost = clampd(d(), 0.0, 10.0);
     else if (key == "SquealLevel") s.squealLevel = d();
     else if (key == "SlideLevel") s.slideLevel = d();
+    else if (key == "SquealStart") s.squealStart = clampd(d(), 0.1, 3.0);
+    else if (key == "SlideStart") s.slideStart = clampd(d(), 0.2, 4.0);
     else if (key == "CabinEffect") s.cabinEffect = toBool(v);
     else if (key == "CabinLowpassHz") s.cabinLowpassHz = d();
     else if (key == "CabinBassDb") s.cabinBassDb = d();
@@ -334,6 +341,7 @@ struct WheelSample {
 // Wheel order everywhere: LF, RF, LB, RB.
 struct TelemetryFrame {
     double time = 0;          // seconds, monotonic
+    uint32_t steps = 0; bool haveSteps = false;   // NGP's step counter (see PacketLayout::steps)
     float speed = 0;          // raw game units (kph or mph)
     float steering = 0, throttle = 0, brake = 0, handbrake = 0;
     int gear = 0;
@@ -352,6 +360,7 @@ inline bool parsePacket(const uint8_t* d, size_t length, double time, TelemetryF
     auto F = [&](int o) { float v; std::memcpy(&v, d + o, 4); return std::isfinite(v) ? v : 0.0f; };
     auto U = [&](int o) { uint32_t v; std::memcpy(&v, d + o, 4); return v; };
     f.time = time;
+    f.haveSteps = L.steps >= 0; f.steps = f.haveSteps ? U(L.steps) : 0u;
     f.steering = F(L.steering); f.throttle = F(L.throttle); f.brake = F(L.brake); f.handbrake = F(L.handbrake);
     f.gear = (int)U(L.gear);
     f.speed = std::fabs(F(L.speed));
@@ -420,7 +429,7 @@ inline void classify(double roughness, double absSlip, bool slipValid, const Set
 }
 
 // Per-tyre signal analysis. Roughness = RMS of high-passed strut force / mean strut force.
-// Slip = tyre rotation (8-segment counter) vs the rate expected from car speed (learned while coasting).
+// Slip = tyre rotation (8-segment counter, counted over a window) vs the rate expected from the ground speed (learned while coasting).
 class WheelAnalyzer {
 public:
     double probs[4] = {1, 0, 0, 0};      // final class probabilities (game memory when healthy, else inference)
@@ -429,7 +438,9 @@ public:
     double load = 0, loadRef = 0, roughness = 0, pistonHp = 0, pistonRms = 0, pistonRefRms = 0;
     double loadSmooth = 0;               // strut load smoothed over about 0.4 s: weight transfer from body roll, braking and crests, without the bumps
     double pistonRaw = 0;                // damper piston velocity as reported (m/s): slow strokes are what make suspension squeak
-    double revRate = 0, slip = 0, slipAngle = 0, slipNorm = 0;
+    double revRate = 0;                  // tyre revolutions per second
+    double slip = 0;                     // slip ratio past its dead band: + wheelspin, - lock-up, 0 = rolling or not sure (see wheel_slip.hpp)
+    double slipAngle = 0, slipNorm = 0;
     bool slipValid = false;
     double speed_ = 0;                  // ground speed (the car's speed over the ground), m/s
     // Wheel speed: how fast this tyre's surface is turning, as a road speed (m/s). Ground speed and wheel speed are
@@ -450,7 +461,9 @@ public:
     double loadFraction() const { return loadRef <= 1e-6 ? 1.0 : clampd(load / (0.7 * loadRef), 0.0, 1.0); }
     int dominant() const { int b = 0; for (int i = 1; i < 4; ++i) if (probs[i] > probs[b]) b = i; return b; }
 
-    void update(const WheelSample& w, double speedMs, double drivenMs, double dt, bool coasting) {
+    // st: this packet on the clean time axis (see Slip::Timebase); timeGen changes when that axis restarts.
+    void update(const WheelSample& w, double speedMs, double drivenMs, double dt, bool coasting,
+                const Slip::Timebase::Stamp& st, unsigned timeGen) {
         speed_ = speedMs;   // true ground speed
         load = std::fabs(w.strutForce);
         double ls = loadShort_.update(load, dt);
@@ -468,28 +481,27 @@ public:
         pistonRms = std::sqrt(pistonVar_.update(pistonHp * pistonHp, dt));
         pistonRefRms = std::sqrt(pistonRef_.update(pistonHp * pistonHp, dt));
 
-        uint32_t seg = w.currentSegment % 8u;
-        if (haveSeg_ && dt > 1e-4) {
-            int delta = (int)((seg + 8u - lastSeg_) % 8u);
-            revRate_.update(delta / 8.0 / dt, dt);
-        }
-        lastSeg_ = seg; haveSeg_ = true;
-        revRate = revRate_.value();
-
-        if (coasting && speedMs > 8.0 && revRate_.hasValue()) rollRatio_.update(revRate_.value() / speedMs, dt);
-        slipValid = rollRatio_.hasValue() && rollRatio_.value() > 1e-3 && speedMs > 3.0;
-        double raw = slipValid ? revRate_.value() / (rollRatio_.value() * speedMs) - 1.0 : 0.0;
-        slip = slipSmooth_.update(raw, dt);
+        // Spin of the tyre from its segment counter, counted over a window with enough steps and compared with the real ground
+        // speed. Slip only counts past the uncertainty of that count, so a wheel that is just rolling never reads as slipping.
+        if (timeGen != timeGen_) { rev_.reset(); timeGen_ = timeGen; }
+        rev_.push(w.currentSegment, st.tick, st.secPerTick);
+        slip_.update(rev_, st.secPerTick, st.timeErr, speedMs, coasting, dt);
+        const Slip::RevCounter::Est e = rev_.estimate(32.0, 0.5, st.secPerTick);
+        revRate = e.valid ? e.revPerSec : 0.0;
+        slipValid = slip_.valid;
+        slip = slip_.valid ? slip_.ratio : 0.0;
         {
             // Wheel speed of this tyre as a road speed. With the real tyre size learned (from coasting) it comes from this
             // tyre's own rotation counter. Before that it is the driven-wheel speed from the Speed field, which is known from
             // the very first metre: a standing-start launch is detected without having coasted once.
-            bool have = rollRatio_.hasValue() && rollRatio_.value() > 1e-3;
+            const bool have = slip_.learned();
             rollLearned = have;
-            wheelSpeedValid = have ? revRate_.hasValue() : true;
-            wheelSpeedMs = have ? (revRate_.hasValue() ? revRate_.value() / rollRatio_.value() : speedMs) : drivenMs;
+            wheelSpeedValid = have ? slip_.wheelValid : true;
+            wheelSpeedMs = have ? (slip_.wheelValid ? slip_.wheelMs : speedMs) : drivenMs;
             double ls = (wheelSpeedMs - speedMs) / std::max(speedMs, 3.0);
-            if (!have) ls = std::max(0.0, ls - 0.08);   // an estimate: wheelspin only (a lock-up is not read from the driven speed)
+            // A wheel speed from a count has an error too: only what lies beyond it is wheelspin or lock-up.
+            const double band = (have ? slip_.wheelErrMs / std::max(speedMs, 3.0) : 0.08) + (have ? 0.03 : 0.0);
+            ls = ls >= 0 ? std::max(0.0, ls - band) : (have ? std::min(0.0, ls + band) : 0.0);   // before the size is learned: wheelspin only
             launchValid = wheelSpeedValid && !slipValid;
             launchSlip = launchSmooth_.update(launchValid ? ls : 0.0, dt);
         }
@@ -528,8 +540,8 @@ public:
 private:
     HighPass hpForce_{0.12}, hpPiston_{0.12};
     Ema loadShort_{2.0}, loadQuick_{0.4}, loadLong_{8.0}, forceVar_{0.35}, pistonVar_{0.35}, pistonRef_{4.0};
-    Ema revRate_{0.12}, rollRatio_{3.0}, slipSmooth_{0.25}, slipNorm_{0.05}, launchSmooth_{0.05};
-    uint32_t lastSeg_ = 0; bool haveSeg_ = false;
+    Ema slipNorm_{0.05}, launchSmooth_{0.05};
+    Slip::RevCounter rev_; Slip::WheelSlip slip_; unsigned timeGen_ = ~0u;
     double transition_ = 0;
     static void smooth(double* cur, const double* target, double tau, double dt) {
         double a = 1.0 - std::exp(-dt / tau), sum = 0;
@@ -659,9 +671,10 @@ public:
                         std::fabs(f.accSurge * dynamics.accelScale(s_)) < s_.coastAccelLimit && speedMs > 8.0;
         if (groundFromVelocity && coasting && speedMs > 8.0) fieldScale_.update(clampd(fieldMs / speedMs, 1.0, 2.5), dt);
         drivenMs = groundFromVelocity ? fieldMs / (fieldScale_.hasValue() ? fieldScale_.value() : s_.speedFieldScale) : fieldMs;
+        const Slip::Timebase::Stamp stamp = timebase_.stamp(f.steps, f.haveSteps, f.time);
         double total = 0, raw[4];
         for (int i = 0; i < 4; ++i) {
-            wheels[i].update(f.wheels[i], speedMs, drivenMs, dt, coasting);
+            wheels[i].update(f.wheels[i], speedMs, drivenMs, dt, coasting, stamp, timebase_.generation());
             total += std::fabs(f.wheels[i].strutForce);   // NGP reports compression as negative force
             classify(wheels[i].roughness, std::fabs(wheels[i].slip) * slipGate((double)f.throttle, (double)f.brake, speedMs), wheels[i].slipValid, s_, raw);
             wheels[i].applyProbabilities(raw, dt, speedMs < 12.0);   // settle fast while pulling away from a standstill
@@ -687,6 +700,7 @@ public:
     }
 private:
     const Settings& s_;
+    Slip::Timebase timebase_;
     Ema totalLoad_{3.0};
     double airTimer_ = 0, groundHold_ = 0, lastTotal_ = 0;
 };
@@ -981,8 +995,8 @@ private:
             bool on = a.speedMs > 1.0 || wa.launchSlip > 0.05;   // standing wheelspin counts
             double air = a.airborne ? 0.0 : 1.0;   // in the air: no tyre noise
             double squeal = 0, slide = 0;
-            if (on && s.enableSqueal) squeal = smoothstep((n - 0.45) / 0.5) * (1.0 - 0.6 * smoothstep((n - 1.4) / 0.6)) * load * air;
-            if (on && s.enableSlide) slide = smoothstep((n - 1.0) / 0.8) * load * air;
+            if (on && s.enableSqueal) squeal = smoothstep((n - s.squealStart) / 0.45) * (1.0 - 0.6 * smoothstep((n - (s.slideStart + 0.4)) / 0.6)) * load * air;
+            if (on && s.enableSlide) slide = smoothstep((n - s.slideStart) / 0.8) * load * air;
             float sqRate = (float)(0.85 + 0.5 * clampd((n - 0.7) / 1.0, 0.0, 1.0));
             float slRate = (float)(0.9 + 0.4 * clampd(std::max(a.speedMs, wa.contactSpeedMs()) / 40.0, 0.0, 1.0));   // sliding speed: ground or spinning surface, whichever is faster
             const std::vector<double>& weights = sv.w[w];

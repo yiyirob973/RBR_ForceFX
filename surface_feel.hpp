@@ -1,4 +1,5 @@
-// Surface feel: which kinds of ground the plugin tells apart and how each one reshapes the road vibration.
+// Surface classes: which kinds of ground the plugin tells apart, which class each game material id belongs to, and the checks on
+// the telemetry that spot ridged ground. How the road actually feels is worked out in road_feel.hpp.
 // Pure logic, no Windows or game access, so it can be tested on its own (see tests/surface_feel_test.cpp).
 //
 // RBR_ForceFX.cpp includes this file INSIDE its anonymous namespace at the place the code used to live, so the
@@ -22,15 +23,10 @@ inline const char* ClsName(int c) {
     static const char* const n[C_COUNT] = {"unknown", "tarmac", "gravel", "snow", "ice", "soft", "cobble", "wood"};
     return c >= 0 && c < C_COUNT ? n[c] : "?";
 }
-// Names used for the keys in the [Surface] section of ForceFX.ini ("GravelAmp", "CobbleRidge", ...).
-inline const char* ClsIniName(int c) {
-    static const char* const n[C_COUNT] = {"", "Tarmac", "Gravel", "Snow", "Ice", "Soft", "Cobble", "Wood"};
-    return c >= 0 && c < C_COUNT ? n[c] : "";
-}
-
+// The values the road effect uses for one side of the car, worked out by Road::Derive (road_feel.hpp).
 struct Feel {
     float amp;        // multiplier on the road strength
-    float grainAdd;   // added to RoadGrain (0..1): how random the strength and pitch are
+    float grainAdd;   // added to the base grain (-1..1): how random the strength and pitch are
     float dropout;    // extra drop of the weakest hits (0..0.6): gaps between grains
     float hz;         // multiplier on the road pitch
     float atk;        // how fast the effect rises (0.05..1)
@@ -40,45 +36,13 @@ struct Feel {
     float sparkMul;   // strength of that hit
     float floor;      // the least texture level: smooth ground still gives a faint feel
     float ridge;      // metres between ridges (cobbles, planks). 0 = none. With a ridge the pitch is locked to speed: hits per second = speed / ridge
-    float ridgeMix;   // blended result only, never set from the ini: how much of the pitch comes from the ridges (0..1)
+    float ridgeMix;   // how much of the pitch comes from the ridges (0..1)
 };
 constexpr Feel kNeutral = {1.0f, 0.0f, 0.0f, 1.0f, 0.55f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f};
 
-constexpr int kFeelParams = 11;     // values that can be set per surface (the ini keys); the 11th is Ridge
-constexpr int kBlendParams = 10;    // the first ten blend linearly; Ridge is combined separately
-
-constexpr float kRidgeMin = 0.03f, kRidgeMax = 1.0f;   // metres: the range the ini may set
-
-// Default values per class. Hard ground that is not smooth gets a ridge so its pitch follows speed:
-//   cobble: small stones, a hit every ~12 cm, crisp and regular, strong even with little suspension movement (floor); real cobbles
-//           are very obvious through the wheel, so this is a lot stronger than any other surface
-//   wood:   planks across the road, a hit every ~25 cm, rounder and a little hollow
-inline Feel* DefaultFeels() {
-    static Feel f[C_COUNT] = {
-        kNeutral,                                                                                      // unknown
-        kNeutral,                                                                                      // tarmac
-        {1.00f,  0.10f, 0.25f, 1.10f, 0.60f, 1.8f, 1.00f, 0.07f, 1.6f, 0.20f, 0.0f, 0.0f},           // gravel
-        {0.55f, -0.70f, 0.00f, 0.50f, 0.12f, 0.3f, 0.90f, 0.00f, 1.0f, 0.22f, 0.0f, 0.0f},           // snow
-        {0.90f, -0.40f, 0.00f, 1.35f, 0.90f, 2.2f, 0.30f, 0.10f, 2.4f, 0.30f, 0.0f, 0.0f},           // ice
-        {0.90f, -0.20f, 0.05f, 0.80f, 0.35f, 0.5f, 1.00f, 0.00f, 1.0f, 0.18f, 0.0f, 0.0f},           // soft
-        {2.40f, -0.60f, 0.00f, 1.00f, 1.00f, 3.0f, 1.25f, 0.07f, 2.2f, 0.60f, 0.12f, 0.0f},          // cobble
-        {1.60f, -0.50f, 0.00f, 1.00f, 0.80f, 1.5f, 1.10f, 0.00f, 1.0f, 0.40f, 0.25f, 0.0f}};         // wood
-    return f;
-}
-
-inline const char* const* FeelKeys() {
-    static const char* const k[kFeelParams] = {"Amp", "Grain", "Dropout", "Hz", "Attack", "Release", "Base", "Spark", "SparkMul", "Floor", "Ridge"};
-    return k;
-}
-inline float Feel::* const* FeelMembers() {
-    static float Feel::* const m[kFeelParams] = {&Feel::amp, &Feel::grainAdd, &Feel::dropout, &Feel::hz, &Feel::atk,
-                                                 &Feel::rel, &Feel::base, &Feel::spark, &Feel::sparkMul, &Feel::floor, &Feel::ridge};
-    return m;
-}
-
 // Which class a material id belongs to. The gravel and tarmac families up to 55 are verified against the game's material table;
-// the rest come from the table's order and from driving, so [Surface] Map= can correct any of them.
-// Anything not listed is "unknown" and leaves the feel unchanged. The game's own material table has no cobblestone or wooden
+// the rest come from the table's order and from driving, so [Surface] Map= can correct any of them (the class also picks the ground when an id is not in the game's material table).
+// Anything not listed is "unknown": the ground then comes from the material name, or is plain hard ground. The game's own material table has no cobblestone or wooden
 // bridge entries, so those are assigned by id with Map= (the log names every unmapped id the car drives on).
 inline int DefaultClass(int id) {
     auto in = [id](int a, int b) { return id >= a && id <= b; };
@@ -88,8 +52,8 @@ inline int DefaultClass(int id) {
     if (in(37, 39) || in(45, 47) || in(53, 55) || in(65, 87)) return C_TARMAC;                                    // six tarmac families of three: clean, sprinkled, covered
     if (in(101, 103)) return C_SNOW;                                                                              // snow on gravel (shallow, medium, deep)
     if (in(117, 119)) return C_ICE;                                                                               // snow on ice (shallow, medium, deep)
-    if (in(93, 99) || in(105, 115) || in(121, 131) || in(137, 139)) return C_SOFT;                                // grass, rough verge
-    return C_NONE;                                                                                                // unknown, trees, rocks, walls, water: nothing changes
+    if (in(93, 99) || in(105, 115) || in(121, 131) || in(137, 139) || id == 157) return C_SOFT;                  // grass, rough verge, water
+    return C_NONE;                                                                                                // unknown, trees, rocks, walls: nothing changes
 }
 
 inline int* IdMap() { static int m[256] = {}; return m; }       // per-id override of the class, stored as class+1 (0 = use the built-in table)
@@ -137,29 +101,6 @@ inline int ParseIdMap(const std::string& m, std::vector<std::string>* rejected =
         IdMap()[id] = k + 1; ++applied;
     }
     return applied;
-}
-
-// Weighted mix of the per-class values (w sums to 1), then scaled by the strength (0 = no change at all, 1 = as tuned, up to 1.5).
-// Ridges don't average (half a cobble and half tarmac is not a 6 cm ridge): the ridge spacing is the weighted spacing of the
-// classes that have one, and ridgeMix says how much of the mix they make up, so the pitch fades between random and speed-locked.
-inline Feel Blend(const float w[C_COUNT], float strength) {
-    using detail::clampf;
-    const Feel* gf = DefaultFeels();
-    Feel r = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    float Feel::* const* m = FeelMembers();
-    for (int p = 0; p < kBlendParams; ++p) {
-        float v = 0;
-        for (int i = 0; i < C_COUNT; ++i) v += w[i] * gf[i].*m[p];
-        r.*m[p] = kNeutral.*m[p] + (v - kNeutral.*m[p]) * strength;
-    }
-    float rw = 0, rs = 0;
-    for (int i = 0; i < C_COUNT; ++i) if (gf[i].ridge > 0.0f) { rw += w[i]; rs += w[i] * gf[i].ridge; }
-    r.ridge = rw > 0.0f ? clampf(rs / rw, kRidgeMin, kRidgeMax) : 0.0f;
-    r.ridgeMix = clampf(rw * strength, 0.0f, 1.0f);
-    r.atk = clampf(r.atk, 0.05f, 1.0f); r.rel = clampf(r.rel, 0.05f, 4.0f); r.hz = clampf(r.hz, 0.3f, 2.0f);
-    r.dropout = clampf(r.dropout, 0.0f, 0.6f); r.spark = clampf(r.spark, 0.0f, 0.5f); r.floor = clampf(r.floor, 0.0f, 0.6f);
-    r.amp = std::max(0.0f, r.amp); r.base = std::max(0.0f, r.base); r.sparkMul = clampf(r.sparkMul, 0.5f, 3.0f);
-    return r;
 }
 
 // Pitch of a ridged surface: hits per second = speed / spacing. When that is above what the wheel can play it is folded down

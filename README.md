@@ -41,18 +41,28 @@ ForceFX settings are stored in `ForceFX.ini`. The comments in that file describe
 
 `ForceFXCars.ini` contains optional per-car profiles. Profiles can adjust selected values and fall back to the global settings for unspecified values. You can edit or remove profiles, or disable per-car profiles in the configuration.
 
-## Surface feel
+## Road feel
 
-ForceFX reads the contact data RBR keeps for each tyre (read-only; it never writes to the game) to tell what kind of ground the car is on, and reshapes the road vibration to match. Tarmac and unknown ground keep the plain road feel.
+The road feel is not a list of "gravel feels like this, tarmac like that". ForceFX reads the contact data RBR keeps for each tyre (read-only; it never writes to the game) and takes the name of the material under it, for example `Gravel_Coarse_Deep_Wet`. From the name it works out how hard the ground is, how much loose material lies on it, how coarse it is and how slippery it is. The road vibration then follows from those together with what the car is doing, so the same ground feels different depending on how you drive on it:
 
-- Switch it on or off, and set how strongly it applies, from **Plugins > ForceFX** (`Effect: Surface feel` and `Surface feel strength`) or with `EnableSurfaceFeel` and `SurfaceStrength` in `ForceFX.ini`. At 0% the road feels the same on every surface.
-- The `[Surface]` section of `ForceFX.ini` tunes each surface (gravel, snow, ice, soft ground, cobblestone, wooden bridge) separately and can correct the surface type of a single material id with `Map=`. Edits there take effect when RBR starts.
-- **Cobblestone and wooden bridges:** the game's material table has no entry for them, so they are assigned by id. Drive over one and look in `ForceFX.log` for `ground material id N ... has no surface class` (the Diagnostics page also shows the ids under the tyres), then add `Map=N:cobble` or `Map=N:wood`. If the cobbles reuse a tarmac id, `Map=` can override that id too, but then every road using that id gets the cobble feel. On these surfaces the pitch follows your speed: one hit per ridge (`CobbleRidge` and `WoodRidge` set the spacing in metres).
-- **Cobble detection from telemetry:** ground the game calls tarmac blends into the cobble feel when the tyres shake the way cobbles do (roughness per speed, smoothed over about a second). `CobbleDetect=0` turns it off, and `CobbleDetectLow` / `CobbleDetectHigh` set where the blend starts and is complete. To tune surfaces from your own driving, set `SurfaceProbe=1` and send `ForceFX_probe.csv`.
-- All four tyres are read separately, so a car with two wheels on grass and two on tarmac feels the difference on each side. Each side mixes its front and rear tyre (`FrontWeight`), and `TyreOrder` in the `[Surface]` section says which tyre object is which wheel.
+- **Strength** follows how rough the tyres actually measure, from the strut forces and damper speed in the telemetry.
+- **Loose ground** (gravel, dirt, snow) is grainy, with gaps and the odd flung stone. How much of that you feel depends on speed and wheel slip: a gentle roll is calm, a slide or wheelspin is violent. Standing still, nothing is thrown.
+- **Soft ground** (deep gravel, snow, grass) absorbs and dulls the vibration, with a lower pitch and a slower rise and fall.
+- **Hard, slippery ground** (snow on ice, wet tarmac) is quiet between hits and cracks sharply. Wet tarmac is only slightly different from dry.
+- **Cobblestones and other ridged ground** are recognised from the telemetry: hard ground whose tyres shake in a regular pattern gets strong, crisp hits in time with your speed (one per ridge). No material id is needed.
+- All four tyres are read separately, so a car with two wheels on grass and two on tarmac feels the difference on each side. Each side mixes its front and rear tyre, and the ground fades in over a fraction of a second.
+
+**The one setting is the road gain** (`RoadMaxMagnitude`, or `Road gain` in **Plugins > ForceFX**). `Effect: Surface feel` (`EnableSurfaceFeel`) switches the ground-aware part off, so the road feels the same on every surface. Unknown ground is treated as plain hard ground. The old per-surface values, `SurfaceStrength`, `RoadGrain` and `RoadDirectional` are gone; they are ignored if they are still in your `ForceFX.ini`.
+
+For people who want to dig further, the `[Surface]` section of `ForceFX.ini` has the tyre order, the front/rear weighting, how often the ground is read, the cobble detection thresholds (`CobbleDetect`, `CobbleDetectLow`, `CobbleDetectHigh`) and `Map=`. `Map=N:type` replaces the ground of a single material id with a typical ground of that type (tarmac, gravel, snow, ice, soft, cobble, wood or none), which also covers an id the game's material table doesn't have. Edits there take effect when RBR starts. To help tune it from your own driving, set `SurfaceProbe=1` and send `ForceFX_probe.csv`.
+
 - The ground is read only while a stage is running. Finding the tyre data takes a short scan of the game's memory at the start of each stage, in the background.
 - The Diagnostics page shows the detected surface and the material ids under the four tyres. `ForceFX.log` records each surface change.
-- It relies on the memory layout of the RallySimFans `RichardBurnsRally_SSE.exe`. On a build with a different layout the plugin simply finds no tyre data and the road feels as it did before.
+- It relies on the memory layout of the RallySimFans `RichardBurnsRally_SSE.exe`. On a build with a different layout the plugin simply finds no tyre data, the ground counts as plain hard ground, and the road feel still follows the telemetry.
+
+## How wheel slip is measured
+
+NGP's telemetry has no slip value. Each wheel only reports a segment counter that steps once per eighth of a turn, so ForceFX counts the turns over a window of at least four revolutions (about a quarter of a second at speed) and compares them with the car's real speed over the ground (the velocity vector, not the speedometer, which follows the driven wheels). Every reading carries the error of the count, and slip only counts beyond it, so a wheel that is simply rolling is never read as slipping. A shorter window finds lock-up and wheelspin quickly. NGP's step counter (`OffsetSteps`) is used as the clock when it behaves. Road feel, front-wheel lock-up and the audio's squeal and slide all use this. The tyre size is learned while coasting, so the first few seconds of a stage use a cautious guess. `tests/wheel_slip_test.cpp` and `audio/tests/slip_test.cpp` cover it.
 
 ## Dynamic surface audio
 
@@ -84,7 +94,7 @@ ForceFX can also play tyre and ground sounds that follow each wheel: rolling noi
 - **No telemetry is received:** Check that NGP UDP telemetry is enabled, then open the ForceFX menu. The telemetry line shows the packet count and where packets come from (NGP or the UDP port), and diagnostic information.
 - **The wheel does not connect or effects are unavailable:** Confirm force feedback is enabled in RBR and select the same DirectInput wheel that RBR uses. Check `ForceFX.log` for connection or device errors.
 - **Telemetry arrives but feedback is incorrect:** The telemetry layout may differ from the configured offsets or scaling. Review the advanced settings in `ForceFX.ini` and use the diagnostics page to inspect the received values.
-- **Surface feel does nothing:** Open the Diagnostics page. `Surface: looking for the tyres` means the tyre data was not found (check `ForceFX.log` for `Surface:` lines; a different RBR build can have a different layout). `Surface: unknown` means the ground under the car is not one the plugin recognises; the Diagnostics page shows the material ids, and `Map=` in `[Surface]` can assign them.
+- **The road feel doesn't react to the ground:** Open the Diagnostics page. `Surface: looking for the tyres` means the tyre data was not found (check `ForceFX.log` for `Surface:` lines; a different RBR build can have a different layout). `Surface: unknown` means the ground under the car is not one the plugin recognises, so it counts as plain hard ground; the Diagnostics page shows the material ids, and `Map=` in `[Surface]` can assign them.
 - **Feedback is too strong or busy:** Lower the combined output ceiling or live level first, then adjust individual effect levels. Start conservatively and test one effect at a time.
 
 The plugin writes `ForceFX.log` and, after receiving telemetry, `ForceFX_packet.txt` beside the DLL. Include relevant log details and your NGP/telemetry setup when reporting a problem; remove any personal information before sharing logs.
