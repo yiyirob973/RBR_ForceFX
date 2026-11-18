@@ -2,8 +2,8 @@
 // the telemetry that spot ridged ground. How the road actually feels is worked out in road_feel.hpp.
 // Pure logic, no Windows or game access, so it can be tested on its own (see tests/surface_feel_test.cpp).
 //
-// RBR_ForceFX.cpp includes this file INSIDE its anonymous namespace at the place the code used to live, so the
-// Surf namespace here is the same one the surface reader extends. The standard headers are already included there.
+// RBR_ForceFX.cpp includes this file inside its anonymous namespace, so the Surf namespace here is the same one the
+// surface reader extends. The standard headers are already included there.
 #pragma once
 #include <algorithm>
 #include <cctype>

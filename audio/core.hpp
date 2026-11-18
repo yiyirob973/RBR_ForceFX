@@ -51,25 +51,6 @@ private:
 // -------------------------------------------------------------------- settings
 enum StageHint { HintAuto = 0, HintTarmac = 1, HintGravel = 2, HintSnow = 3 };
 
-// Where to find the game's own surface (material id) value in memory. Everything is data, nothing is
-// hard-coded, so a game or NGP update only needs a new profile, never a rebuild. See README.
-struct MemoryProfile {
-    std::string name;
-    std::string module = "exe";        // "exe" = RichardBurnsRally_SSE.exe, or a loaded DLL name such as NGP.dll
-    uint32_t imageSize = 0;            // build fingerprint of that module (PE SizeOfImage); 0 = any
-    uint32_t peTimestamp = 0;          // build fingerprint (PE TimeDateStamp); 0 = any
-    std::string signature;             // byte pattern with ?? wildcards, e.g. "A1 ?? ?? ?? ?? 8B 40 10"
-    int sigOffset = 0;                 // offset inside the match of a 4-byte absolute address operand
-    uint32_t baseOffset = 0;           // used when no signature: module base + this = address of the base pointer
-    std::vector<int32_t> chain;        // for each: ptr = read32(addr); addr = ptr + offset
-    int width = 4;                     // value size in bytes: 1, 2 or 4
-    int wheelStride = 4;               // bytes between the four wheels' values (LF, RF, LB, RB)
-    bool perWheel = true;              // false = a single value for the whole car
-    // Filled in by auto-discovery (learned.ini). A profile you write by hand is verified by default.
-    bool verified = true;
-    int agree[4] = {0, 0, 0, 0}, disagree[4] = {0, 0, 0, 0};   // per coarse class: tarmac, loose/rough, (unused), slippery
-};
-
 // Byte offsets of the NGP UDP packet fields. Defaults follow rbr.telemetry.data.TelemetryData.h (NGP 7.4.778).
 // Override with "Packet.<Name> = <offset>" in the ini if a future NGP changes the layout.
 struct PacketLayout {
@@ -138,10 +119,7 @@ struct Settings {
     bool memCrossCheck = true;         // distrust the game surface when it says tarmac but the suspension is hammered. For a blind memory scanner; ForceFX turns it off because its reader is exact (cobbles are tarmac to the game)
     bool startupBeep = true;           // short test tone when the plugin starts: proves the audio output path
 
-    bool autoDiscover = true;            // let the plugin find the surface value in memory by itself (read-only)
     int surfaceMode = 0;                 // 0 auto: game memory when healthy, else telemetry inference; 1 telemetry only
-    std::vector<MemoryProfile> memProfiles;
-    std::vector<MemoryProfile> rejectedProfiles;   // decoys auto-discovery already threw out; remembered so rescans do not bring them back
     PacketLayout packet;
 };
 
@@ -212,7 +190,6 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "ImpactMinVelocity") s.impactMinVelocity = d();
     else if (key == "DebugLog") s.debugLog = toBool(v);
     else if (key == "StartupBeep") s.startupBeep = toBool(v);
-    else if (key == "AutoDiscover") s.autoDiscover = toBool(v);
     else if (key == "SurfaceMode") s.surfaceMode = (v == "telemetry" || v == "1") ? 1 : 0;
     else if (key.compare(0, 7, "Packet.") == 0) {
         PacketLayout& p = s.packet;
@@ -235,77 +212,21 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     }
 }
 
-inline void applyProfileSetting(MemoryProfile& m, const std::string& key, const std::string& v) {
-    using namespace detail;
-    auto num = [&]() { return (uint32_t)std::strtoul(v.c_str(), nullptr, 0); };
-    if (key == "Module") m.module = v;
-    else if (key == "ImageSize") m.imageSize = num();
-    else if (key == "PeTimestamp") m.peTimestamp = num();
-    else if (key == "Signature") m.signature = v;
-    else if (key == "SigOffset") m.sigOffset = (int)std::strtol(v.c_str(), nullptr, 0);
-    else if (key == "BaseOffset") m.baseOffset = num();
-    else if (key == "Chain") { m.chain.clear(); for (auto& t : split(v, ',')) if (!t.empty()) m.chain.push_back((int32_t)std::strtol(t.c_str(), nullptr, 0)); }
-    else if (key == "Width") m.width = std::atoi(v.c_str());
-    else if (key == "WheelStride") m.wheelStride = std::atoi(v.c_str());
-    else if (key == "PerWheel") m.perWheel = toBool(v);
-    else if (key == "Verified") m.verified = toBool(v);
-    else if (key == "Agree" || key == "Disagree") {
-        int* dst = key == "Agree" ? m.agree : m.disagree;
-        auto p = split(v, ',');
-        for (size_t i = 0; i < p.size() && i < 4; ++i) dst[i] = std::atoi(p[i].c_str());
-    }
-}
-
 inline bool loadSettings(const std::string& path, Settings& s) {
     std::ifstream f(path);
     if (!f) return false;
     std::string line;
-    MemoryProfile* cur = nullptr;
     while (std::getline(f, line)) {
         size_t c = line.find_first_of(";#");
         if (c != std::string::npos) line = line.substr(0, c);
         line = detail::trim(line);
-        if (line.size() > 2 && line.front() == '[' && line.back() == ']') {   // "[Memory: name]" starts a profile
-            std::string h = detail::trim(line.substr(1, line.size() - 2));
-            if (h.compare(0, 7, "Memory:") == 0 || h.compare(0, 7, "Memory ") == 0) {
-                s.memProfiles.emplace_back();
-                s.memProfiles.back().name = detail::trim(h.substr(7));
-                cur = &s.memProfiles.back();
-            } else if (h.compare(0, 9, "Rejected:") == 0) {
-                s.rejectedProfiles.emplace_back();
-                s.rejectedProfiles.back().name = detail::trim(h.substr(9));
-                cur = &s.rejectedProfiles.back();
-            } else cur = nullptr;
-            continue;
-        }
+        if (!line.empty() && line.front() == '[') continue;   // section headers are ignored
         size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string k = detail::trim(line.substr(0, eq)), v = detail::trim(line.substr(eq + 1));
-        if (cur) applyProfileSetting(*cur, k, v); else applySetting(s, k, v);
+        applySetting(s, k, v);
     }
     return true;
-}
-
-inline bool saveProfiles(const std::string& path, const std::vector<MemoryProfile>& profiles, const std::vector<MemoryProfile>& rejected = {}) {
-    std::ofstream f(path);
-    if (!f) return false;
-    f << "; Written by RBR Surface Audio auto-discovery. Safe to delete; it is rebuilt automatically.\n";
-    auto list = [](const int* a) { std::ostringstream o; o << a[0] << "," << a[1] << "," << a[2] << "," << a[3]; return o.str(); };
-    for (const MemoryProfile& p : profiles) {
-        f << "\n[Memory: " << p.name << "]\nModule = " << p.module << "\nImageSize = 0x" << std::hex << p.imageSize
-          << "\nPeTimestamp = 0x" << p.peTimestamp << "\nBaseOffset = 0x" << p.baseOffset << std::dec << "\nChain = ";
-        for (size_t i = 0; i < p.chain.size(); ++i) f << (i ? "," : "") << p.chain[i];
-        f << "\nWidth = " << p.width << "\nWheelStride = " << p.wheelStride << "\nPerWheel = " << (p.perWheel ? 1 : 0)
-          << "\nVerified = " << (p.verified ? 1 : 0) << "\nAgree = " << list(p.agree) << "\nDisagree = " << list(p.disagree) << "\n";
-        if (!p.signature.empty()) f << "Signature = " << p.signature << "\nSigOffset = " << p.sigOffset << "\n";
-    }
-    for (const MemoryProfile& p : rejected) {
-        f << "\n[Rejected: " << p.name << "]\nModule = " << p.module << "\nImageSize = 0x" << std::hex << p.imageSize
-          << "\nPeTimestamp = 0x" << p.peTimestamp << "\nBaseOffset = 0x" << p.baseOffset << std::dec << "\nChain = ";
-        for (size_t i = 0; i < p.chain.size(); ++i) f << (i ? "," : "") << p.chain[i];
-        f << "\nWidth = " << p.width << "\nWheelStride = " << p.wheelStride << "\nPerWheel = " << (p.perWheel ? 1 : 0) << "\nVerified = 0\n";
-    }
-    return (bool)f;
 }
 
 // ------------------------------------------------------------------- telemetry

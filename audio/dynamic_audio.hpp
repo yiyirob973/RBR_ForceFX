@@ -227,9 +227,6 @@ private:
             applyCar(st);
             st.surfaceMode = 0;                  // surface comes from ForceFX's reader; telemetry inference is the fallback
             st.memCrossCheck = false;            // the reader is exact: a rough road the game calls tarmac (cobbles, a bridge) is still tarmac to it, so never throw the surface away because the suspension is busy
-            st.autoDiscover = false;             // ForceFX finds the tyres itself, so the audio code never scans memory
-            st.memProfiles.clear();
-            st.rejectedProfiles.clear();
 
             const std::string dataDir = dir_ + "ForceFXAudio\\";
             CreateDirectoryA(dataDir.c_str(), nullptr);
