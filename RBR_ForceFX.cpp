@@ -91,6 +91,7 @@
 #include "materials.hpp"      // ground material table, shared by the surface feel and the audio
 #include "audio_module.hpp"   // dynamic surface audio: only built in when FORCEFX_AUDIO is defined (off until the menu switch is turned on)
 #include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
+#include "tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slides (shared with the audio module)
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dinput8.lib")
@@ -181,7 +182,6 @@ struct Config {
     // brake
     float brakeHzScale = 1.0f;       // judder pitch multiplier 0.5..2
     float tyreCircumference = 1.95f; // metres, until the plugin has measured it while coasting
-    float lockThreshold = 0.12f;     // how far the front wheels must slow relative to the car before it counts as lock-up
 
     // engine
     float engineMinHz = 14.0f, engineMaxHz = 100.0f;
@@ -206,12 +206,17 @@ struct Config {
     float lumpScale = 1.0f;          // idle lump / beat strength
     float unevenness = 0.0f;         // uneven firing (boxer, five-cylinder, cross-plane V8)
     int   carProfiles = 1;           // use ForceFXCars.ini
+    // Which tyres the engine drives (Tyre::FWD / RWD / AWD). Only driven tyres can have wheelspin. RWD unless the car's profile in
+    // ForceFXCars.ini says otherwise. Car geometry for the per-tyre slip angles (a profile can set it per car).
+    int   drivetrain = Tyre::kDefaultDrivetrain;
+    float wheelbase = 2.5f, cgToFront = 1.25f, trackWidth = 1.5f;   // metres
 
     // NGP packet offsets (float32 unless noted)
     int   offCarIndex = 56;
     int   offSteps = 0;              // totalSteps_: NGP's own step counter, a clean clock for counting wheel turns (-1 = not used)
     int   offVelSurge = 88, offVelSway = 92;   // the car's velocity over the ground, m/s: what wheel speed is compared with
     int   offThrottle = 28, offBrake = 32, offSpeed = 60, offAccHeave = 120, offRpm = 136;
+    int   offHandbrake = 36, offSteering = 24, offYawRate = 108, offAccSurge = 112, offAccSway = 116;   // for the per-tyre motion (slip angle, lock-up, grip)
     int   offRpmMax = -1;            // float32 rev limit in the packet (-1 = this packet doesn't have one)
     int   offSuspBase = 152, suspStride = 128, offStrut = 16, offPiston = 28, offSegment = 60;   // segment = uint32
     int   speedIsKph = 0;
@@ -239,6 +244,8 @@ void ClampConfig(Config& c) {
     c.brakeMaxMag = std::max(0, std::min(c.brakeMaxMag, 10000));
     c.impactGain = clampf(c.impactGain, 0.0f, 3.0f);
     c.brakeHzScale = clampf(c.brakeHzScale, 0.5f, 2.0f);
+    c.drivetrain = std::max((int)Tyre::FWD, std::min(c.drivetrain, (int)Tyre::AWD));
+    c.wheelbase = clampf(c.wheelbase, 1.5f, 4.0f); c.trackWidth = clampf(c.trackWidth, 1.0f, 2.2f); c.cgToFront = clampf(c.cgToFront, 0.4f * c.wheelbase, 0.6f * c.wheelbase);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
     c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0;
 #ifdef FORCEFX_AUDIO
@@ -303,9 +310,10 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     F("WeightFeel", c.weightFeel); F("LumpScale", c.lumpScale); F("Unevenness", c.unevenness);
     I("CarProfiles", c.carProfiles); I("OffsetCarIndex", c.offCarIndex); I("OffsetSteps", c.offSteps); I("OffsetVelSurge", c.offVelSurge); I("OffsetVelSway", c.offVelSway);
     F("PistonScale", c.pistonScale); F("BumpScale", c.bumpScale); F("MaxSpeed", c.maxSpeed);
-    F("TyreCircumference", c.tyreCircumference); F("LockThreshold", c.lockThreshold);
+    F("TyreCircumference", c.tyreCircumference);
+    F("Wheelbase", c.wheelbase); F("CgToFront", c.cgToFront); F("TrackWidth", c.trackWidth);
     I("OffsetThrottle", c.offThrottle); I("OffsetBrake", c.offBrake); I("OffsetSpeed", c.offSpeed);
-    I("OffsetAccHeave", c.offAccHeave); I("OffsetRpm", c.offRpm); I("OffsetRpmMax", c.offRpmMax);
+    I("OffsetAccHeave", c.offAccHeave); I("OffsetHandbrake", c.offHandbrake); I("OffsetSteering", c.offSteering); I("OffsetYawRate", c.offYawRate); I("OffsetAccSurge", c.offAccSurge); I("OffsetAccSway", c.offAccSway); I("OffsetRpm", c.offRpm); I("OffsetRpmMax", c.offRpmMax);
     I("OffsetSuspBase", c.offSuspBase); I("SuspStride", c.suspStride); I("OffsetStrutForce", c.offStrut);
     I("OffsetPistonVel", c.offPiston); I("OffsetTyreSegment", c.offSegment);
     I("SpeedIsKph", c.speedIsKph); F("RpmScale", c.rpmScale);
@@ -335,6 +343,8 @@ struct CarProfile {
     float rpmMax = 0;                // 0 = keep global / learn
     float engineScale = 1.0f, roadScale = 1.0f;
     float lumpScale = -1, grit = -1, unevenness = -1, weightFeel = -1;   // negative = keep global
+    int   drivetrain = -1;           // Tyre::FWD / RWD / AWD; -1 = not given (rear-wheel drive)
+    float wheelbase = -1, cgToFront = -1, trackWidth = -1;   // metres; negative = keep global
 };
 
 struct Preset { const char* name; int cyl; float lump, grit, uneven, engine; };
@@ -458,6 +468,10 @@ struct CarDb {
                 else if (kv.first == "grit") p.grit = fv;
                 else if (kv.first == "unevenness") p.unevenness = fv;
                 else if (kv.first == "weightfeel") p.weightFeel = fv;
+                else if (kv.first == "drivetrain" || kv.first == "drivetrains" || kv.first == "drive" || kv.first == "drivetype") p.drivetrain = Tyre::ParseDrivetrain(kv.second, -1);
+                else if (kv.first == "wheelbase") p.wheelbase = fv;
+                else if (kv.first == "cgtofront") p.cgToFront = fv;
+                else if (kv.first == "trackwidth") p.trackWidth = fv;
             }
             p.found = true;
             list.push_back(p);
@@ -528,6 +542,11 @@ void ApplyProfile(const Config& base, const CarProfile& p, Config& e) {
     if (p.grit >= 0)        e.engineGrit = clampf(p.grit, 0.0f, 1.0f);
     if (p.unevenness >= 0)  e.unevenness = clampf(p.unevenness, 0.0f, 1.0f);
     if (p.weightFeel > 0)   e.weightFeel = clampf(p.weightFeel, 0.5f, 2.0f);
+    if (p.drivetrain >= 0)  e.drivetrain = p.drivetrain;            // otherwise whatever the global config says (rear-wheel drive)
+    if (p.wheelbase > 0)    e.wheelbase = p.wheelbase;
+    if (p.cgToFront > 0)    e.cgToFront = p.cgToFront;
+    if (p.trackWidth > 0)   e.trackWidth = p.trackWidth;
+    ClampConfig(e);
 }
 
 // ------------------------------------------------ landing boost on RBR's own force
@@ -1261,6 +1280,10 @@ inline bool readF(const uint8_t* b, int len, int off, float& out) {
     return true;
 }
 
+// The share of each side's ground and texture that comes from its front tyre (the rear tyre gets the rest). The front tyre is what the
+// steering feels, so it dominates: 90:10. Overridden by FrontWeight in [Surface].
+namespace Surf { float g_front = 0.90f; }
+
 struct Signals {
     float rpm = 0, speed = 0 /* m/s */, throttle = 0, brake = 0;
     float rpmMaxTelem = 0;   // rev limit straight from the telemetry (0 = not available)
@@ -1270,7 +1293,7 @@ struct Signals {
     float texL = 0, texR = 0;   // the same, per side (left / right tyres)
     float bump = 0;       // heave acceleration spike envelope
     float dive = 0;       // front load transfer under braking 0..1
-    float lock = 0;       // front wheel lock-up 0..1
+    float lock = 0;       // lock-up 0..1 (the synth works it out per tyre; only the test mode sets it here)
     float frontRev = 0;   // front wheel revolutions per second
     int   carIndex = -1;  // NGP Car.Index (-1 = unknown)
     // weight / suspension load, relative to this car's own static load (1 = at rest)
@@ -1278,7 +1301,14 @@ struct Signals {
     float airborne = 0;   // 0 = wheels loaded, 1 = off the ground
     int   surf[4] = {0, 0, 0, 0};   // ground class under each tyre, in the order FL, FR, RL, RR (Surf::Cls); 0 = unknown
     int   mat[4] = {-1, -1, -1, -1};   // game material id under each tyre, same order (-1 = unknown); the ground's properties come from its name
-    float slip[4] = {0, 0, 0, 0};   // how much each wheel slips, 0..1, same order: its spin against the car's ground speed, past the uncertainty of the count (lock-up and wheelspin both count)
+    // Per tyre, same order (FL, FR, RL, RR): the raw material for wheelspin and slides. The synth judges them against the grip of the ground under each tyre.
+    float ratio[4] = {0, 0, 0, 0};  // slip ratio past the uncertainty of the count: + the tyre turns faster than the ground along its own direction, - slower
+    bool  ratioOk[4] = {false, false, false, false};
+    float angle[4] = {0, 0, 0, 0};  // slip angle, rad (from body motion and steering)
+    bool  angleOk = false;
+    float handbrake = 0;
+    float wload[4] = {0, 0, 0, 0};  // share of the car's weight on each tyre (sums to 1)
+    float accMag = 0; bool accOk = false;   // the car's acceleration over the ground in m/s^2, if the units are known
     float ground = 0;               // the car's speed over the ground, m/s (0 = not known)
     float thumpL = 0, thumpR = 0;   // compression / landing envelope per side
     unsigned evtSeq = 0;  // goes up by one for every landing or hard hit; the synth starts one boost per event
@@ -1300,7 +1330,8 @@ struct Dsp {
     // Wheel turns, counted over a window with enough steps, against the ground speed (wheel_slip.hpp)
     Slip::Timebase tbase; Slip::RevCounter revc[4]; Slip::WheelSlip wslip[4]; Slip::GroundSpeed gspeed;
     unsigned timeGen = ~0u; double tArr = 0; bool slipInit = false;
-    float bumpEnv = 0, diveSm = 0, lockSm = 0;
+    Tyre::Kinematics kin;   // each tyre's own slip angle and ground speed
+    float bumpEnv = 0, diveSm = 0;
     Ema statRef[4], rLsm, rRsm, rFsm;
     float thumpL = 0, thumpR = 0;
     // landing / impact detector (works on raw, unsmoothed load so the spike doesn't get averaged away)
@@ -1325,12 +1356,13 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
     const float aVar = alphaFor(dt, 0.10f);        // RMS window
     const float aLoad = alphaFor(dt, 0.3f);
 
-    float rough[4] = {0, 0, 0, 0}, absSf[4] = {0, 0, 0, 0}, pRms[4] = {0, 0, 0, 0};
+    float rough[4] = {0, 0, 0, 0}, absSf[4] = {0, 0, 0, 0}, rawSf[4] = {0, 0, 0, 0}, pRms[4] = {0, 0, 0, 0};
     uint32_t segRaw[4] = {0, 0, 0, 0}; bool haveSeg[4] = {false, false, false, false};
     for (int i = 0; i < 4 && c.offSuspBase >= 0; ++i) {
         const int base = c.offSuspBase + i * c.suspStride;
         float sf = 0, pv = 0;
         if (readF(b, n, base + c.offStrut, sf)) {
+            rawSf[i] = sf;
             absSf[i] = std::fabs(sf);
             float ls = d.loadShort[i].step(absSf[i], aLoad);
             float hpSf = d.sfHp[i].step(sf, aHp);
@@ -1346,6 +1378,8 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
         if (so >= 0 && so + 4 <= n) { std::memcpy(&segRaw[i], b + so, 4); haveSeg[i] = true; }
     }
     const float meanLoad = 0.25f * (absSf[0] + absSf[1] + absSf[2] + absSf[3]);
+    {   const float totAbs = absSf[0] + absSf[1] + absSf[2] + absSf[3];
+        for (int i = 0; i < 4; ++i) s.wload[i] = totAbs > 1e-6f ? absSf[i] / totAbs : 0.25f; }
     if (s.speed > 3.0f && meanLoad > 0) d.loadRef.step(meanLoad, alphaFor(dt, 8.0f));
 
     // ---- weight / suspension load model. Everything is relative to this car's own static load (learned slowly and
@@ -1380,14 +1414,14 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 
     // ---- road texture: the front tyres dominate, because they are what you feel through the steering rack
     const float rF = std::max(rough[0], rough[1]), rR = std::max(rough[2], rough[3]);
-    s.rough = 0.75f * rF + 0.25f * rR;
+    s.rough = Surf::g_front * rF + (1.0f - Surf::g_front) * rR;
     const float roughLevel = std::pow(clamp01((s.rough - c.roughLow) / (c.roughHigh - c.roughLow)), c.roughGamma);
     s.piston = std::pow(clamp01(std::max(pRms[0], pRms[1]) * c.pistonScale), 1.2f);
     s.texture = clamp01(std::max(roughLevel, 0.8f * s.piston));
 
     // ---- the same thing per side (LF/LB on the left, RF/RB on the right); the fronts count most
     auto side = [&](int front, int back) {
-        const float r = 0.75f * rough[front] + 0.25f * rough[back];
+        const float r = Surf::g_front * rough[front] + (1.0f - Surf::g_front) * rough[back];
         const float lv = std::pow(clamp01((r - c.roughLow) / (c.roughHigh - c.roughLow)), c.roughGamma);
         const float pi = std::pow(clamp01(pRms[front] * c.pistonScale), 1.2f);
         return clamp01(std::max(lv, 0.8f * pi));
@@ -1489,24 +1523,36 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
         s.ground = (float)groundMs;
         const Slip::Timebase::Stamp st = d.tbase.stamp(steps, haveSteps, d.tArr);
         if (d.tbase.generation() != d.timeGen) { for (Slip::RevCounter& r : d.revc) r.reset(); d.timeGen = d.tbase.generation(); }
-        const bool coasting = s.throttle < 0.12f && s.brake < 0.03f;
+        float steer = 0, yaw = 0, aSway = 0, aSurge = 0, hb = 0;
+        readF(b, n, c.offSteering, steer); readF(b, n, c.offYawRate, yaw); readF(b, n, c.offAccSway, aSway);
+        readF(b, n, c.offAccSurge, aSurge);
+        s.handbrake = readF(b, n, c.offHandbrake, hb) ? clamp01(hb) : 0.0f;
+
+        // Each tyre's own motion over the ground: its slip angle, and the ground speed along the direction it points. A tyre
+        // sliding sideways only rolls at that speed, so its spin must be compared with it, not with the car's full speed.
+        Tyre::Params kp;
+        kp.wheelbase = c.wheelbase; kp.cgToFront = c.cgToFront; kp.trackWidth = c.trackWidth;
+        Tyre::Input ki;
+        ki.velSurge = haveVel ? vs : 0.0; ki.velSway = haveVel ? vw : 0.0; ki.yawRate = yaw; ki.accSway = aSway; ki.steering = steer;
+        for (int i = 0; i < 4; ++i) ki.strut[i] = rawSf[i];
+        d.kin.update(ki, dt, groundMs, kp, d.gspeed.fromVelocity());
+        const double accScale = d.kin.accelScale(kp);
+        s.accMag = (float)(std::sqrt((double)aSurge * aSurge + (double)aSway * aSway) * accScale);
+        s.accOk = d.kin.unitsConfirmed();
+        s.angleOk = d.kin.valid;
+
+        const bool coasting = s.throttle < 0.12f && s.brake < 0.03f && s.handbrake < 0.03f &&
+                              std::fabs(aSway * accScale) < kp.coastAccelLimit && std::fabs(aSurge * accScale) < kp.coastAccelLimit;
         float frontRev = 0; int frontN = 0;
         for (int i = 0; i < 4; ++i) {
-            if (!haveSeg[i]) { s.slip[i] = 0.0f; continue; }
+            s.ratio[i] = 0.0f; s.ratioOk[i] = false; s.angle[i] = (float)d.kin.slipAngle[i];
+            if (!haveSeg[i]) continue;
             d.revc[i].push(segRaw[i], st.tick, st.secPerTick);
-            d.wslip[i].update(d.revc[i], st.secPerTick, st.timeErr, groundMs, coasting, dt);
-            s.slip[i] = d.wslip[i].valid ? clamp01((float)std::fabs(d.wslip[i].ratio) / 0.4f) : 0.0f;
+            d.wslip[i].update(d.revc[i], st.secPerTick, st.timeErr, d.kin.vLong[i], coasting, dt);
+            if (d.wslip[i].valid) { s.ratio[i] = (float)d.wslip[i].ratio; s.ratioOk[i] = true; }
             if (i < 2) { const Slip::RevCounter::Est e = d.revc[i].estimate(32.0, 0.5, st.secPerTick); if (e.valid) { frontRev += (float)e.revPerSec; ++frontN; } }
         }
         s.frontRev = frontN ? frontRev / frontN : 0.0f;
-        // Front wheel lock-up under braking: both front wheels slower than the car.
-        float lockT = 0;
-        if (groundMs > 4.0 && s.brake > 0.2f && d.wslip[0].valid && d.wslip[1].valid) {
-            const float slipF = 0.5f * (float)(d.wslip[0].ratio + d.wslip[1].ratio);
-            lockT = clamp01((-slipF - c.lockThreshold) / 0.5f);
-        }
-        d.lockSm += (lockT - d.lockSm) * alphaFor(dt, lockT > d.lockSm ? 0.05f : 0.15f);
-        s.lock = d.lockSm;
     }
 }
 
@@ -1530,7 +1576,6 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 #include "road_feel.hpp"   // how the ground and what the car is doing shape the road vibration
 namespace Surf {
 float g_fade = 0.25f;                // seconds to cross-fade between two surfaces
-float g_front = 0.65f;               // share of a side's ground that comes from its front tyre (the rear tyre gets the rest)
 int   g_cobbleDetect = 1;            // 1 = hard ground that shakes in a regular pattern gets the cobble feel (detected from the telemetry)
 float g_cobbleLo = 0.5f;             // rough-per-speed level (x100) where that blend starts ...
 float g_cobbleHi = 1.0f;             // ... and where it is complete
@@ -1543,6 +1588,9 @@ struct Synth {
     float sm[S_COUNT] = {};
     Surf::CobbleDetector cob;                              // telemetry check for hard ground made of regular ridges
     Road::Ground gnd[4];                                   // the ground under each tyre (FL, FR, RL, RR), moved gradually towards what was read
+    Tyre::GripLearner grip;                                // how hard the car can accelerate on each kind of ground (reset with the car)
+    float spinSm[4] = {}, slideSm[4] = {}, lockSm[4] = {};   // wheelspin, sliding and lock-up of each tyre (FL, FR, RL, RR), 0..1, smoothed
+    float lockAmt = 0;                                     // lock-up for the brake effect, 0..1
     float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
     float jAge = 5.0f, evAmp = 0.0f;                       // age and severity of the current landing event
     unsigned seenEvt = 0;
@@ -1594,6 +1642,36 @@ struct Synth {
         // roughness, so a hit on one side is felt as a snap in one direction.
         const float spN = clamp01(s.speed / c.maxSpeed);
         const float gSpd = smooth01(1.0f, 10.0f, s.speed);
+
+        // ---------------- TYRE MOTION: wheelspin and slides, each tyre judged against the grip limit of the ground under it.
+        //   Wheelspin: a driven tyre turning faster than the ground, throttle open. A rear-wheel-drive car only has it at the rear.
+        //   Slide: a tyre moving the wrong way, sideways or locked up under braking or the handbrake. Any tyre can slide.
+        // How much of the grip the car is using (learned per ground from how hard it has accelerated on it) confirms a slide.
+        {
+            double share[Tyre::GripLearner::kClasses] = {0, 0, 0, 0, 0, 0, 0, 0};
+            for (int w = 0; w < 4; ++w) { const int cl = s.surf[w]; if (cl > 0 && cl < Tyre::GripLearner::kClasses) share[cl] += s.wload[w]; }
+            double sum = 0; for (double v : share) sum += v;
+            if (sum > 1e-6) for (double& v : share) v /= sum;
+            grip.update(s.accMag, share, s.accOk && s.airborne < 0.5f && s.speed > 5.0f && sum > 1e-6, dt);
+            const double gate = Tyre::GripGate(grip.use());
+            for (int w = 0; w < 4; ++w) {
+                Tyre::TyreIn in;
+                in.driven = Tyre::Driven(c.drivetrain, w);
+                in.ratioValid = s.ratioOk[w]; in.ratio = s.ratio[w];
+                in.angleValid = s.angleOk && s.speed > 1.0f && std::fabs(s.angle[w]) < 0.7f; in.angle = s.angle[w];
+                in.throttle = s.throttle; in.brake = s.brake; in.handbrake = s.handbrake; in.gate = gate;
+                Tyre::PeaksFromGround(gnd[w].loose, gnd[w].slick, in.peakRatio, in.peakAngleDeg);   // the grip limit of the ground under this tyre
+                const Tyre::TyreOut o = Tyre::Classify(in);
+                const float aSp = alphaFor(dt, 0.05f);
+                const float tSpin = (float)Tyre::SpinAmount(o.spin), tSlide = (float)Tyre::SlideAmount(o.slide), tLock = (float)Tyre::SlideAmount(o.lock, 1.0);
+                spinSm[w]  += (tSpin  - spinSm[w])  * aSp;
+                slideSm[w] += (tSlide - slideSm[w]) * aSp;
+                lockSm[w]  += (tLock  - lockSm[w])  * alphaFor(dt, tLock > lockSm[w] ? 0.05f : 0.15f);
+            }
+            // what the steering feels: the front tyres first, the rear ones a little less (they are felt through the car)
+            lockAmt = clamp01(0.5f * (lockSm[0] + lockSm[1]) + 0.25f * (lockSm[2] + lockSm[3]));
+        }
+        const auto sideDyn = [](const float* a, int k2) { return std::max(a[k2], 0.6f * a[2 + k2]); };   // front tyre of the side is k2, rear tyre 2 + k2
         const float texMono = clamp01(s.texture + 0.9f * s.bump);
         const float wf = clampf(c.weightFeel, 0.5f, 2.0f);
         const float thump[2] = { s.thumpL, s.thumpR };
@@ -1611,7 +1689,8 @@ struct Synth {
             const float fw = Surf::g_front;
             for (int k2 = 0; k2 < 2; ++k2) {                                          // front tyre of this side is wheel k2, rear tyre is wheel 2 + k2
                 Road::Drive dr;
-                dr.activity = Road::Activity(spN, std::max(s.slip[k2], 0.6f * s.slip[2 + k2]));
+                dr.spin = sideDyn(spinSm, k2); dr.slide = sideDyn(slideSm, k2);
+                dr.activity = Road::Activity(spN, std::max(dr.spin, dr.slide));
                 dr.ridge = cobScore;
                 fes[k2] = Road::Derive(Road::Mix(gnd[2 + k2], gnd[k2], fw), dr);
             }
@@ -1658,8 +1737,10 @@ struct Synth {
 
         // ---------------- BRAKE: front-end judder, harsh on lock-up
         const float gB = smooth01(2.0f, 8.0f, s.speed);
-        const float Ab = clamp01(std::pow(s.brake, 1.2f) * (0.3f + 0.7f * s.dive) * 0.6f + s.lock);
-        hz[S_BRAKE] = s.lock > 0.1f ? clampf(38.0f + 25.0f * rnd(), 25.0f, 70.0f) : clampf(s.frontRev * 2.0f, 12.0f, 60.0f);
+        // Lock-up shakes the wheel according to the ground: soft ground swallows it, hard ground and cobbles pass it on.
+        const float lockU = std::max(s.lock, lockAmt) * (c.fxSurface ? clampf(0.5f * (fes[0].amp + fes[1].amp), 0.4f, 1.3f) : 1.0f);
+        const float Ab = clamp01(std::pow(s.brake, 1.2f) * (0.3f + 0.7f * s.dive) * 0.6f + lockU);
+        hz[S_BRAKE] = lockU > 0.1f ? clampf(38.0f + 25.0f * rnd(), 25.0f, 70.0f) : clampf(s.frontRev * 2.0f, 12.0f, 60.0f);
         hz[S_BRAKE] *= c.brakeHzScale;
         float t4 = c.brakeMaxMag * Ab * gB * clampf(0.65f + 0.35f * s.loadF, 0.5f, 1.3f);   // more load on the fronts means more judder
 
@@ -2375,7 +2456,10 @@ private:
             if (base.carProfiles)
                 if (const CarProfile* m = carDb.Match(id.name, id.rsfId, score)) prof = *m;
             ApplyProfile(base, prof, eff);
-            if (!sameCar) { dsp = Dsp(); synth.rpmPeak = 0; }           // a different car, so forget what the last one taught us
+#ifdef FORCEFX_AUDIO
+            m_audio.setDrivetrain(eff.drivetrain);
+#endif
+            if (!sameCar) { dsp = Dsp(); synth.rpmPeak = 0; synth.grip = Tyre::GripLearner(); }           // a different car, so forget what the last one taught us
             char lab[200];
             if (prof.found) snprintf(lab, sizeof(lab), "-> %s%s%s (match %.2f)", prof.name.empty() ? prof.section.c_str() : prof.name.c_str(),
                                      prof.preset.empty() ? "" : ", ", prof.preset.c_str(), score);
@@ -2384,8 +2468,8 @@ private:
               m_carName = id.name.empty() ? "(name unknown)" : id.name;
               m_carPreset = lab; }
             m_dCar = curSlot;
-            Logf("Car slot %d, RSFCarID %d, name \"%s\" %s  cyl=%d rpmMax=%.0f weightFeel=%.2f%s", curSlot, id.rsfId,
-                 id.name.c_str(), lab, eff.cylinders, eff.rpmMax, eff.weightFeel, sameCar ? "  (profiles reloaded)" : "");
+            Logf("Car slot %d, RSFCarID %d, name \"%s\" %s  cyl=%d rpmMax=%.0f weightFeel=%.2f drivetrain=%s%s", curSlot, id.rsfId,
+                 id.name.c_str(), lab, eff.cylinders, eff.rpmMax, eff.weightFeel, Tyre::DrivetrainName(eff.drivetrain), sameCar ? "  (profiles reloaded)" : "");
         };
 
         // One telemetry packet, from either source. ts is when it was sent (or arrived), so packets that pile up
@@ -2451,6 +2535,7 @@ private:
                 { std::lock_guard<std::mutex> lk(m_mtx); base = m_cfg; }
                 ApplyProfile(base, prof, eff);
 #ifdef FORCEFX_AUDIO
+                m_audio.setDrivetrain(eff.drivetrain);
                 m_audio.setActive(base.fxAudio != 0);
                 m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
 #endif
@@ -2491,7 +2576,7 @@ private:
 
             m_dRpm = sig.rpm; m_dSpeed = sig.speed; m_dThr = sig.throttle; m_dBrk = sig.brake;
             m_dTex = sig.texture; m_dRough = sig.rough; m_dBump = sig.bump;
-            m_dDive = sig.dive; m_dLock = sig.lock;
+            m_dDive = sig.dive; m_dLock = std::max(sig.lock, synth.lockAmt);
             m_dStat = sig.staticLoad; m_dLoadL = sig.loadL; m_dLoadR = sig.loadR; m_dAir = sig.airborne;
             {   // the ground class is only read while telemetry is flowing (a stage is running)
                 const bool telemLive = !m_test && std::chrono::duration<double>(now - lastRx).count() < 0.4;

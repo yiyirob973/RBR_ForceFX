@@ -62,7 +62,17 @@ For people who want to dig further, the `[Surface]` section of `ForceFX.ini` has
 
 ## How wheel slip is measured
 
-NGP's telemetry has no slip value. Each wheel only reports a segment counter that steps once per eighth of a turn, so ForceFX counts the turns over a window of at least four revolutions (about a quarter of a second at speed) and compares them with the car's real speed over the ground (the velocity vector, not the speedometer, which follows the driven wheels). Every reading carries the error of the count, and slip only counts beyond it, so a wheel that is simply rolling is never read as slipping. A shorter window finds lock-up and wheelspin quickly. NGP's step counter (`OffsetSteps`) is used as the clock when it behaves. Road feel, front-wheel lock-up and the audio's squeal and slide all use this. The tyre size is learned while coasting, so the first few seconds of a stage use a cautious guess. `tests/wheel_slip_test.cpp` and `audio/tests/slip_test.cpp` cover it.
+NGP's telemetry has no slip value. Each wheel only reports a segment counter that steps once per eighth of a turn, so ForceFX counts the turns over a window of at least four revolutions (about a quarter of a second at speed) and compares them with the car's real speed over the ground (the velocity vector, not the speedometer, which follows the driven wheels). Every reading carries the error of the count, and slip only counts beyond it, so a wheel that is simply rolling is never read as slipping. A shorter window finds lock-up and wheelspin quickly. NGP's step counter (`OffsetSteps`) is used as the clock when it behaves. Road feel, lock-up and the audio's squeal and slide all use this. Each tyre is compared with the ground speed along the direction it points (from the car's slip angles), not the car's full speed, so a tyre sliding sideways is not mistaken for a locked one. The tyre size is learned while coasting, so the first few seconds of a stage use a cautious guess. `tests/wheel_slip_test.cpp` and `audio/tests/slip_test.cpp` cover it.
+
+### Wheelspin and slides
+
+They are two different things and are treated that way, for the road feel and for the audio (`tyre_motion.hpp`, `tests/tyre_motion_test.cpp`):
+
+- **Wheelspin** (the squeal) is a *driven* tyre turning faster than the ground under it while the throttle is open. A rear-wheel-drive car only has it at the rear, a front-wheel-drive car at the front, an all-wheel-drive car at any tyre. Set the layout per car with `Drivetrain=RWD|FWD|AWD` in `ForceFXCars.ini`; a car with no entry is treated as RWD.
+- **A slide** (the scrubbing sound) is a tyre moving the wrong way: sideways (slip angle), or locked under braking or the handbrake. Any tyre can slide. A slow tyre with no brake or handbrake on is not a lock-up.
+- **Grip.** Both are measured against the grip limit of the ground under that tyre (hard ground peaks early, loose ground late, slippery ground gently), so the same slip is a squeal on tarmac and an ordinary slide on snow. ForceFX also learns how hard the car can really accelerate on each kind of ground and uses how much of that it is using to confirm a slide: a slip angle that is not backed by the car being near its limit counts for less. The telemetry has no per-tyre force, so the slip limits themselves are fixed per surface.
+- **Road feel** takes its ground and texture 90:10 from the front tyre of each side (`FrontWeight` in `[Surface]`), because the front tyre is what the steering feels. Wheelspin and slides reshape it: loose ground is dug into harder and throws more stones, hard ground chatters, ice stays quiet. Lock-up shakes the wheel according to the ground.
+
 
 ## Dynamic surface audio
 

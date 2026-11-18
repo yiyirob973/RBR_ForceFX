@@ -152,7 +152,7 @@ TEST(activity_comes_from_speed_and_slip_and_slip_counts_most) {
 TEST(ridges_need_hard_ground_that_is_not_mostly_loose) {
     Road::Drive d; d.ridge = 1.0f;
     CHECK(Road::Derive(gnd("Tarmac_Coarse_Clean_Dry"), d).ridgeMix > 0.95f);          // hard tarmac that shakes like cobbles: cobbles
-    CHECK(Road::Derive(gnd("Gravel_Coarse_Deep_Dry"), d).ridgeMix == 0.0f);           // gravel shakes a lot too, and is not cobbled
+    CHECK(Road::Derive(gnd("Gravel_Coarse_Deeper_Dry"), d).ridgeMix == 0.0f);           // gravel shakes a lot too, and is not cobbled
     CHECK(Road::Derive(gnd("Grass_Soft_Dry"), d).ridgeMix == 0.0f);
     CHECK(Road::Derive(gnd("SnowOnGravel_Deep"), d).ridgeMix == 0.0f);
     const float sprinkled = Road::Derive(gnd("Tarmac_Coarse_Sprinkled_Dry"), d).ridgeMix;
@@ -199,6 +199,21 @@ TEST(out_of_range_properties_and_inputs_are_clamped_not_propagated) {
     Road::Ground g; g.hard = 5.0f; g.loose = -3.0f; g.coarse = 9.0f; g.slick = 7.0f;
     Road::Drive d; d.activity = 50.0f; d.ridge = -4.0f;
     CHECK(finite(Road::Derive(g, d)));
+}
+
+TEST(wheelspin_and_slides_dig_into_loose_ground_and_stay_quiet_on_ice) {
+    Road::Drive calm, spin, slide; spin.spin = 1.0f; slide.slide = 1.0f;
+    const Road::Ground gravel = gnd("Gravel_Coarse_Deeper_Dry"), ice = gnd("SnowOnIce_Shallow");
+    const Surf::Feel g0 = Road::Derive(gravel, calm), g1 = Road::Derive(gravel, spin), g2 = Road::Derive(gravel, slide);
+    CHECK(g1.amp > g0.amp && g2.amp > g1.amp);                         // a slide digs in harder than wheelspin
+    CHECK(g2.spark > g0.spark && g2.floor > g0.floor && g2.hz > g0.hz);
+    const Surf::Feel i0 = Road::Derive(ice, calm), i2 = Road::Derive(ice, slide);
+    CHECK(i2.amp - i0.amp < g2.amp - g0.amp);                          // little to grab on ice
+}
+TEST(spin_and_slide_inputs_are_safe_for_bad_numbers) {
+    Road::Drive d; d.spin = NAN; d.slide = -5.0f;
+    const Surf::Feel f = Road::Derive(gnd("Gravel_Coarse_Deeper_Dry"), d);
+    CHECK(std::isfinite(f.amp) && std::isfinite(f.hz) && f.amp > 0.0f);
 }
 
 int main() {

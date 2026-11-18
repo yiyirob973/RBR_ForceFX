@@ -9,7 +9,8 @@
 
         RBR (under <RBR>\Audio)                      ForceFX name
         Surfaces\Normal\<surface>                    <surface>_loop
-        Surfaces\Skid\<surface>                      <surface>_squeal and <surface>_slide
+        Surfaces\Skid\<skid file>                    <surface>_squeal (the file Effects.ini names, e.g. skidtarmac)
+        Surfaces\Skid\<other file>                   <surface>_slide  (RBR's second skid sound: tarm, gravel, snow)
         Impact\Grus\*                                debris_stone_1, _2 ...
         Impact\Medium\*                              debris_impact_1, _2 ...
         Impact\Heavy\*                               debris_landing_1, _2 ...
@@ -20,6 +21,10 @@
     Surfaces are tarmac, gravel, snow and water, plus RBR's "generic" ground sound, which becomes grass.
     Where RBR has two versions of a surface sound (for example gravel.wav and normgravel.wav), the one that
     Audio\Cars\Effects.ini points at is used, so you get what the game itself plays.
+
+    Squeal (wheelspin under power) and slide (sideways or locked tyre) are separate sounds in ForceFX. RBR's Skid folder
+    holds two files for most surfaces, so each gets its own: the one Effects.ini names becomes the squeal, the other one
+    the slide. Water, and any surface with only one skid file, uses it for both. If they sound the wrong way round, use -SwapSkid.
 
     Run it through Copy-RbrSounds.bat, or directly:
         powershell -ExecutionPolicy Bypass -File Copy-RbrSounds.ps1 -RbrDir "C:\Games\RichardBurnsRally"
@@ -33,6 +38,9 @@
 .PARAMETER OnlyMissing
     Leave any sound that is already in the sounds folder alone (keeps sounds you replaced with your own).
 
+.PARAMETER SwapSkid
+    Give the squeal the sound the slide would get and the other way round, if you prefer them that way.
+
 .PARAMETER DryRun
     Show what would be copied without copying anything.
 #>
@@ -40,6 +48,7 @@ param(
     [Parameter(Mandatory = $true)][string]$RbrDir,
     [string]$SoundsDir = '',
     [switch]$OnlyMissing,
+    [switch]$SwapSkid,
     [switch]$DryRun
 )
 
@@ -55,8 +64,8 @@ $surfaceFiles = [ordered]@{
     'water'  = @{ Normal = @('normwater', 'water');   Skid = @('skidwater') }
     'grass'  = @{ Normal = @('generic');              Skid = @('generic') }
 }
-# Rolling sound gets one name, the skid sound gets two (RBR has a single skid sound per surface).
-$surfaceSuffixes = @{ Normal = @('loop'); Skid = @('squeal', 'slide') }
+# The rolling sound gets one name. The skid files get two different ones: the first file found is the squeal, the next
+# different file the slide (RBR's Skid folder has two for tarmac, gravel and snow). With only one file it serves as both.
 
 # Sets of variants: ForceFX name -> folder under Audio. Every .wav in it is copied as <name>_1, <name>_2 ...
 $variantSets = @(
@@ -151,7 +160,18 @@ try {
                 if (Test-Path -LiteralPath $p -PathType Leaf) { $found = $p; break }
             }
             if (-not $found) { Say "  none     $surface (no matching file in Surfaces\$kind)" 'Yellow'; continue }
-            foreach ($suffix in $surfaceSuffixes[$kind]) { Put $found ("{0}_{1}" -f $surface, $suffix) }
+            if ($kind -eq 'Normal') { Put $found ("{0}_loop" -f $surface); continue }
+            # Skid: the squeal and the slide are different sounds when RBR has two for this surface
+            $other = $null
+            foreach ($c in $candidates) {
+                $p = Join-Path $dir ($c + '.wav')
+                if ((Test-Path -LiteralPath $p -PathType Leaf) -and ($p -ne $found)) { $other = $p; break }
+            }
+            if (-not $other) { $other = $found }
+            $squealFile = $found; $slideFile = $other
+            if ($SwapSkid) { $squealFile = $other; $slideFile = $found }
+            Put $squealFile ("{0}_squeal" -f $surface)
+            Put $slideFile ("{0}_slide" -f $surface)
         }
     }
 

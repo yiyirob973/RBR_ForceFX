@@ -123,6 +123,13 @@ public:
         if (s_) s_->sink->setLiveLevels(debris, impacts, suspension);
     }
 
+    // Which tyres the engine drives for the current car (Tyre::FWD / RWD / AWD). Overrides Drivetrain in ForceFXAudio.ini. Safe from any thread.
+    void setDrivetrain(int d) {
+        drive_ = d;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (s_) s_->settings.drivetrain = d;
+    }
+
     State state() const { return state_.load(); }
 
     std::string status() {
@@ -159,6 +166,7 @@ private:
     std::unique_ptr<Session> s_;
     std::thread loader_;
     std::atomic<bool> wantOn_{false}, loading_{false};
+    std::atomic<int> drive_{-1};          // set by the plugin per car; -1 = use ForceFXAudio.ini
     std::atomic<float> liveDebris_{1.0f}, liveImpacts_{1.0f}, liveSusp_{1.0f};
     std::atomic<long long> lastFrameNs_{0};
     long long nextDebugNs_ = 0;
@@ -167,9 +175,11 @@ private:
     // DebugLog=1 in ForceFXAudio.ini: once a second, what the tyre sounds are being told, so a sound that sticks can be traced.
     void debugLine() {          // caller holds mu_
         const SurfaceAnalyzer& a = s_->controller->analyzer;
-        char b[400];
-        snprintf(b, sizeof(b), "audio: %.1f m/s air %d | slip FL %.2f FR %.2f RL %.2f RR %.2f | launch %.2f %.2f %.2f %.2f | loops %.2f peak %.2f shots %zu | %s",
-                 a.speedMs, a.airborne ? 1 : 0, a.wheels[0].slipNorm, a.wheels[1].slipNorm, a.wheels[2].slipNorm, a.wheels[3].slipNorm,
+        char b[560];
+        snprintf(b, sizeof(b), "audio: %.1f m/s air %d %s grip %.2f | spin FL %.2f FR %.2f RL %.2f RR %.2f | slide %.2f %.2f %.2f %.2f | launch %.2f %.2f %.2f %.2f | loops %.2f peak %.2f shots %zu | %s",
+                 a.speedMs, a.airborne ? 1 : 0, Tyre::DrivetrainName(s_->settings.drivetrain), a.gripUse,
+                 a.wheels[0].spinN, a.wheels[1].spinN, a.wheels[2].spinN, a.wheels[3].spinN,
+                 a.wheels[0].slideN, a.wheels[1].slideN, a.wheels[2].slideN, a.wheels[3].slideN,
                  a.wheels[0].launchSlip, a.wheels[1].launchSlip, a.wheels[2].launchSlip, a.wheels[3].launchSlip,
                  (double)s_->mixer->targetSum(), (double)s_->mixer->takePeak(), s_->mixer->activeShots(), s_->controller->surfaceSourceText().c_str());
         log(b);
@@ -209,6 +219,7 @@ private:
             const std::string ini = dir_ + "ForceFXAudio.ini";
             if (!loadSettings(ini, st)) log("Dynamic audio: no ForceFXAudio.ini found, using defaults");
             st.enabled = true;
+            if (drive_.load() >= 0) st.drivetrain = drive_.load();   // the car's own drivetrain wins over the ini
             st.surfaceMode = 0;                  // surface comes from ForceFX's reader; telemetry inference is the fallback
             st.memCrossCheck = false;            // the reader is exact: a rough road the game calls tarmac (cobbles, a bridge) is still tarmac to it, so never throw the surface away because the suspension is busy
             st.autoDiscover = false;             // ForceFX finds the tyres itself, so the audio code never scans memory

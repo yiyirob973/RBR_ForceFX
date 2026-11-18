@@ -30,13 +30,15 @@ struct Drive {
     double rate = 100, jitterMs = 0, ground = 25, circ = 1.95;
     bool withSteps = true;
     std::function<double(double, int)> slip = [](double, int) { return 0.0; };   // per wheel slip over time (0 FL, 1 FR, 2 RL, 3 RR)
-    float throttle = 0.3f;
+    float throttle = 0.3f, brake = 0.0f;
+    int drivetrain = Tyre::RWD;                                                  // the default
+    std::function<double(double)> sway = [](double) { return 0.0; };             // sideways speed over time, m/s
     double from = 8.0;                                                           // the gains are measured from here
 };
 
 // The wheels turn at ground speed x (1 + slip); the segment counter steps every eighth of a turn; packets arrive with jitter.
 static void drive(const Drive& d, double seconds, GainSink& sink) {
-    Settings st; st.memCrossCheck = false; st.accelToMs2 = 9.81;
+    Settings st; st.memCrossCheck = false; st.accelToMs2 = 9.81; st.drivetrain = d.drivetrain;
     SurfaceAudioController c(st, sink, 1);
     std::mt19937 rng(5); std::normal_distribution<double> jit(0.0, d.jitterMs / 1000.0);
     double rev[4] = {0.11, 0.42, 0.67, 0.93}, lastArr = -1; const int n = (int)(seconds * d.rate);
@@ -47,6 +49,8 @@ static void drive(const Drive& d, double seconds, GainSink& sink) {
         double arr = t + (d.jitterMs > 0 ? jit(rng) : 0.0); arr = std::max(arr, lastArr + 1e-6); lastArr = arr;
         f.time = arr; f.haveSteps = d.withSteps; f.steps = 5000 + (uint32_t)i;
         f.speed = (float)(d.ground * 3.6 * 1.609); f.velSurge = (float)d.ground;
+        f.velSway = (float)d.sway(t);
+        f.brake = t < 6.0 ? 0.0f : d.brake;
         f.throttle = t < 6.0 ? 0.0f : d.throttle;                         // coasting first, as on a real stage: that is when the tyre size is learned
         for (int w = 0; w < 4; ++w) {
             if (i > 0) rev[w] += d.ground * (1.0 + d.slip(t, w)) / d.circ / d.rate;
@@ -68,28 +72,73 @@ TEST(tyres_that_are_only_rolling_never_squeal_or_slide_at_any_speed_packet_rate_
                     CHECK(s.maxSqueal <= 0.005f && s.maxSlide <= 0.005f);
                 }
 }
-TEST(a_locked_wheel_slides_and_squeals_and_the_other_tyres_stay_quiet) {
-    Drive d; d.throttle = 0.0f;
+TEST(a_locked_wheel_under_braking_slides_without_squealing_and_the_other_tyres_stay_quiet) {
+    Drive d; d.throttle = 0.0f; d.brake = 0.8f;
     d.slip = [](double t, int w) { return (w == 0 && t >= 12.0) ? -1.0 : 0.0; };
     d.from = 13.0;
     GainSink s; drive(d, 18.0, s);
     CHECK(s.maxSlide > 0.05f && s.wheelOfMax == 0);
+    CHECK(s.maxSqueal <= 0.005f);                                                // lock-up is a slide, not wheelspin
     Drive q = d; q.slip = [](double, int) { return 0.0; };
     GainSink quiet; drive(q, 18.0, quiet);
     CHECK(quiet.maxSlide <= 0.005f && quiet.maxSqueal <= 0.005f);
 }
-TEST(wheelspin_makes_a_noise_and_a_gentle_roll_does_not) {
+TEST(a_tyre_that_turns_slow_with_no_brake_on_is_not_a_lock_up) {
+    Drive d; d.throttle = 0.0f; d.brake = 0.0f;
+    d.slip = [](double t, int w) { return (w == 0 && t >= 12.0) ? -1.0 : 0.0; };
+    d.from = 13.0;
+    GainSink s; drive(d, 18.0, s);
+    CHECK(s.maxSlide <= 0.005f && s.maxSqueal <= 0.005f);
+}
+TEST(wheelspin_on_the_driven_rear_tyres_squeals_and_does_not_slide) {
     Drive d; d.throttle = 0.9f;
     d.slip = [](double t, int w) { return (w >= 2 && t >= 12.0) ? 0.5 : 0.0; };
     d.from = 13.0;
     GainSink s; drive(d, 18.0, s);
-    CHECK(s.maxSlide + s.maxSqueal > 0.05f);
+    CHECK(s.maxSqueal > 0.05f && s.wheelOfMax >= 2);
+    CHECK(s.maxSlide <= 0.005f);
 }
+TEST(a_rear_wheel_drive_car_never_has_wheelspin_at_the_front) {
+    Drive d; d.throttle = 0.9f;
+    d.slip = [](double t, int w) { return (w < 2 && t >= 12.0) ? 0.5 : 0.0; };   // front tyres turn fast: not driven, so not wheelspin
+    d.from = 13.0;
+    GainSink s; drive(d, 18.0, s);
+    CHECK(s.maxSqueal <= 0.005f && s.maxSlide <= 0.005f);
+}
+TEST(front_wheel_drive_spins_the_front_and_all_wheel_drive_spins_every_tyre) {
+    for (int dt : {Tyre::FWD, Tyre::AWD}) {
+        Drive d; d.throttle = 0.9f; d.drivetrain = dt;
+        d.slip = [](double t, int w) { return (w < 2 && t >= 12.0) ? 0.5 : 0.0; };
+        d.from = 13.0;
+        GainSink s; drive(d, 18.0, s);
+        CHECK(s.maxSqueal > 0.05f && s.wheelOfMax < 2);
+    }
+    Drive r; r.throttle = 0.9f; r.drivetrain = Tyre::FWD;
+    r.slip = [](double t, int w) { return (w >= 2 && t >= 12.0) ? 0.5 : 0.0; };   // FWD: the rears are not driven
+    r.from = 13.0;
+    GainSink s; drive(r, 18.0, s);
+    CHECK(s.maxSqueal <= 0.005f);
+}
+TEST(sliding_sideways_makes_the_slide_sound_not_the_squeal_and_rolling_wheels_do_not_read_as_lock_up) {
+    Drive d; d.throttle = 0.0f;
+    d.sway = [](double t) { return t >= 12.0 ? 12.0 : 0.0; };                     // 25 m/s forward, 12 m/s sideways: the tyres still roll at 25
+    d.from = 13.0;
+    GainSink s; drive(d, 18.0, s);
+    CHECK(s.maxSlide > 0.05f);
+    CHECK(s.maxSqueal <= 0.005f);
+}
+
 TEST(slip_that_is_small_compared_with_the_grip_limit_stays_quiet) {
     Drive d; d.slip = [](double t, int) { return t >= 12.0 ? 0.04 : 0.0; };      // 4 percent: well inside a tyre's limit
     d.from = 13.0;
     GainSink s; drive(d, 18.0, s);
     CHECK(s.maxSqueal <= 0.005f && s.maxSlide <= 0.005f);
+}
+TEST(the_drivetrain_can_be_set_and_defaults_to_rear_wheel_drive) {
+    Settings st; CHECK(st.drivetrain == Tyre::RWD);
+    applySetting(st, "Drivetrain", "FWD"); CHECK(st.drivetrain == Tyre::FWD);
+    applySetting(st, "Drivetrain", "4wd"); CHECK(st.drivetrain == Tyre::AWD);
+    applySetting(st, "Drivetrain", "nonsense"); CHECK(st.drivetrain == Tyre::AWD);
 }
 TEST(the_squeal_and_slide_starts_can_be_set) {
     Settings st; CHECK(st.squealStart == 0.8 && st.slideStart == 1.3);

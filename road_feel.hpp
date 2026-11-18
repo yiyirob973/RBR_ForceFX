@@ -140,6 +140,8 @@ inline Ground GroundForTyre(int id, int cls) {
 struct Drive {
     float activity = 0.0f;   // 0..1: how hard the tyres are working the ground (speed and wheel slip)
     float ridge = 0.0f;      // 0..1: the telemetry says the tyres are hitting regular ridges (Surf::CobbleDetector)
+    float spin = 0.0f;       // 0..1: wheelspin on the driven tyres (a tyre faster than the ground under power)
+    float slide = 0.0f;      // 0..1: tyres sliding sideways or locked under braking (Tyre::Classify, measured against this ground's grip limit)
 };
 
 // Turns a ground and what the car is doing into the values the road effect uses (see Surf::Feel). Smooth in every input:
@@ -168,6 +170,16 @@ inline Surf::Feel Derive(const Ground& g, const Drive& d) {
     f.floor    = 0.17f * soft + 0.10f * loose + 0.15f * slick + 0.55f * r;                                    // ground that is never silent while the car moves
     f.ridge    = r > 0.0f ? clampf(g.spacing, 0.03f, 1.0f) : 0.0f;
     f.ridgeMix = r;
+
+    // Wheelspin and slides work the ground differently. Both dig into loose ground (strength, flung stones) and scrub hard ground
+    // (a higher chatter, never silent), but a tyre sliding on ice has little to grab, so it stays quiet.
+    const float sp = c01(d.spin), sl = c01(d.slide) * (1.0f - 0.7f * hs);
+    f.amp     *= 1.0f + (0.50f * sl + 0.30f * sp) * (0.5f + 0.5f * loose);
+    f.hz      *= 1.0f + 0.25f * sl + 0.10f * sp;
+    f.grainAdd += 0.15f * sl + 0.05f * sp;
+    f.spark   += (0.10f * sl + 0.06f * sp) * loose;
+    f.sparkMul += (0.6f * sl + 0.3f * sp) * loose;
+    f.floor   += 0.20f * sl + 0.10f * sp;
 
     f.atk = clampf(f.atk, 0.05f, 1.0f); f.rel = clampf(f.rel, 0.05f, 4.0f); f.hz = clampf(f.hz, 0.3f, 2.0f);
     f.dropout = clampf(f.dropout, 0.0f, 0.6f); f.spark = clampf(f.spark, 0.0f, 0.5f); f.floor = clampf(f.floor, 0.0f, 0.6f);

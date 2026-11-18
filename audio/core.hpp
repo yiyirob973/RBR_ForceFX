@@ -12,6 +12,7 @@
 #include <vector>
 #include "../materials.hpp"
 #include "../wheel_slip.hpp"   // wheel slip from the segment counter (shared with the road feel)
+#include "../tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slide (shared with the road feel)
 
 namespace rsa {
 
@@ -104,8 +105,10 @@ struct Settings {
     double loopBoost = 2.0;            // extra rolling-noise gain at full slip / very rough ground (0 = flat level)
     double loopLevel = 0.25, squealLevel = 0.5, slideLevel = 0.5;   // mix levels per tyre (each of 4 tyres has its own)
     // Where the squeal and the slide begin, in units of the tyre's grip limit (1 = the limit, from PeakSlipRatio / PeakSlipAngleDeg).
-    // A tyre only squeals once it is at or near its limit, and slides beyond it.
-    double squealStart = 0.8, slideStart = 1.3;
+    // Squeal is wheelspin: a driven tyre turning faster than the ground under power. A slide is a tyre moving the wrong way:
+    // sideways, or locked under braking. Any tyre can slide; only the driven ones can spin.
+    double squealStart = Tyre::kSpinStart, slideStart = Tyre::kSlideStart;
+    int drivetrain = Tyre::kDefaultDrivetrain;   // which tyres the engine drives (FWD, RWD, AWD); the plugin sets it per car from ForceFXCars.ini
     bool cabinEffect = true;           // sound as heard from inside the car: muffled, bassy, with cabin reflections
     double cabinLowpassHz = 2600, cabinBassDb = 6, cabinReverb = 0.2;
     bool speedIsKph = true;
@@ -174,6 +177,7 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "LoopRoughBoost") s.loopBoost = clampd(d(), 0.0, 10.0);
     else if (key == "SquealLevel") s.squealLevel = d();
     else if (key == "SlideLevel") s.slideLevel = d();
+    else if (key == "Drivetrain") s.drivetrain = Tyre::ParseDrivetrain(v, s.drivetrain);
     else if (key == "SquealStart") s.squealStart = clampd(d(), 0.1, 3.0);
     else if (key == "SlideStart") s.slideStart = clampd(d(), 0.2, 4.0);
     else if (key == "CabinEffect") s.cabinEffect = toBool(v);
@@ -462,8 +466,10 @@ public:
     int dominant() const { int b = 0; for (int i = 1; i < 4; ++i) if (probs[i] > probs[b]) b = i; return b; }
 
     // st: this packet on the clean time axis (see Slip::Timebase); timeGen changes when that axis restarts.
+    // tyreGroundMs: the ground speed along the direction this tyre points (Tyre::Kinematics::vLong): a tyre sliding sideways
+    // only rolls at that, not at the car's full speed.
     void update(const WheelSample& w, double speedMs, double drivenMs, double dt, bool coasting,
-                const Slip::Timebase::Stamp& st, unsigned timeGen) {
+                const Slip::Timebase::Stamp& st, unsigned timeGen, double tyreGroundMs) {
         speed_ = speedMs;   // true ground speed
         load = std::fabs(w.strutForce);
         double ls = loadShort_.update(load, dt);
@@ -485,7 +491,7 @@ public:
         // speed. Slip only counts past the uncertainty of that count, so a wheel that is just rolling never reads as slipping.
         if (timeGen != timeGen_) { rev_.reset(); timeGen_ = timeGen; }
         rev_.push(w.currentSegment, st.tick, st.secPerTick);
-        slip_.update(rev_, st.secPerTick, st.timeErr, speedMs, coasting, dt);
+        slip_.update(rev_, st.secPerTick, st.timeErr, tyreGroundMs, coasting, dt);
         const Slip::RevCounter::Est e = rev_.estimate(32.0, 0.5, st.secPerTick);
         revRate = e.valid ? e.revPerSec : 0.0;
         slipValid = slip_.valid;
@@ -497,27 +503,38 @@ public:
             const bool have = slip_.learned();
             rollLearned = have;
             wheelSpeedValid = have ? slip_.wheelValid : true;
-            wheelSpeedMs = have ? (slip_.wheelValid ? slip_.wheelMs : speedMs) : drivenMs;
-            double ls = (wheelSpeedMs - speedMs) / std::max(speedMs, 3.0);
+            wheelSpeedMs = have ? (slip_.wheelValid ? slip_.wheelMs : tyreGroundMs) : drivenMs;
+            double ls = (wheelSpeedMs - tyreGroundMs) / std::max(tyreGroundMs, 3.0);
             // A wheel speed from a count has an error too: only what lies beyond it is wheelspin or lock-up.
-            const double band = (have ? slip_.wheelErrMs / std::max(speedMs, 3.0) : 0.08) + (have ? 0.03 : 0.0);
+            const double band = (have ? slip_.wheelErrMs / std::max(tyreGroundMs, 3.0) : 0.08) + (have ? 0.03 : 0.0);
             ls = ls >= 0 ? std::max(0.0, ls - band) : (have ? std::min(0.0, ls + band) : 0.0);   // before the size is learned: wheelspin only
             launchValid = wheelSpeedValid && !slipValid;
             launchSlip = launchSmooth_.update(launchValid ? ls : 0.0, dt);
         }
     }
 
-    // Combines longitudinal and lateral slip, each normalised by the peak for this tyre's surface.
-    void updateCombinedSlip(double angle, bool angleValid, const Settings& s, double dt) {
+    // Wheelspin and slides, kept apart and each measured against the grip limit of this tyre's ground.
+    //  spinN: wheelspin (driven tyre faster than the ground, throttle open), in grip limits.
+    //  slideN: sideways slip and lock-up under braking, in grip limits.
+    //  spinAmt / slideAmt: the same as 0..1 sound amounts. slipNorm: the larger of the two, how hard the tyre is working the ground.
+    double spinN = 0, slideN = 0, spinAmt = 0, slideAmt = 0;
+    void updateMotion(double angle, bool angleValid, bool driven, double throttle, double brake, double handbrake, double gate,
+                      const Settings& s, double dt) {
         double pkx = 0, pka = 0;
         for (int c = 0; c < 4; ++c) { pkx += probs[c] * s.peakSlipRatio[c]; pka += probs[c] * s.peakSlipAngleDeg[c]; }
-        pkx = std::max(pkx, 0.02);
-        double tanPeak = std::tan(std::max(pka, 1.0) * kPi / 180.0);
-        angleValid = angleValid && speed_ > 1.0 && std::fabs(angle) < 0.7;   // slip angle is meaningless at a standstill   // > 40 deg is a unit/learning error, not a real slip angle
+        angleValid = angleValid && speed_ > 1.0 && std::fabs(angle) < 0.7;   // slip angle is meaningless at a standstill; > 40 deg is a unit/learning error
         slipAngle = angleValid ? angle : 0.0;
-        double nx = slipValid ? slip / pkx : (launchValid ? launchSlip / pkx : 0.0);
-        double na = angleValid ? std::tan(std::min(std::fabs(angle), 1.2)) / tanPeak : 0.0;
-        slipNorm = slipNorm_.update(std::sqrt(nx * nx + na * na), dt);
+        Tyre::TyreIn in;
+        in.driven = driven; in.throttle = throttle; in.brake = brake; in.handbrake = handbrake;
+        in.ratioValid = slipValid || launchValid; in.ratio = slipValid ? slip : (launchValid ? launchSlip : 0.0);
+        in.angleValid = angleValid; in.angle = angle;
+        in.peakRatio = pkx; in.peakAngleDeg = pka; in.gate = gate;
+        const Tyre::TyreOut o = Tyre::Classify(in);
+        spinN = spinSm_.update(o.spin, dt);
+        slideN = slideSm_.update(o.slide, dt);
+        spinAmt = Tyre::SpinAmount(spinN, s.squealStart);
+        slideAmt = Tyre::SlideAmount(slideN, s.slideStart);
+        slipNorm = std::max(spinN, slideN);
     }
 
     // Smooths the telemetry-based classification into `inferred`.
@@ -540,7 +557,7 @@ public:
 private:
     HighPass hpForce_{0.12}, hpPiston_{0.12};
     Ema loadShort_{2.0}, loadQuick_{0.4}, loadLong_{8.0}, forceVar_{0.35}, pistonVar_{0.35}, pistonRef_{4.0};
-    Ema slipNorm_{0.05}, launchSmooth_{0.05};
+    Ema spinSm_{0.05}, slideSm_{0.05}, launchSmooth_{0.05};
     Slip::RevCounter rev_; Slip::WheelSlip slip_; unsigned timeGen_ = ~0u;
     double transition_ = 0;
     static void smooth(double* cur, const double* target, double tau, double dt) {
@@ -550,87 +567,20 @@ private:
     }
 };
 
-// Per-tyre slip angles from body velocity, yaw rate and steering (rigid-body kinematics).
-// Learned automatically: yaw sign, sway-axis side, steering->wheel angle, velocity units.
-class CarDynamics {
+// Per-tyre slip angles and ground speeds from body velocity, yaw rate and steering: see Tyre::Kinematics (tyre_motion.hpp).
+class CarDynamics : public Tyre::Kinematics {
 public:
-    double slipAngle[4] = {0, 0, 0, 0};
-    bool valid = false;
-    double vx = 0, vy = 0, yaw = 0, latAccel = 0, latRatio = 0;
-    bool steerLearned() const { return steerGain_.hasValue(); }
-    double steerGain() const { return steerGain_.value(); }
-    double accelScale(const Settings& s) const { return s.accelToMs2 != 1.0 ? s.accelToMs2 : autoAccel_; }
-    double yawScale(const Settings& s) const { return s.yawRateScale != 1.0 ? s.yawRateScale : autoYaw_; }
-    bool unitsConfirmed() const { return latRatioAvg_.hasValue() && latRatioAvg_.value() > 0.5 && latRatioAvg_.value() < 2.0; }
-
     void update(const TelemetryFrame& f, double dt, double speedMs, const Settings& s, bool velocityIsGround = false) {
-        valid = false;
-        for (double& a : slipAngle) a = 0.0;
-        double raw = std::sqrt((double)f.velSurge * f.velSurge + (double)f.velSway * f.velSway);
-        double k;
-        if (velocityIsGround) k = s.velocityScale;     // the vector IS the ground speed: nothing to calibrate against
-        else {                                         // fallback: size the vector to the Speed field
-            if (speedMs > 5.0 && raw > 0.5) velScale_.update(clampd(speedMs / raw, 0.1, 10.0), dt);
-            k = velScale_.hasValue() ? velScale_.value() : 1.0;
-            if (k > 0.85 && k < 1.18) k = 1.0;
-        }
-        vx = f.velSurge * k; vy = f.velSway * k;
-        if (speedMs < 8.0 || std::fabs(vx) < 3.0) return;
-
-        // Unit auto-detection (only when the ini leaves AccelToMs2 / YawRateScale at 1): while cornering,
-        // raw a_y / (v * yaw) equals scaleYaw / scaleAccel, so it shows whether accel is in g (x9.81) and/or yaw in deg/s.
-        if (s.accelToMs2 == 1.0 && s.yawRateScale == 1.0 && std::fabs(f.accSway) > 0.15 && std::fabs(vx * f.yawRate) > 2.0) {
-            rawRatioLog_.update(std::log10(clampd(std::fabs(f.accSway) / std::fabs(vx * f.yawRate), 1e-5, 1e5)), dt);
-            if (++rawRatioN_ >= 120) {
-                static const double cand[4][3] = {{0.0, 1, 1}, {-0.9917, 9.81, 1}, {-1.7581, 1, 0.0174533}, {-2.7498, 9.81, 0.0174533}};
-                int best = -1; double bd = 0.35;
-                for (int i = 0; i < 4; ++i) { double d = std::fabs(rawRatioLog_.value() - cand[i][0]); if (d < bd) { bd = d; best = i; } }
-                if (best >= 0 && (cand[best][1] != autoAccel_ || cand[best][2] != autoYaw_)) {
-                    autoAccel_ = cand[best][1]; autoYaw_ = cand[best][2];
-                    latRatioAvg_ = Ema(3.0);       // re-check the sanity test with the corrected scales
-                }
-            }
-        }
-        double ay = f.accSway * accelScale(s), r = f.yawRate * yawScale(s);
-        yawSign_.update(ay * r, dt);
-        double rc = yawSign_.value() >= 0 ? r : -r;
-        yaw = rc; latAccel = ay;
-        latRatio = std::fabs(vx * rc) > 0.05 ? ay / (vx * rc) : 0.0;
-
-        // Outside wheels carry more load: tells which side +sway points to.
-        double dl = f.wheels[0].strutForce + f.wheels[2].strutForce - f.wheels[1].strutForce - f.wheels[3].strutForce;
-        sideSign_.update(ay * dl, dt);
-        double leftY = sideSign_.value() <= 0 ? 1.0 : -1.0;
-
-        // Self-check of the yaw/acceleration units: while cornering, lateral accel should be about speed x yaw rate
-        // (ratio ~1). If it is not (yaw in deg/s, wrong field, ...), the per-tyre angles would be nonsense (we saw
-        // 70-90 degrees), so fall back to the car's body slip angle, which needs only the two velocities.
-        if (std::fabs(vx * rc) > 0.5 && std::fabs(ay) > 0.3) latRatioAvg_.update(clampd(ay / (vx * rc), 0.0, 50.0), dt);
-        bool unitsOk = latRatioAvg_.hasValue() && latRatioAvg_.value() > 0.5 && latRatioAvg_.value() < 2.0;
-        if (!unitsOk) {
-            double beta = std::atan2(std::fabs(vy), std::fabs(vx));
-            for (double& sa : slipAngle) sa = beta;
-            valid = true;
-            return;
-        }
-
-        double L = std::max(s.wheelbase, 0.5), a = s.cgToFront, b = L - a, half = 0.5 * s.trackWidth;
-        if (std::fabs(f.steering) > 0.05 && std::fabs(ay) < s.coastAccelLimit && std::fabs(vx) > 8.0)
-            steerGain_.update(rc * L / (vx * f.steering), dt);
-        double delta = steerGain_.hasValue() ? f.steering * steerGain_.value() : rc * L / vx;
-        delta = clampd(delta, -0.8, 0.8);
-
-        static const int leftSign[4] = {1, -1, 1, -1};
-        for (int i = 0; i < 4; ++i) {
-            double x = i < 2 ? a : -b, y = leftY * leftSign[i] * half;
-            double vxw = vx - rc * y, vyw = vy + rc * x;
-            slipAngle[i] = std::atan2(vyw, std::fabs(vxw)) - (i < 2 ? delta : 0.0);
-        }
-        valid = true;
+        Tyre::Params p;
+        p.velocityScale = s.velocityScale; p.accelToMs2 = s.accelToMs2; p.yawRateScale = s.yawRateScale;
+        p.wheelbase = s.wheelbase; p.cgToFront = s.cgToFront; p.trackWidth = s.trackWidth; p.coastAccelLimit = s.coastAccelLimit;
+        Tyre::Input in;
+        in.velSurge = f.velSurge; in.velSway = f.velSway; in.yawRate = f.yawRate; in.accSway = f.accSway; in.steering = f.steering;
+        for (int i = 0; i < 4; ++i) in.strut[i] = f.wheels[i].strutForce;
+        Tyre::Kinematics::update(in, dt, speedMs, p, velocityIsGround);
     }
-private:
-    Ema yawSign_{2.0}, sideSign_{2.0}, steerGain_{3.0}, velScale_{2.0}, latRatioAvg_{3.0}, rawRatioLog_{4.0};
-    double autoAccel_ = 1.0, autoYaw_ = 1.0; int rawRatioN_ = 0;
+    double accelScale(const Settings& s) const { Tyre::Params p; p.accelToMs2 = s.accelToMs2; return Tyre::Kinematics::accelScale(p); }
+    double yawScale(const Settings& s) const { Tyre::Params p; p.yawRateScale = s.yawRateScale; return Tyre::Kinematics::yawScale(p); }
 };
 
 class SurfaceAnalyzer {
@@ -638,6 +588,8 @@ public:
     explicit SurfaceAnalyzer(const Settings& s) : s_(s) {}
     WheelAnalyzer wheels[4];
     CarDynamics dynamics;
+    Tyre::GripLearner grip;       // how hard the car can accelerate on each kind of ground
+    double gripUse = -1.0;        // share of that grip in use now (-1 = not learned yet)
     // Optional game-memory input, set by the controller before update(): per tyre class (0..3) and wetness.
     bool memValid[4] = {false, false, false, false};
     int memClass[4] = {0, 0, 0, 0}, memWet[4] = {0, 0, 0, 0};
@@ -672,17 +624,32 @@ public:
         if (groundFromVelocity && coasting && speedMs > 8.0) fieldScale_.update(clampd(fieldMs / speedMs, 1.0, 2.5), dt);
         drivenMs = groundFromVelocity ? fieldMs / (fieldScale_.hasValue() ? fieldScale_.value() : s_.speedFieldScale) : fieldMs;
         const Slip::Timebase::Stamp stamp = timebase_.stamp(f.steps, f.haveSteps, f.time);
+        dynamics.update(f, dt, speedMs, s_, groundFromVelocity);   // first: each tyre's own ground speed is what its spin is compared with
         double total = 0, raw[4];
         for (int i = 0; i < 4; ++i) {
-            wheels[i].update(f.wheels[i], speedMs, drivenMs, dt, coasting, stamp, timebase_.generation());
+            wheels[i].update(f.wheels[i], speedMs, drivenMs, dt, coasting, stamp, timebase_.generation(), dynamics.vLong[i]);
             total += std::fabs(f.wheels[i].strutForce);   // NGP reports compression as negative force
             classify(wheels[i].roughness, std::fabs(wheels[i].slip) * slipGate((double)f.throttle, (double)f.brake, speedMs), wheels[i].slipValid, s_, raw);
             wheels[i].applyProbabilities(raw, dt, speedMs < 12.0);   // settle fast while pulling away from a standstill
             wheels[i].finalizeProbabilities(memValid[i], memClass[i], dt);
             wheels[i].wetness = memValid[i] ? memWet[i] : 0;
         }
-        dynamics.update(f, dt, speedMs, s_, groundFromVelocity);
-        for (int i = 0; i < 4; ++i) wheels[i].updateCombinedSlip(dynamics.slipAngle[i], dynamics.valid, s_, dt);
+        {   // grip: how much of what this ground allows the car is using. Learned only while the wheels are down and acceleration is in m/s^2.
+            double share[Tyre::GripLearner::kClasses] = {0, 0, 0, 0, 0, 0, 0, 0}, ld = 0;
+            for (int i = 0; i < 4; ++i) ld += std::fabs(f.wheels[i].strutForce);
+            if (ld > 1e-6) for (int i = 0; i < 4; ++i) {
+                const double wgt = std::fabs(f.wheels[i].strutForce) / ld;
+                for (int c = 0; c < 4; ++c) share[c] += wgt * wheels[i].probs[c];
+            }
+            const double sc = dynamics.accelScale(s_);
+            const double aMag = std::sqrt((double)f.accSurge * f.accSurge + (double)f.accSway * f.accSway) * sc;
+            grip.update(aMag, share, !airborne && speedMs > 5.0 && dynamics.unitsConfirmed(), dt);
+            gripUse = grip.use();
+        }
+        const double gate = Tyre::GripGate(gripUse);
+        for (int i = 0; i < 4; ++i)
+            wheels[i].updateMotion(dynamics.slipAngle[i], dynamics.valid, Tyre::Driven(s_.drivetrain, i), (double)f.throttle,
+                                   (double)f.brake, (double)f.handbrake, gate, s_, dt);
 
         lastTotal_ = total;
         bool light = totalLoad_.hasValue() && speedMs > 3.0 && total < 0.12 * totalLoad_.value();
@@ -906,8 +873,7 @@ private:
             spray[w] = std::max(a.speedMs, wa.contactSpeedMs()) * 3.6;                   // km/h
             double ground = a.memValid[w] && a.memLoose[w] >= 0.0 ? a.memLoose[w]
                                                                    : 0.8 * clampd(1.0 - wa.inferred[Tarmac], 0.0, 1.0);
-            double slip = wa.slipValid ? std::min(std::fabs(wa.slip) * 4.0, 1.0)
-                          : (wa.launchValid ? std::min(wa.launchSlip * 4.0, 1.0) : 0.0);
+            double slip = std::min(wa.slipNorm, 1.0);                                  // wheelspin or sliding: the tyre is throwing material
             weight[w] = ground * (0.4 + 0.6 * std::max(slip, (double)f.throttle)) * clampd(spray[w] / 90.0, 0.0, 1.5);
             total += weight[w];
         }
@@ -987,16 +953,19 @@ private:
         sink.setRumble(l, r);
     }
 
-    // Squeal (tonal, near the grip limit) and slide (broadband, beyond it), per tyre.
+    // Squeal is wheelspin: a driven tyre turning faster than the ground under power (a rear-wheel-drive car only has it at the
+    // rear, front-wheel drive at the front). The slide is a tyre moving the wrong way: sideways, or locked under braking.
+    // Both are measured against the grip limit of the ground under that tyre.
     void tyres(SurfaceAnalyzer& a, const Settings& s, IAudioSink& sink, const SetView& sv) {
         for (int w = 0; w < 4; ++w) {
             auto& wa = a.wheels[w];
-            double n = wa.slipNorm, load = std::sqrt(std::max(0.35, wa.loadFraction()));
+            double load = std::sqrt(std::max(0.35, wa.loadFraction()));
             bool on = a.speedMs > 1.0 || wa.launchSlip > 0.05;   // standing wheelspin counts
             double air = a.airborne ? 0.0 : 1.0;   // in the air: no tyre noise
             double squeal = 0, slide = 0;
-            if (on && s.enableSqueal) squeal = smoothstep((n - s.squealStart) / 0.45) * (1.0 - 0.6 * smoothstep((n - (s.slideStart + 0.4)) / 0.6)) * load * air;
-            if (on && s.enableSlide) slide = smoothstep((n - s.slideStart) / 0.8) * load * air;
+            if (on && s.enableSqueal) squeal = wa.spinAmt * load * air;
+            if (on && s.enableSlide) slide = wa.slideAmt * load * air;
+            const double n = std::max(wa.spinN, wa.slideN);
             float sqRate = (float)(0.85 + 0.5 * clampd((n - 0.7) / 1.0, 0.0, 1.0));
             float slRate = (float)(0.9 + 0.4 * clampd(std::max(a.speedMs, wa.contactSpeedMs()) / 40.0, 0.0, 1.0));   // sliding speed: ground or spinning surface, whichever is faster
             const std::vector<double>& weights = sv.w[w];

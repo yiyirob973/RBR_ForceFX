@@ -33,6 +33,7 @@ public:
     void telemetryLost() {}
     void newStage() {}
     void setLevels(float, float, float) {}
+    void setDrivetrain(int) {}
     std::string status() { return std::string(); }
 };
 

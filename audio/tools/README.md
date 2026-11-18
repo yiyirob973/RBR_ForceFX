@@ -9,7 +9,8 @@ ForceFX plays its sounds from WAV files in `Plugins\ForceFXAudio\sounds`, found 
 | From RBR's `Audio` folder | Copied as |
 |---|---|
 | `Surfaces\Normal` (tarmac, gravel, snow, water) | `<surface>_loop` |
-| `Surfaces\Skid` (tarmac, gravel, snow, water) | `<surface>_squeal` and `<surface>_slide` |
+| `Surfaces\Skid`: the file `Effects.ini` names (`skidtarmac`, `skidgravel`, `skidsnow`, `skidwater`) | `<surface>_squeal` (wheelspin) |
+| `Surfaces\Skid`: RBR's second skid file (`tarm`, `gravel`, `snow`) | `<surface>_slide` (sideways or locked tyre) |
 | `Surfaces\Normal` and `Skid` `generic` | `grass_loop`, `grass_squeal`, `grass_slide` |
 | `Impact\Grus` | `debris_stone_1`, `_2`, ... (flying stones) |
 | `Impact\Medium` | `debris_impact_1`, `_2`, ... (bumps) |
@@ -19,8 +20,8 @@ ForceFX plays its sounds from WAV files in `Plugins\ForceFXAudio\sounds`, found 
 | `Cars\Effects\Suspen` | `susp_bottom_1`, `_2`, ... (bottoming out) |
 
 Where RBR has two versions of a surface sound (such as `gravel.wav` and `normgravel.wav`), the script uses the one that
-`Audio\Cars\Effects.ini` points at, so you get what the game itself plays. RBR has one skid sound per surface, so it
-serves as both the squeal and the slide. The stone, impact and landing sounds are picked by folder name, so if one
+`Audio\Cars\Effects.ini` points at, so you get what the game itself plays. Squeal and slide are separate sounds in ForceFX. RBR has two skid files for tarmac, gravel and snow, so each gets one
+(add `-SwapSkid` if you prefer them the other way round). Water has one, and grass uses `generic`, so those serve as both. The stone, impact and landing sounds are picked by folder name, so if one
 sounds wrong, replace the matching `debris_*` files with your own.
 
 ## Run it
@@ -35,6 +36,7 @@ sounds wrong, replace the matching `debris_*` files with your own.
 
 Options go after the folder in a command prompt:
 
+- `-SwapSkid` gives the squeal and slide each other's sound.
 - `-OnlyMissing` leaves sounds that are already in the sounds folder alone. Without it, sounds with the same name are
   overwritten, so use this if you have replaced some with your own.
 - `-DryRun` shows what would be copied without copying anything.
