@@ -123,11 +123,12 @@ public:
         if (s_) s_->sink->setLiveLevels(debris, impacts, suspension);
     }
 
-    // Which tyres the engine drives for the current car (Tyre::FWD / RWD / AWD). Overrides Drivetrain in ForceFXAudio.ini. Safe from any thread.
-    void setDrivetrain(int d) {
-        drive_ = d;
+    // The current car: which tyres the engine drives (Tyre::FWD / RWD / AWD) and its geometry in metres, for the per-tyre slip
+    // angles. Set by the plugin from ForceFX.ini and ForceFXCars.ini. Safe from any thread.
+    void setCar(int drivetrain, double wheelbase, double cgToFront, double trackWidth) {
+        drive_ = drivetrain; wheelbase_ = wheelbase; cgToFront_ = cgToFront; trackWidth_ = trackWidth;
         std::lock_guard<std::mutex> lk(mu_);
-        if (s_) s_->settings.drivetrain = d;
+        if (s_) applyCar(s_->settings);
     }
 
     State state() const { return state_.load(); }
@@ -166,7 +167,11 @@ private:
     std::unique_ptr<Session> s_;
     std::thread loader_;
     std::atomic<bool> wantOn_{false}, loading_{false};
-    std::atomic<int> drive_{-1};          // set by the plugin per car; -1 = use ForceFXAudio.ini
+    std::atomic<int> drive_{Tyre::kDefaultDrivetrain};   // set by the plugin per car
+    std::atomic<double> wheelbase_{2.5}, cgToFront_{1.25}, trackWidth_{1.5};
+    void applyCar(Settings& st) const {
+        st.drivetrain = drive_.load(); st.wheelbase = wheelbase_.load(); st.cgToFront = cgToFront_.load(); st.trackWidth = trackWidth_.load();
+    }
     std::atomic<float> liveDebris_{1.0f}, liveImpacts_{1.0f}, liveSusp_{1.0f};
     std::atomic<long long> lastFrameNs_{0};
     long long nextDebugNs_ = 0;
@@ -219,7 +224,7 @@ private:
             const std::string ini = dir_ + "ForceFXAudio.ini";
             if (!loadSettings(ini, st)) log("Dynamic audio: no ForceFXAudio.ini found, using defaults");
             st.enabled = true;
-            if (drive_.load() >= 0) st.drivetrain = drive_.load();   // the car's own drivetrain wins over the ini
+            applyCar(st);
             st.surfaceMode = 0;                  // surface comes from ForceFX's reader; telemetry inference is the fallback
             st.memCrossCheck = false;            // the reader is exact: a rough road the game calls tarmac (cobbles, a bridge) is still tarmac to it, so never throw the surface away because the suspension is busy
             st.autoDiscover = false;             // ForceFX finds the tyres itself, so the audio code never scans memory

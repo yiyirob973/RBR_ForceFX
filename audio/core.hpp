@@ -108,7 +108,7 @@ struct Settings {
     // Squeal is wheelspin: a driven tyre turning faster than the ground under power. A slide is a tyre moving the wrong way:
     // sideways, or locked under braking. Any tyre can slide; only the driven ones can spin.
     double squealStart = Tyre::kSpinStart, slideStart = Tyre::kSlideStart;
-    int drivetrain = Tyre::kDefaultDrivetrain;   // which tyres the engine drives (FWD, RWD, AWD); the plugin sets it per car from ForceFXCars.ini
+    int drivetrain = Tyre::kDefaultDrivetrain;   // which tyres the engine drives (FWD, RWD, AWD); the plugin sets it per car (ForceFXCars.ini), with the car geometry below
     bool cabinEffect = true;           // sound as heard from inside the car: muffled, bassy, with cabin reflections
     double cabinLowpassHz = 2600, cabinBassDb = 6, cabinReverb = 0.2;
     bool speedIsKph = true;
@@ -119,7 +119,7 @@ struct Settings {
     double velocityScale = 1.0;        // VelSurge/VelSway to m/s
     double speedFieldScale = 1.609;    // Speed field / true ground speed while rolling (learned while coasting, this is the starting value)
 
-    double looseThreshold = 0.05, roughThreshold = 0.20, slipThreshold = 0.15, softness = 0.35;
+    double looseThreshold = 0.15, roughThreshold = 0.45, slipThreshold = 0.15, softness = 0.35;
     int hint = HintAuto;
     double coastAccelLimit = 1.5;      // m/s^2
     double accelToMs2 = 1.0;           // 9.81 if accelerations are in g
@@ -177,7 +177,6 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "LoopRoughBoost") s.loopBoost = clampd(d(), 0.0, 10.0);
     else if (key == "SquealLevel") s.squealLevel = d();
     else if (key == "SlideLevel") s.slideLevel = d();
-    else if (key == "Drivetrain") s.drivetrain = Tyre::ParseDrivetrain(v, s.drivetrain);
     else if (key == "SquealStart") s.squealStart = clampd(d(), 0.1, 3.0);
     else if (key == "SlideStart") s.slideStart = clampd(d(), 0.2, 4.0);
     else if (key == "CabinEffect") s.cabinEffect = toBool(v);
@@ -196,9 +195,6 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "CoastAccelLimit") s.coastAccelLimit = d();
     else if (key == "AccelToMs2") s.accelToMs2 = d();
     else if (key == "YawRateScale") s.yawRateScale = d();
-    else if (key == "Wheelbase") s.wheelbase = d();
-    else if (key == "CgToFront") s.cgToFront = d();
-    else if (key == "TrackWidth") s.trackWidth = d();
     else if (key == "PeakSlipRatio") dl(s.peakSlipRatio);
     else if (key == "PeakSlipAngleDeg") dl(s.peakSlipAngleDeg);
     else if (key == "SurfaceNames") { auto p = split(v, ','); for (size_t i = 0; i < p.size() && i < 4; ++i) s.surfaceNames[i] = p[i]; }
@@ -290,29 +286,6 @@ inline bool loadSettings(const std::string& path, Settings& s) {
     return true;
 }
 
-// Returns the ini text with its StageHint line set to `hint` (comment kept, line endings kept); the line is appended if absent.
-inline std::string withStageHint(const std::string& text, int hint) {
-    hint = hint < 0 ? 0 : hint > 3 ? 3 : hint;
-    std::string out; bool done = false; size_t pos = 0;
-    while (pos <= text.size()) {
-        size_t nl = text.find('\n', pos), end = nl == std::string::npos ? text.size() : nl;
-        std::string ln = text.substr(pos, end - pos);
-        bool cr = !ln.empty() && ln.back() == '\r'; if (cr) ln.pop_back();
-        size_t i = ln.find_first_not_of(" \t");
-        if (!done && i != std::string::npos && ln.compare(i, 9, "StageHint") == 0 &&
-            (i + 9 >= ln.size() || ln[i + 9] == ' ' || ln[i + 9] == '=' || ln[i + 9] == '\t')) {
-            size_t semi = ln.find(';');
-            ln = "StageHint = " + std::to_string(hint) + (semi == std::string::npos ? "" : "             " + ln.substr(semi));
-            done = true;
-        }
-        out += ln; if (cr) out += '\r';
-        if (nl == std::string::npos) break;
-        out += '\n'; pos = nl + 1;
-    }
-    if (!done) { if (!out.empty() && out.back() != '\n') out += "\r\n"; out += "StageHint = " + std::to_string(hint) + "\r\n"; }
-    return out;
-}
-
 inline bool saveProfiles(const std::string& path, const std::vector<MemoryProfile>& profiles, const std::vector<MemoryProfile>& rejected = {}) {
     std::ofstream f(path);
     if (!f) return false;
@@ -356,8 +329,6 @@ struct TelemetryFrame {
 
 // Decoder for the NGP UDP packet (rbr.telemetry.data.TelemetryData.h, packed, little-endian, 664 bytes by default).
 // Offsets come from PacketLayout so a changed NGP layout can be handled from the ini.
-constexpr int kPacketMinLength = 664;
-
 inline bool parsePacket(const uint8_t* d, size_t length, double time, TelemetryFrame& f,
                         const PacketLayout& L = PacketLayout()) {
     if (!d || length < (size_t)L.neededLength()) return false;
@@ -607,7 +578,6 @@ public:
     }
     double velDead_ = 0; Ema fieldScale_{4.0};
     int falseAirborneResets = 0;   // times the 1.5 s airborne safety net fired (shown in the debug log)
-    double loadRatio() const { return totalLoad_.hasValue() && totalLoad_.value() > 1e-9 ? lastTotal_ / totalLoad_.value() : -1.0; }   // total strut load / learned normal; airborne below 0.12
 
     void update(const TelemetryFrame& f, double dt) {
         fieldMs = f.speed * (s_.speedIsKph ? (1.0 / 3.6) : 0.44704);
@@ -1014,9 +984,6 @@ public:
         target_.assign(n, 0.0);
     }
     MaterialTable& materials() { return table_; }
-    const MemoryHealth& memoryHealth() const { return health_; }
-    bool telemetryOk() const { return telemetry_.ok(); }
-    Label discoveryLabel() const { return label_; }
     bool usingMemory() const { return mem_ && s_.surfaceMode == 0 && mem_->configured() && health_.usable(); }
 
     std::string surfaceSourceText() const {

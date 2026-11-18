@@ -8,7 +8,8 @@
 // how rough the tyres measure. So the same gravel feels calm when you roll over it gently and violent when you slide on it.
 //
 // Include after surface_feel.hpp (Surf::Feel, Surf::Cls) and materials.hpp (rsa::kMaterials). In RBR_ForceFX.cpp it is
-// included inside the anonymous namespace, right after surface_feel.hpp.
+// included inside the anonymous namespace, right after surface_feel.hpp. How the result reaches the wheel (three sine bands) is in
+// road_bands.hpp.
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -193,5 +194,6 @@ inline Surf::Feel Derive(const Ground& g, const Drive& d) {
 inline float Activity(float speedN, float slip) {
     return detail::c01(0.45f * detail::c01(speedN) + 1.0f * detail::c01(slip));
 }
+
 
 }  // namespace Road

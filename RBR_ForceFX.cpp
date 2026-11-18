@@ -16,12 +16,14 @@
 //            rev limiter makes it stutter.
 //   Lump     A second, lower sine at half the firing order. It gives you the lumpy idle and, at high revs, a
 //            slightly detuned tone that beats against the main one so the engine doesn't feel like a pure sine.
-//   Road     Two sawtooth effects with opposite sharp edges and a bit of random pitch and strength jitter. They
-//            follow how rough the front tyres feel (high-passed strut force relative to the average load, the same
-//            idea RbrSurfaceAudio uses) plus damper velocity. Smooth tarmac is silent and rough ground or kerbs
-//            turn violent and sharp. What the road feels like comes from the ground under each tyre (how hard,
-//            loose, coarse and slippery it is, from the game's material names) together with speed and wheel slip,
-//            not from a list of surfaces; see road_feel.hpp. The road gain is the one setting for it.
+//   Road     Three sine effects, each carrying one band (low, mid, high) of the road's spectrum, with a bit of
+//            random pitch and strength jitter. Their pitch follows the car's speed, and the tyre's contact patch
+//            takes the high bands away at low speed (road_bands.hpp). How strong the road is follows how rough the
+//            tyres feel (high-passed strut force relative to the average load, the same idea RbrSurfaceAudio uses)
+//            plus damper velocity. Smooth tarmac is silent and rough ground or kerbs turn violent and sharp. What
+//            the road feels like comes from the ground under each tyre (how hard, loose, coarse and slippery it
+//            is, from the game's material names) together with speed and wheel slip, not from a list of surfaces;
+//            see road_feel.hpp. The road gain is the one setting for it.
 //   Brake    A sine that grows with the brake pedal and with weight shifting onto the front tyres. Front wheel
 //            lock-up (tyre segment counter vs car speed) makes it much harsher.
 //   Landing  No effect of its own. When a landing or hard hit is detected, a hook on RBR's constant-force updates
@@ -194,7 +196,6 @@ struct Config {
     float roughLow = 0.03f, roughHigh = 0.35f, roughGamma = 1.0f;   // tyre roughness -> 0..1 level (tarmac sits below roughLow)
     float pistonScale = 1.0f;        // damper piston velocity -> 0..1 (hard hits, kerbs)
     float bumpScale = 0.25f;         // heave acceleration spikes -> 0..1
-    int   roadSideInvert = 0;        // 1 = swap which direction each side's impacts pull
     float maxSpeed = 40.0f;          // m/s that counts as full speed
 
     // weight and suspension load (relative to the car's own static load, so units never matter)
@@ -304,7 +305,6 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
     F("RoughLow", c.roughLow); F("RoughHigh", c.roughHigh); F("RoughGamma", c.roughGamma);
-    I("RoadSideInvert", c.roadSideInvert);
     F("EngineGrit", c.engineGrit);
     F("LoadInfluence", c.loadInfluence); F("ThumpGain", c.thumpGain); F("AirborneFade", c.airborneFade);
     F("WeightFeel", c.weightFeel); F("LumpScale", c.lumpScale); F("Unevenness", c.unevenness);
@@ -1152,8 +1152,8 @@ BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
     return DIENUM_CONTINUE;
 }
 
-enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD, S_ROADR, S_BRAKE, S_COUNT };   // S_ROAD is a sawtooth-up (sharp edge to the left), S_ROADR a sawtooth-down (sharp edge to the right)
-const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-A", "road-B", "brake"};
+enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD1, S_ROAD2, S_ROAD3, S_BRAKE, S_COUNT };   // the three road slots are sine effects, one per band of the road spectrum, low to high (road_bands.hpp)
+const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-low", "road-mid", "road-high", "brake"};
 
 class FFLayer {
 public:
@@ -1172,7 +1172,7 @@ public:
         if (axisId == 0xFFFFFFFF) return E_NOTIMPL;      // this device has no force feedback motor
         m_axisId = axisId;
 
-        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_SawtoothUp, &GUID_SawtoothDown, &GUID_Sine };
+        const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_Sine, &GUID_Sine, &GUID_Sine, &GUID_Sine };
         HRESULT firstErr = DI_OK;
         int ok = 0;
         for (int i = 0; i < S_COUNT; ++i) {
@@ -1218,6 +1218,7 @@ public:
         return true;
     }
     HRESULT LastHr() const { return m_lastHr; }
+    bool Has(int slot) const { return slot >= 0 && slot < S_COUNT && m_fx[slot] != nullptr; }
 private:
     IDirectInputDevice8A* m_dev = nullptr;
     IDirectInputEffect* m_fx[S_COUNT] = {};
@@ -1574,6 +1575,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 // same Surf namespace.
 #include "surface_feel.hpp"
 #include "road_feel.hpp"   // how the ground and what the car is doing shape the road vibration
+#include "road_bands.hpp"  // the road vibration as three sine effects: pitch from speed, strength spread by the ground
 namespace Surf {
 float g_fade = 0.25f;                // seconds to cross-fade between two surfaces
 int   g_cobbleDetect = 1;            // 1 = hard ground that shakes in a regular pattern gets the cobble feel (detected from the telemetry)
@@ -1581,7 +1583,7 @@ float g_cobbleLo = 0.5f;             // rough-per-speed level (x100) where that 
 float g_cobbleHi = 1.0f;             // ... and where it is complete
 }  // namespace Surf
 
-// How far the two road effects follow their own side (0 = both sides identical, 1 = left and right hits fully separate).
+// How far each side's road strength follows its own tyres (0 = both sides identical, 1 = left and right fully separate).
 constexpr float kRoadDirectional = 0.7f;
 
 struct Synth {
@@ -1595,7 +1597,8 @@ struct Synth {
     float jAge = 5.0f, evAmp = 0.0f;                       // age and severity of the current landing event
     unsigned seenEvt = 0;
     float boostMul = 1.0f, boostAdd = 0.0f;                // landing boost for RBR's own force (the worker thread hands it to the hook)
-    float roadJit[2] = {1.0f, 1.0f}, ampJit[2] = {1.0f, 1.0f}, engJit = 1.0f, engHzJit = 1.0f, unevPhase = 0;
+    float bandHzJit[Road::kBands] = {1.0f, 1.0f, 1.0f}, bandAmpJit[2][Road::kBands] = {{1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}};   // random pitch per band, random strength per side and band
+    float engJit = 1.0f, engHzJit = 1.0f, unevPhase = 0;
     double nextJit = 0;
 
     void Run(const Config& c, const Signals& s, double t, float dt, float userGain, int mag[S_COUNT], float hz[S_COUNT]) {
@@ -1637,9 +1640,10 @@ struct Synth {
                        + 0.55f * grit * (0.6f + 0.4f * thrSm);
         float t2 = s.rpm > 200 ? c.engineMaxMag * 0.8f * clamp01(A2 * c.lumpScale) * engAir : 0.0f;
 
-        // ---------------- ROAD: two sawtooth effects with opposite sharp edges (zero mean, so they never shift RBR's
-        // own force). S_ROAD snaps to the left and S_ROADR to the right, and each is fed by one side's tyre
-        // roughness, so a hit on one side is felt as a snap in one direction.
+        // ---------------- ROAD: three sine effects, each carrying one band (low, mid, high) of the road's spectrum. The pitch of
+        // each band follows the car's speed, the ground under each side decides how the strength is spread over the bands, and
+        // the tyre's contact patch takes the high bands away at low speed (road_bands.hpp). Sine effects are zero-mean, so they
+        // never shift RBR's own force, and the two sides add as energy, so they can not cancel each other.
         const float spN = clamp01(s.speed / c.maxSpeed);
         const float gSpd = smooth01(1.0f, 10.0f, s.speed);
 
@@ -1703,37 +1707,31 @@ struct Synth {
             loadGain[k2] = 1.0f + c.loadInfluence * (clampf(sideLoad[k2], 0.4f, 1.8f) - 1.0f);   // a more heavily loaded tyre transmits more
         }
         const float roadAir = 1.0f - c.airborneFade * s.airborne;                     // wheels off the ground: no road feel
-        if (t >= nextJit) {                                                           // every ~12 ms, pick a new random strength and pitch per side
+        Road::SideIn rside[2];                                                        // [0] = left, [1] = right
+        for (int k2 = 0; k2 < 2; ++k2) {
+            rside[k2].fe = fes[k2];
+            rside[k2].strength = c.roadMaxMag * 0.7f * texSide[k2] * gSpd * loadGain[k2] * roadAir * fes[k2].amp;
+        }
+        const Road::Targets plan = Road::Plan(rside, s.speed, c.roadMinHz, c.roadMaxHz);
+        if (t >= nextJit) {                                                           // every ~12 ms, pick a new random strength per side and band, and a new pitch per band
+            float grMix = 0.0f, txMax = 0.0f;
             for (int k2 = 0; k2 < 2; ++k2) {
-                const float tx = texSide[k2];
                 const Surf::Feel& fe = fes[k2];
                 const float gr = clamp01(Road::kBaseGrain + fe.grainAdd);
-                roadJit[k2] = 1.0f + (0.10f + 0.40f * gr * (tx > 0.3f ? 1.0f : 0.5f)) * rnd();
+                grMix += 0.5f * gr; txMax = std::max(txMax, texSide[k2]);
                 const float lo = std::max(0.02f, 1.0f - 0.65f * gr - fe.dropout);     // strength varies between lo and 1
-                ampJit[k2] = (lo + (1.0f - lo) * (rnd() * 0.5f + 0.5f)) * fe.base;
-                if (fe.spark > 0.0f && rnd() * 0.5f + 0.5f < fe.spark) ampJit[k2] = fe.sparkMul;   // a stone, a crack: one hard hit
+                const bool hit = fe.spark > 0.0f && rnd() * 0.5f + 0.5f < fe.spark;   // a stone, a crack: one hard hit, felt in every band
+                for (int b = 0; b < Road::kBands; ++b)
+                    bandAmpJit[k2][b] = hit ? fe.sparkMul : (lo + (1.0f - lo) * (rnd() * 0.5f + 0.5f)) * fe.base;
             }
+            for (int b = 0; b < Road::kBands; ++b) bandHzJit[b] = 1.0f + (0.10f + 0.40f * grMix * (txMax > 0.3f ? 1.0f : 0.5f)) * rnd();
             engJit = rnd(); engHzJit = rnd();
             nextJit = t + 0.012;
         }
-        float t3[2];
-        for (int k2 = 0; k2 < 2; ++k2) {
-            const Surf::Feel& fe = fes[k2];
-            const float spd = c.roadMinHz + (c.roadMaxHz - c.roadMinHz) * clamp01(0.35f * spN + 0.65f * texSide[k2]);
-            float hzR = spd * roadJit[k2] * (k2 ? 1.31f : 1.0f) / std::sqrt(wf);                  // the two sides are detuned; heavier cars sound lower
-            if (fe.hz != 1.0f) hzR = clampf(hzR * fe.hz, 20.0f, kHardMaxHz);
-            if (fe.ridgeMix > 0.0f && fe.ridge > 0.0f) {                                          // cobbles, planks: the pitch is the speed over the ridge spacing
-                const float hzRidge = Surf::RidgeHz(s.speed, fe.ridge * (k2 ? 1.07f : 1.0f), c.roadMinHz, c.roadMaxHz);   // the sides differ a little: they never hit the same ridge together
-                hzR += (hzRidge - hzR) * fe.ridgeMix;
-            }
-            hz[k2 == 0 ? S_ROAD : S_ROADR] = hzR;
-            t3[k2] = c.roadMaxMag * 0.7f * texSide[k2] * gSpd * ampJit[k2] * loadGain[k2] * roadAir * fe.amp;   // the two road effects share the road budget
-        }
-        // A has its sharp edge to the left, B to the right. By default a hit on the left tyre snaps left.
-        const int sA = c.roadSideInvert ? 1 : 0, sB = 1 - sA;
-        const float tRoadA = t3[sA], tRoadB = t3[sB];
-        { const float hzA = hz[sA == 0 ? S_ROAD : S_ROADR], hzB = hz[sB == 0 ? S_ROAD : S_ROADR];
-          hz[S_ROAD] = hzA; hz[S_ROADR] = hzB; }
+        float roadTarget[Road::kBands];
+        Road::Combine(rside, plan.share, bandAmpJit, roadTarget);
+        for (int b = 0; b < Road::kBands; ++b)
+            hz[S_ROAD1 + b] = clampf(plan.hz[b] * bandHzJit[b] / std::sqrt(wf), 20.0f, kHardMaxHz);   // heavier cars sound lower
 
         // ---------------- BRAKE: front-end judder, harsh on lock-up
         const float gB = smooth01(2.0f, 8.0f, s.speed);
@@ -1766,16 +1764,18 @@ struct Synth {
         follow(S_ENG1, t1, 0.35f, 0.15f);
         follow(S_ENG2, t2, 0.25f, 0.12f);
         const float roadDown = clampf(0.40f / wf, 0.15f, 0.70f);                     // heavier cars let the thump ring out longer
-        const Surf::Feel& feA = fes[sA]; const Surf::Feel& feB = fes[sB];            // each road effect follows its own side's ground
-        const float relA = clampf(roadDown * feA.rel, 0.05f, 0.95f), relB = clampf(roadDown * feB.rel, 0.05f, 0.95f);   // gravel and ice let go fast, snow slowly
-        follow(S_ROAD,  c.fxRoad ? tRoadA : 0.0f, feA.atk, relA);
-        follow(S_ROADR, c.fxRoad ? tRoadB : 0.0f, feB.atk, relB);
+        // The road follows the ground under the side that is feeling more of it (equal weight when both are silent).
+        const float sumSt = rside[0].strength + rside[1].strength, w0 = sumSt > 1e-6f ? rside[0].strength / sumSt : 0.5f;
+        const float roadAtk = w0 * fes[0].atk + (1.0f - w0) * fes[1].atk;
+        const float roadRel = clampf(roadDown * (w0 * fes[0].rel + (1.0f - w0) * fes[1].rel), 0.05f, 0.95f);   // gravel and ice let go fast, snow slowly
+        for (int b = 0; b < Road::kBands; ++b) follow(S_ROAD1 + b, c.fxRoad ? roadTarget[b] : 0.0f, roadAtk, roadRel);
         follow(S_BRAKE, c.fxBrake ? t4 : 0.0f, 0.50f, 0.20f);
         // Priority: road beats engine. A lower layer backs off while a higher one is active.
-        const float pR = c.roadMaxMag > 0 ? clamp01(std::max(std::fabs(sm[S_ROAD]), std::fabs(sm[S_ROADR])) / (float)c.roadMaxMag) : 0.0f;
+        const float roadRms = std::sqrt(sm[S_ROAD1] * sm[S_ROAD1] + sm[S_ROAD2] * sm[S_ROAD2] + sm[S_ROAD3] * sm[S_ROAD3]);
+        const float pR = c.roadMaxMag > 0 ? clamp01(roadRms / (float)c.roadMaxMag) : 0.0f;
         const float dk = clampf(c.priorityDuck, 0.0f, 1.0f);
         float duck[S_COUNT];
-        duck[S_ROAD] = duck[S_ROADR] = duck[S_BRAKE] = 1.0f;
+        duck[S_ROAD1] = duck[S_ROAD2] = duck[S_ROAD3] = duck[S_BRAKE] = 1.0f;
         duck[S_ENG1] = duck[S_ENG2] = 1.0f - dk * pR;
         float sumO = 0;
         for (int i = 0; i < S_COUNT; ++i) sumO += std::fabs(sm[i]) * duck[i];
@@ -2457,7 +2457,7 @@ private:
                 if (const CarProfile* m = carDb.Match(id.name, id.rsfId, score)) prof = *m;
             ApplyProfile(base, prof, eff);
 #ifdef FORCEFX_AUDIO
-            m_audio.setDrivetrain(eff.drivetrain);
+            m_audio.setCar(eff.drivetrain, eff.wheelbase, eff.cgToFront, eff.trackWidth);
 #endif
             if (!sameCar) { dsp = Dsp(); synth.rpmPeak = 0; synth.grip = Tyre::GripLearner(); }           // a different car, so forget what the last one taught us
             char lab[200];
@@ -2535,7 +2535,7 @@ private:
                 { std::lock_guard<std::mutex> lk(m_mtx); base = m_cfg; }
                 ApplyProfile(base, prof, eff);
 #ifdef FORCEFX_AUDIO
-                m_audio.setDrivetrain(eff.drivetrain);
+                m_audio.setCar(eff.drivetrain, eff.wheelbase, eff.cgToFront, eff.trackWidth);
                 m_audio.setActive(base.fxAudio != 0);
                 m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
 #endif
@@ -3008,9 +3008,9 @@ public:
         { std::string nm, pr; { std::lock_guard<std::mutex> lk(m_mtx); nm = m_carName; pr = m_carPreset; }
           snprintf(buf, sizeof(buf), "car slot %d: %s %s", m_dCar.load(), nm.empty() ? "waiting for telemetry" : nm.c_str(), pr.c_str());
           line(buf); }
-        snprintf(buf, sizeof(buf), "now: engine %.0f@%.0fHz  lump %.0f  road L %.0f R %.0f  brake %.0f@%.0fHz",
+        snprintf(buf, sizeof(buf), "now: engine %.0f@%.0fHz  lump %.0f  road low %.0f mid %.0f high %.0f  brake %.0f@%.0fHz",
                  m_mag[S_ENG1].load(), m_hz[S_ENG1].load(), m_mag[S_ENG2].load(),
-                 m_mag[S_ROAD].load(), m_mag[S_ROADR].load(), m_mag[S_BRAKE].load(), m_hz[S_BRAKE].load());
+                 m_mag[S_ROAD1].load(), m_mag[S_ROAD2].load(), m_mag[S_ROAD3].load(), m_mag[S_BRAKE].load(), m_hz[S_BRAKE].load());
         line(buf);
         snprintf(buf, sizeof(buf), "landing boost on RBR's force: x%.2f  +%.0f", m_dBoostMul.load(), m_dBoostAdd.load() * 10000.0f);
         line(buf);

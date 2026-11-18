@@ -174,6 +174,7 @@ TEST(rough_road_that_the_game_calls_tarmac_keeps_its_surface) {
     CHECK(c.usingMemory());                                                                                   // 25 s of heavy roughness later
     CHECK(c.analyzer.wheels[0].dominant() == Tarmac);
     Settings scanner; scanner.memCrossCheck = true;                                                           // the blind-scanner default does what it always did
+    scanner.looseThreshold = 0.05; scanner.roughThreshold = 0.20;                                               // a sensitive scanner: it would call this road rough
     FakeSink sink2; SurfaceAudioController c2(scanner, sink2, 1); c2.setSurfaceMemory(&m); t = 0;
     for (int i = 0; i < 60 * 25; ++i) { t += 1.0 / 60; c2.onFrame(gframe(t, 25.0, 25.0, -3500.f * (1.f + 0.8f * n(g)), 0.5f)); }
     CHECK(!c2.usingMemory() || c2.analyzer.wheels[0].dominant() != Tarmac);

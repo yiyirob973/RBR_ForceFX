@@ -78,8 +78,6 @@ public:
     double vLong[4] = {0, 0, 0, 0};       // m/s: ground speed along the direction each tyre points (the car's speed when it is not known)
     bool valid = false;                   // slipAngle is usable
     double vx = 0, vy = 0, yaw = 0, latAccel = 0, latRatio = 0;
-    bool steerLearned() const { return steerGain_.hasValue(); }
-    double steerGain() const { return steerGain_.value(); }
     double accelScale(const Params& s) const { return s.accelToMs2 != 1.0 ? s.accelToMs2 : autoAccel_; }
     double yawScale(const Params& s) const { return s.yawRateScale != 1.0 ? s.yawRateScale : autoYaw_; }
     // True once lateral acceleration and speed x yaw rate agree: acceleration is known in m/s^2 and the yaw rate unit is right.

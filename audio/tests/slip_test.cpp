@@ -134,11 +134,8 @@ TEST(slip_that_is_small_compared_with_the_grip_limit_stays_quiet) {
     GainSink s; drive(d, 18.0, s);
     CHECK(s.maxSqueal <= 0.005f && s.maxSlide <= 0.005f);
 }
-TEST(the_drivetrain_can_be_set_and_defaults_to_rear_wheel_drive) {
+TEST(the_drivetrain_defaults_to_rear_wheel_drive) {
     Settings st; CHECK(st.drivetrain == Tyre::RWD);
-    applySetting(st, "Drivetrain", "FWD"); CHECK(st.drivetrain == Tyre::FWD);
-    applySetting(st, "Drivetrain", "4wd"); CHECK(st.drivetrain == Tyre::AWD);
-    applySetting(st, "Drivetrain", "nonsense"); CHECK(st.drivetrain == Tyre::AWD);
 }
 TEST(the_squeal_and_slide_starts_can_be_set) {
     Settings st; CHECK(st.squealStart == 0.8 && st.slideStart == 1.3);
