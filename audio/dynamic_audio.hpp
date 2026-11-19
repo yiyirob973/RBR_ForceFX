@@ -47,7 +47,7 @@ public:
         std::function<void(const std::string&)> log;
     };
 
-    // pluginDir: the folder holding the DLL. Settings: ForceFXAudio.ini beside it. Sounds: ForceFXAudio\sounds.
+    // pluginDir: the folder holding the DLL. Settings: the [Audio] section of ForceFX.ini beside it. Sounds: ForceFXAudio\sounds.
     void configure(std::string pluginDir, Hooks hooks) {
         if (!pluginDir.empty() && pluginDir.back() != '\\' && pluginDir.back() != '/') pluginDir += '\\';
         dir_ = pluginDir;
@@ -116,11 +116,18 @@ public:
         if (s_) remakeController();
     }
 
-    // Live debris and impact multipliers from the menu (1 = as set in ForceFXAudio.ini). Safe from any thread.
+    // Live debris and impact multipliers from the menu (1 = as set in [Audio] of ForceFX.ini). Safe from any thread.
     void setLevels(float debris, float impacts, float suspension) {
         liveDebris_ = debris; liveImpacts_ = impacts; liveSusp_ = suspension;
         std::lock_guard<std::mutex> lk(mu_);
         if (s_) s_->sink->setLiveLevels(debris, impacts, suspension);
+    }
+
+    // Units of the telemetry speed field, from SpeedIsKph in [ForceFX]: one setting for the whole plugin.
+    void setSpeedUnits(bool kph) {
+        speedKph_ = kph;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (s_) applyCar(s_->settings);
     }
 
     // The current car: which tyres the engine drives (Tyre::FWD / RWD / AWD) and its geometry in metres, for the per-tyre slip
@@ -170,14 +177,16 @@ private:
     std::atomic<int> drive_{Tyre::kDefaultDrivetrain};   // set by the plugin per car
     std::atomic<double> wheelbase_{2.5}, cgToFront_{1.25}, trackWidth_{1.5};
     void applyCar(Settings& st) const {
+        st.speedIsKph = speedKph_.load();
         st.drivetrain = drive_.load(); st.wheelbase = wheelbase_.load(); st.cgToFront = cgToFront_.load(); st.trackWidth = trackWidth_.load();
     }
+    std::atomic<bool> speedKph_{true};
     std::atomic<float> liveDebris_{1.0f}, liveImpacts_{1.0f}, liveSusp_{1.0f};
     std::atomic<long long> lastFrameNs_{0};
     long long nextDebugNs_ = 0;
     static long long nowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-    // DebugLog=1 in ForceFXAudio.ini: once a second, what the tyre sounds are being told, so a sound that sticks can be traced.
+    // DebugLog=1 in the [Audio] section of ForceFX.ini: once a second, what the tyre sounds are being told, so a sound that sticks can be traced.
     void debugLine() {          // caller holds mu_
         const SurfaceAnalyzer& a = s_->controller->analyzer;
         char b[560];
@@ -221,8 +230,8 @@ private:
         try {
             std::unique_ptr<Session> s(new Session());
             Settings& st = s->settings;
-            const std::string ini = dir_ + "ForceFXAudio.ini";
-            if (!loadSettings(ini, st)) log("Dynamic audio: no ForceFXAudio.ini found, using defaults");
+            const std::string ini = dir_ + "ForceFX.ini";
+            if (!loadSettings(ini, st, "Audio")) log("Dynamic audio: no ForceFX.ini found, using defaults");
             st.enabled = true;
             applyCar(st);
             st.surfaceMode = 0;                  // surface comes from ForceFX's reader; telemetry inference is the fallback

@@ -212,15 +212,24 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     }
 }
 
-inline bool loadSettings(const std::string& path, Settings& s) {
+// Reads key = value lines. With a section name, only that [section] is read (ForceFX.ini holds several); with an empty
+// name every line is read and section headers are ignored.
+inline bool loadSettings(const std::string& path, Settings& s, const std::string& section = std::string()) {
     std::ifstream f(path);
     if (!f) return false;
+    auto lower = [](std::string v) { for (char& ch : v) ch = (char)std::tolower((unsigned char)ch); return v; };
+    const std::string want = lower(section);
+    bool inSection = want.empty();
     std::string line;
     while (std::getline(f, line)) {
         size_t c = line.find_first_of(";#");
         if (c != std::string::npos) line = line.substr(0, c);
         line = detail::trim(line);
-        if (!line.empty() && line.front() == '[') continue;   // section headers are ignored
+        if (!line.empty() && line.front() == '[') {
+            if (!want.empty()) { size_t r = line.find(']'); inSection = lower(detail::trim(line.substr(1, r == std::string::npos ? std::string::npos : r - 1))) == want; }
+            continue;
+        }
+        if (!inSection) continue;
         size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string k = detail::trim(line.substr(0, eq)), v = detail::trim(line.substr(eq + 1));

@@ -11,7 +11,7 @@
 //               frame (used when openRBRVR is loaded or the Direct3D hooks do not come up). Method 3 is experimental.
 //   Windscreen  Rain, snow and mud drawn on the glass from an EndScene hook; see the [Windscreen] section of the ini.
 //
-// HEAD MODEL (everything is tunable in ForceFXCamera.ini)
+// HEAD MODEL (everything is tunable in the [Camera...] sections of ForceFX.ini)
 //   * Torso and neck: each translation axis is a slow, well damped torso spring plus a faster, slightly bouncy neck spring,
 //     both driven by the car's acceleration. The head ends up opposite to the acceleration, lags behind it and overshoots a little.
 //   * Brake boost: stronger forward lean while the brake is pressed.
@@ -21,7 +21,7 @@
 //   * Gear-shift kick, crash and landing shakes, airborne lift.
 //   * Speed fade (no movement when parked), soft limits (tanh), fixed 240 Hz sub-stepping so the springs are stable at any frame rate.
 //   * Test mode: scripted inputs for checking every axis from the cockpit.
-//   * Hot keys (RBR window focused, Ctrl held): F9 reloads ForceFXCamera.ini, F10 camera on/off, F8 windscreen on/off, F7 syncs the
+//   * Hot keys (RBR window focused, Ctrl held): F9 reloads the camera settings from ForceFX.ini, F10 camera on/off, F8 windscreen on/off, F7 syncs the
 //     emulated wipers.
 //
 // This is written for the RallySimFans RichardBurnsRally_SSE.exe: it hooks fixed addresses in that executable, so it stays
@@ -132,53 +132,53 @@ float iniF(const std::string& path, const char* sec, const char* key, float def)
 struct Opt { const char* sec; const char* key; float* f; int* i; float lo, hi; };
 std::vector<Opt> optTable(Cfg& c) {
     return {
-        {"General", "Apply", nullptr, &c.apply, 0, 1},           {"General", "Log", nullptr, &c.log, 0, 1},
-        {"General", "AnyExe", nullptr, &c.anyExe, 0, 1}, {"General", "Method", nullptr, &c.method, 2, 4}, {"General", "AutoFallback", nullptr, &c.autoFallback, 0, 1}, {"General", "MaxApplyHz", nullptr, &c.maxApplyHz, 0, 240},
-        {"General", "Diag", nullptr, &c.diag, 0, 1}, {"General", "DiagDeep", nullptr, &c.diagDeep, 0, 1}, {"General", "DiagAfter", nullptr, &c.diagAfter, 1, 100000},
-        {"General", "Test", nullptr, &c.test, 0, 1},             {"General", "Intensity", &c.intensity, nullptr, 0, 2},
-        {"General", "ToggleKey", nullptr, &c.toggleKey, 0, 254}, {"General", "ReloadKey", nullptr, &c.reloadKey, 0, 254},
-        {"General", "NeedCtrl", nullptr, &c.needCtrl, 0, 1},
+        {"Camera", "Apply", nullptr, &c.apply, 0, 1},           {"Camera", "Log", nullptr, &c.log, 0, 1},
+        {"Camera", "AnyExe", nullptr, &c.anyExe, 0, 1}, {"Camera", "Method", nullptr, &c.method, 2, 4}, {"Camera", "AutoFallback", nullptr, &c.autoFallback, 0, 1}, {"Camera", "MaxApplyHz", nullptr, &c.maxApplyHz, 0, 240},
+        {"Camera", "Diag", nullptr, &c.diag, 0, 1}, {"Camera", "DiagDeep", nullptr, &c.diagDeep, 0, 1}, {"Camera", "DiagAfter", nullptr, &c.diagAfter, 1, 100000},
+        {"Camera", "Test", nullptr, &c.test, 0, 1},             {"Camera", "Intensity", &c.intensity, nullptr, 0, 2},
+        {"Camera", "ToggleKey", nullptr, &c.toggleKey, 0, 254}, {"Camera", "ReloadKey", nullptr, &c.reloadKey, 0, 254},
+        {"Camera", "NeedCtrl", nullptr, &c.needCtrl, 0, 1},
 
-        {"Input", "Smooth", &c.smooth, nullptr, 0, 0.95f},       {"Input", "AccelClamp", &c.accelClamp, nullptr, 0.5f, 5000}, {"Input", "DeadZone", &c.deadZone, nullptr, 0, 1},
-        {"Input", "MinSpeed", &c.minSpeed, nullptr, 0, 200},     {"Input", "FullSpeed", &c.fullSpeed, nullptr, 1, 400},
-        {"Input", "YawFloor", &c.yawFloor, nullptr, 0.001f, 1000}, {"Input", "SteerFloor", &c.steerFloor, nullptr, 0.001f, 1000},
-        {"Input", "InvertSurge", nullptr, &c.invSurge, -1, 1},   {"Input", "InvertSway", nullptr, &c.invSway, -1, 1},
-        {"Input", "InvertHeave", nullptr, &c.invHeave, -1, 1},   {"Input", "InvertYaw", nullptr, &c.invYaw, -1, 1},
-        {"Input", "InvertSteer", nullptr, &c.invSteer, -1, 1},
+        {"CameraInput", "Smooth", &c.smooth, nullptr, 0, 0.95f},       {"CameraInput", "AccelClamp", &c.accelClamp, nullptr, 0.5f, 5000}, {"CameraInput", "DeadZone", &c.deadZone, nullptr, 0, 1},
+        {"CameraInput", "MinSpeed", &c.minSpeed, nullptr, 0, 200},     {"CameraInput", "FullSpeed", &c.fullSpeed, nullptr, 1, 400},
+        {"CameraInput", "YawFloor", &c.yawFloor, nullptr, 0.001f, 1000}, {"CameraInput", "SteerFloor", &c.steerFloor, nullptr, 0.001f, 1000},
+        {"CameraInput", "InvertSurge", nullptr, &c.invSurge, -1, 1},   {"CameraInput", "InvertSway", nullptr, &c.invSway, -1, 1},
+        {"CameraInput", "InvertHeave", nullptr, &c.invHeave, -1, 1},   {"CameraInput", "InvertYaw", nullptr, &c.invYaw, -1, 1},
+        {"CameraInput", "InvertSteer", nullptr, &c.invSteer, -1, 1},
 
-        {"Translation", "Surge", &c.kSurge, nullptr, 0, 0.2f},   {"Translation", "Sway", &c.kSway, nullptr, 0, 0.2f},
-        {"Translation", "Heave", &c.kHeave, nullptr, 0, 0.2f},   {"Translation", "BrakeBoost", &c.brakeBoost, nullptr, 0.5f, 3},
-        {"Translation", "TorsoShare", &c.torsoShare, nullptr, 0, 1},
-        {"Translation", "TorsoFreq", &c.torsoFreq, nullptr, 0.3f, 8}, {"Translation", "TorsoDamp", &c.torsoDamp, nullptr, 0.2f, 2},
-        {"Translation", "NeckFreq", &c.neckFreq, nullptr, 0.5f, 12}, {"Translation", "NeckDamp", &c.neckDamp, nullptr, 0.1f, 2},
+        {"CameraTranslation", "Surge", &c.kSurge, nullptr, 0, 0.2f},   {"CameraTranslation", "Sway", &c.kSway, nullptr, 0, 0.2f},
+        {"CameraTranslation", "Heave", &c.kHeave, nullptr, 0, 0.2f},   {"CameraTranslation", "BrakeBoost", &c.brakeBoost, nullptr, 0.5f, 3},
+        {"CameraTranslation", "TorsoShare", &c.torsoShare, nullptr, 0, 1},
+        {"CameraTranslation", "TorsoFreq", &c.torsoFreq, nullptr, 0.3f, 8}, {"CameraTranslation", "TorsoDamp", &c.torsoDamp, nullptr, 0.2f, 2},
+        {"CameraTranslation", "NeckFreq", &c.neckFreq, nullptr, 0.5f, 12}, {"CameraTranslation", "NeckDamp", &c.neckDamp, nullptr, 0.1f, 2},
 
-        {"Bumps", "Gain", &c.bumpGain, nullptr, 0, 0.1f},        {"Bumps", "Freq", &c.bumpFreq, nullptr, 1, 20},
-        {"Bumps", "Damp", &c.bumpDamp, nullptr, 0.1f, 2},        {"Bumps", "HighPassTau", &c.bumpTau, nullptr, 0.05f, 2}, {"Bumps", "Threshold", &c.bumpThreshold, nullptr, 0, 3},
+        {"CameraBumps", "Gain", &c.bumpGain, nullptr, 0, 0.1f},        {"CameraBumps", "Freq", &c.bumpFreq, nullptr, 1, 20},
+        {"CameraBumps", "Damp", &c.bumpDamp, nullptr, 0.1f, 2},        {"CameraBumps", "HighPassTau", &c.bumpTau, nullptr, 0.05f, 2}, {"CameraBumps", "Threshold", &c.bumpThreshold, nullptr, 0, 3},
 
-        {"Rotation", "PitchPerG", &c.pitchPerG, nullptr, 0, 20}, {"Rotation", "PitchFreq", &c.pitchFreq, nullptr, 0.3f, 10},
-        {"Rotation", "PitchDamp", &c.pitchDamp, nullptr, 0.2f, 2}, {"Rotation", "LookYaw", &c.lookYaw, nullptr, 0, 30},
-        {"Rotation", "LookSteerMix", &c.lookSteerMix, nullptr, 0, 1}, {"Rotation", "LookFreq", &c.lookFreq, nullptr, 0.2f, 6},
-        {"Rotation", "LookDamp", &c.lookDamp, nullptr, 0.2f, 2},
-        {"Rotation", "RollPerG", &c.rollPerG, nullptr, 0, 10}, {"Rotation", "RollFreq", &c.rollFreq, nullptr, 0.3f, 10},
-        {"Rotation", "RollDamp", &c.rollDamp, nullptr, 0.2f, 2}, {"Rotation", "HorizonLock", &c.horizonLock, nullptr, 0, 1},
-        {"Rotation", "CarRollScale", &c.carRollScale, nullptr, 0, 100}, {"Rotation", "InvertCarRoll", nullptr, &c.invCarRoll, -1, 1},
+        {"CameraRotation", "PitchPerG", &c.pitchPerG, nullptr, 0, 20}, {"CameraRotation", "PitchFreq", &c.pitchFreq, nullptr, 0.3f, 10},
+        {"CameraRotation", "PitchDamp", &c.pitchDamp, nullptr, 0.2f, 2}, {"CameraRotation", "LookYaw", &c.lookYaw, nullptr, 0, 30},
+        {"CameraRotation", "LookSteerMix", &c.lookSteerMix, nullptr, 0, 1}, {"CameraRotation", "LookFreq", &c.lookFreq, nullptr, 0.2f, 6},
+        {"CameraRotation", "LookDamp", &c.lookDamp, nullptr, 0.2f, 2},
+        {"CameraRotation", "RollPerG", &c.rollPerG, nullptr, 0, 10}, {"CameraRotation", "RollFreq", &c.rollFreq, nullptr, 0.3f, 10},
+        {"CameraRotation", "RollDamp", &c.rollDamp, nullptr, 0.2f, 2}, {"CameraRotation", "HorizonLock", &c.horizonLock, nullptr, 0, 1},
+        {"CameraRotation", "CarRollScale", &c.carRollScale, nullptr, 0, 100}, {"CameraRotation", "InvertCarRoll", nullptr, &c.invCarRoll, -1, 1},
 
-        {"Shift", "Kick", &c.shiftKick, nullptr, -2, 2},
+        {"CameraShift", "Kick", &c.shiftKick, nullptr, -2, 2},
 
-        {"Impact", "Scale", &c.impactScale, nullptr, 0, 3}, {"Impact", "CrashThreshold", &c.crashThr, nullptr, 0.5f, 50},
-        {"Impact", "CrashIgnoreAbove", &c.crashIgnore, nullptr, 2, 500}, {"Impact", "CrashKick", &c.crashKick, nullptr, 0, 2},
-        {"Impact", "CrashPitchKick", &c.crashPitchKick, nullptr, 0, 200}, {"Impact", "CrashRollKick", &c.crashRollKick, nullptr, 0, 200},
-        {"Impact", "CrashCooldown", &c.crashCooldown, nullptr, 0.1f, 5}, {"Impact", "MaxKick", &c.maxKick, nullptr, 0.05f, 2},
-        {"Impact", "AirLoadFraction", &c.airFrac, nullptr, 0.01f, 0.5f}, {"Impact", "LandLoadFraction", &c.landFrac, nullptr, 0.05f, 0.9f},
-        {"Impact", "AirborneMs", &c.airMs, nullptr, 30, 1000}, {"Impact", "AirTimeRef", &c.airRef, nullptr, 0.2f, 3},
-        {"Impact", "LandRefG", &c.landRefG, nullptr, 0.5f, 20}, {"Impact", "LandMinStrength", &c.landMinS, nullptr, 0, 2},
-        {"Impact", "LandMaxStrength", &c.landMaxS, nullptr, 0.5f, 5}, {"Impact", "LandKick", &c.landKick, nullptr, 0, 2},
-        {"Impact", "LandPitchKick", &c.landPitchKick, nullptr, 0, 200}, {"Impact", "AirLift", &c.airLift, nullptr, 0, 0.05f},
-        {"Impact", "ShakePos", &c.shakePos, nullptr, 0, 0.05f}, {"Impact", "ShakeAngleDeg", &c.shakeAng, nullptr, 0, 10},
-        {"Impact", "ShakeFreq1", &c.shakeFreq1, nullptr, 2, 40}, {"Impact", "ShakeFreq2", &c.shakeFreq2, nullptr, 2, 40},
-        {"Impact", "ShakeDecay", &c.shakeDecay, nullptr, 0.05f, 3}, {"Impact", "ShakeGain", &c.shakeGain, nullptr, 0, 2},
+        {"CameraImpact", "Scale", &c.impactScale, nullptr, 0, 3}, {"CameraImpact", "CrashThreshold", &c.crashThr, nullptr, 0.5f, 50},
+        {"CameraImpact", "CrashIgnoreAbove", &c.crashIgnore, nullptr, 2, 500}, {"CameraImpact", "CrashKick", &c.crashKick, nullptr, 0, 2},
+        {"CameraImpact", "CrashPitchKick", &c.crashPitchKick, nullptr, 0, 200}, {"CameraImpact", "CrashRollKick", &c.crashRollKick, nullptr, 0, 200},
+        {"CameraImpact", "CrashCooldown", &c.crashCooldown, nullptr, 0.1f, 5}, {"CameraImpact", "MaxKick", &c.maxKick, nullptr, 0.05f, 2},
+        {"CameraImpact", "AirLoadFraction", &c.airFrac, nullptr, 0.01f, 0.5f}, {"CameraImpact", "LandLoadFraction", &c.landFrac, nullptr, 0.05f, 0.9f},
+        {"CameraImpact", "AirborneMs", &c.airMs, nullptr, 30, 1000}, {"CameraImpact", "AirTimeRef", &c.airRef, nullptr, 0.2f, 3},
+        {"CameraImpact", "LandRefG", &c.landRefG, nullptr, 0.5f, 20}, {"CameraImpact", "LandMinStrength", &c.landMinS, nullptr, 0, 2},
+        {"CameraImpact", "LandMaxStrength", &c.landMaxS, nullptr, 0.5f, 5}, {"CameraImpact", "LandKick", &c.landKick, nullptr, 0, 2},
+        {"CameraImpact", "LandPitchKick", &c.landPitchKick, nullptr, 0, 200}, {"CameraImpact", "AirLift", &c.airLift, nullptr, 0, 0.05f},
+        {"CameraImpact", "ShakePos", &c.shakePos, nullptr, 0, 0.05f}, {"CameraImpact", "ShakeAngleDeg", &c.shakeAng, nullptr, 0, 10},
+        {"CameraImpact", "ShakeFreq1", &c.shakeFreq1, nullptr, 2, 40}, {"CameraImpact", "ShakeFreq2", &c.shakeFreq2, nullptr, 2, 40},
+        {"CameraImpact", "ShakeDecay", &c.shakeDecay, nullptr, 0.05f, 3}, {"CameraImpact", "ShakeGain", &c.shakeGain, nullptr, 0, 2},
 
-        {"Limits", "MaxPos", &c.maxPos, nullptr, 0.005f, 0.15f}, {"Limits", "MaxAngleDeg", &c.maxAng, nullptr, 0.5f, 25}, {"Limits", "MaxRollDeg", &c.maxRoll, nullptr, 0.5f, 15},
+        {"CameraLimits", "MaxPos", &c.maxPos, nullptr, 0.005f, 0.15f}, {"CameraLimits", "MaxAngleDeg", &c.maxAng, nullptr, 0.5f, 25}, {"CameraLimits", "MaxRollDeg", &c.maxRoll, nullptr, 0.5f, 15},
 
         {"Windscreen", "Mode", nullptr, &c.wsMode, 1, 3},
         {"Windscreen", "WetFromGame", nullptr, &c.wsWetFromGame, 0, 1},
@@ -217,11 +217,11 @@ std::vector<Opt> optTable(Cfg& c) {
         {"Windscreen", "W2X", &c.wsW2X, nullptr, -0.5f, 1.5f}, {"Windscreen", "W2Y", &c.wsW2Y, nullptr, -0.5f, 1.5f}, {"Windscreen", "W2Len", &c.wsW2Len, nullptr, 0, 3},
         {"Windscreen", "W2A0", &c.wsW2A0, nullptr, -360, 360}, {"Windscreen", "W2A1", &c.wsW2A1, nullptr, -360, 360},
 
-        {"Axes", "Right", nullptr, &c.axRight, 0, 2}, {"Axes", "Up", nullptr, &c.axUp, 0, 2}, {"Axes", "Forward", nullptr, &c.axFwd, 0, 2},
-        {"Axes", "SignRight", nullptr, &c.sgRight, -1, 1}, {"Axes", "SignUp", nullptr, &c.sgUp, -1, 1}, {"Axes", "SignForward", nullptr, &c.sgFwd, -1, 1},
-        {"Render", "FixedFunction", nullptr, &c.fixedFunction, 0, 1},
-        {"Render", "SignRight", nullptr, &c.rSgRight, -1, 1}, {"Render", "SignUp", nullptr, &c.rSgUp, -1, 1}, {"Render", "SignForward", nullptr, &c.rSgFwd, -1, 1},
-        {"Render", "SignPitch", nullptr, &c.rSgPitch, -1, 1}, {"Render", "SignYaw", nullptr, &c.rSgYaw, -1, 1}, {"Render", "SignRoll", nullptr, &c.rSgRoll, -1, 1},
+        {"CameraAxes", "Right", nullptr, &c.axRight, 0, 2}, {"CameraAxes", "Up", nullptr, &c.axUp, 0, 2}, {"CameraAxes", "Forward", nullptr, &c.axFwd, 0, 2},
+        {"CameraAxes", "SignRight", nullptr, &c.sgRight, -1, 1}, {"CameraAxes", "SignUp", nullptr, &c.sgUp, -1, 1}, {"CameraAxes", "SignForward", nullptr, &c.sgFwd, -1, 1},
+        {"CameraRender", "FixedFunction", nullptr, &c.fixedFunction, 0, 1},
+        {"CameraRender", "SignRight", nullptr, &c.rSgRight, -1, 1}, {"CameraRender", "SignUp", nullptr, &c.rSgUp, -1, 1}, {"CameraRender", "SignForward", nullptr, &c.rSgFwd, -1, 1},
+        {"CameraRender", "SignPitch", nullptr, &c.rSgPitch, -1, 1}, {"CameraRender", "SignYaw", nullptr, &c.rSgYaw, -1, 1}, {"CameraRender", "SignRoll", nullptr, &c.rSgRoll, -1, 1},
     };
 }
 
@@ -257,8 +257,8 @@ void wsApplyStage() {                                                // an expli
 
 int g_rawMethod = 2;
 void loadConfig() {
-    const std::string p = g_dir + "ForceFXCamera.ini";     // a missing file or key simply uses the built-in default
-    g_rawMethod = (int)std::lround(iniF(p, "General", "Method", 2));
+    const std::string p = g_dir + "ForceFX.ini";     // a missing file or key simply uses the built-in default
+    g_rawMethod = (int)std::lround(iniF(p, "Camera", "Method", 2));
     Cfg c; auto t = optTable(c);
     for (const Opt& o : t) {
         if (o.f) *o.f = std::max(o.lo, std::min(iniF(p, o.sec, o.key, *o.f), o.hi));
@@ -2414,7 +2414,7 @@ class CameraFx {
 public:
     struct Hooks { std::function<void(const std::string&)> log; };
 
-    // Reads ForceFXCamera.ini and installs the hooks. cameraOn / windscreenOn are the switches from ForceFX.ini. The windscreen
+    // Reads the camera sections of ForceFX.ini and installs the hooks. cameraOn / windscreenOn are the switches from ForceFX.ini. The windscreen
     // hooks are only installed when it is on here, so a restart is needed to switch it on later.
     void configure(const std::string& dir, Hooks h, bool cameraOn, bool windscreenOn) {
         if (m_started) return;
@@ -2424,7 +2424,7 @@ public:
         loadConfig();
         if (g_cfg.log) g_log = fopen((g_dir + "ForceFXCamera.log").c_str(), "w");
         if (!g_cfg.anyExe && !isRsfExe()) {
-            Note("not the RallySimFans executable (RichardBurnsRally_SSE.exe), so the camera and windscreen effects stay off. Set AnyExe=1 in ForceFXCamera.ini to try anyway");
+            Note("not the RallySimFans executable (RichardBurnsRally_SSE.exe), so the camera and windscreen effects stay off. Set AnyExe=1 in the [Camera] section of ForceFX.ini to try anyway");
             return;
         }
         QueryPerformanceFrequency(&g_qf); QueryPerformanceCounter(&g_qlast);

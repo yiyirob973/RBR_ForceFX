@@ -62,7 +62,7 @@ ForceFX reads which material is under each tyre from RBR's memory (read-only) an
 Audio build only. It is off by default: switch on **Dynamic audio** in the menu, or set `EnableDynamicAudio=1`.
 
 1. Run `ForceFXAudio\Copy-RbrSounds.bat` to copy matching sounds from your RBR `Audio` folder. See the short readme beside it. You can also put your own WAV files in `ForceFXAudio\sounds`.
-2. Mix levels and the output device are in `ForceFXAudio.ini`.
+2. Mix levels and the output device are in the `[Audio]` section of `ForceFX.ini`.
 
 `audio/surfaces.md` lists the sound names ForceFX looks for.
 
@@ -70,8 +70,8 @@ Audio build only. It is off by default: switch on **Dynamic audio** in the menu,
 
 Camera builds only. It is on by default. Switch it with **Camera movement** in the menu or `EnableCamera` in `ForceFX.ini`; it changes at once.
 
-- `Intensity` in `ForceFXCamera.ini` is the main strength setting: 0.5 is very subtle, 1.0 natural, 1.5 to 2.0 pronounced. The other values in that file are described there.
-- With RBR in focus, hold Ctrl and press **F9** to reload `ForceFXCamera.ini` while you drive, **F10** to switch the camera on or off.
+- `Intensity` in the `[Camera]` section of `ForceFX.ini` is the main strength setting: 0.5 is very subtle, 1.0 natural, 1.5 to 2.0 pronounced. The other camera sections are described in the file.
+- With RBR in focus, hold Ctrl and press **F9** to reload the camera settings from `ForceFX.ini` while you drive, **F10** to switch the camera on or off.
 - It reads the same telemetry as the force feedback, so a wheel doesn't have to be connected. If telemetry comes only from ForceFX's own UDP port (`TelemetrySource=2`), the camera needs the wheel connected.
 - It hooks fixed addresses in the RallySimFans `RichardBurnsRally_SSE.exe` and stays off in any other executable.
 - It patches the Direct3D matrices the way openRBRVR does, so the game's own camera and wipers are untouched. With openRBRVR loaded, or if those hooks don't start, it switches to a simpler method that has no head roll and can stop the wipers.
@@ -83,7 +83,7 @@ Camera builds only. Off by default. Turn on **Windscreen effects** in the menu o
 
 - Rain and snow follow the stage's weather, read from the game. Mud is thrown on rough, wet ground, on landings and on impacts.
 - Wipers clear the glass. The plugin finds the car's real wipers after about 12 seconds of rain and follows them; until then it uses emulated blades.
-- Drops, mud, haze, wipers and the game's own wet-windscreen effect have their own settings in the `[Windscreen]` section of `ForceFXCamera.ini`. F8 (with Ctrl) switches it on and off while driving.
+- Drops, mud, haze, wipers and the game's own wet-windscreen effect have their own settings in the `[Windscreen]` section of `ForceFX.ini`. F8 (with Ctrl) switches it on and off while driving.
 - It costs some frame rate. If that is a problem, lower `Micro`, `Drops` and `Mud`, or set `Refraction=0`.
 
 ## Troubleshooting
@@ -92,7 +92,7 @@ Camera builds only. Off by default. Turn on **Windscreen effects** in the menu o
 - **Wheel won't connect or has no effects:** make sure force feedback is on in RBR and that you picked the same wheel RBR uses. Check `ForceFX.log`.
 - **Road doesn't react to the ground:** open the Diagnostics page. "looking for the tyres" means the tyre data wasn't found, usually because the RBR build is different. "unknown" means the material isn't recognised; assign it with `Map=`.
 - **Too strong or busy:** lower the total output or the live level first, then the individual effects.
-- **The camera doesn't move:** open the Diagnostics page and read the camera line, and look for lines starting with `Camera:` in `ForceFX.log`. "not the RallySimFans executable" means the game isn't `RichardBurnsRally_SSE.exe`. "telemetry not seen" means NGP isn't sending UDP telemetry. For more detail set `Log=1` in `ForceFXCamera.ini`.
+- **The camera doesn't move:** open the Diagnostics page and read the camera line, and look for lines starting with `Camera:` in `ForceFX.log`. "not the RallySimFans executable" means the game isn't `RichardBurnsRally_SSE.exe`. "telemetry not seen" means NGP isn't sending UDP telemetry. For more detail set `Log=1` in the `[Camera]` section of `ForceFX.ini`.
 
 When reporting a problem, attach `ForceFX.log` (it is beside the DLL), plus `ForceFXCamera.log` for camera problems, and describe your NGP setup. Remove any personal information first.
 

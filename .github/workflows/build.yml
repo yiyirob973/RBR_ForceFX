@@ -41,11 +41,9 @@ jobs:
             Copy-Item "out\$variant\RBR_ForceFX.dll" $stage
             Copy-Item ForceFX.ini, ForceFXCars.ini $stage
             if ($audio) {
-              Copy-Item ForceFXAudio.ini $stage
               New-Item -ItemType Directory -Path "$stage\ForceFXAudio" | Out-Null
               Copy-Item audio\tools\* "$stage\ForceFXAudio"
             }
-            if ($camera) { Copy-Item ForceFXCamera.ini $stage }
             $zip = "ForceFX-$tag-$suffix.zip"
             Compress-Archive -Path "$stage\*" -DestinationPath $zip
             return $zip

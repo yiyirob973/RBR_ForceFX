@@ -165,13 +165,13 @@ struct Config {
     int   roadViaRbr = 1;            // 1 = the road vibration is added to RBR's own force updates, so the wheel gets no extra road effect; 0 = one sine effect of its own
     int   probe = 0;                 // 1 = write ForceFX_probe.csv (ground ids and road signals ten times a second) for tuning surfaces; read at start only
 #ifdef FORCEFX_AUDIO
-    int   fxAudio = 0;               // dynamic surface audio (settings in ForceFXAudio.ini); off until switched on
-    float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in ForceFXAudio.ini)
+    int   fxAudio = 0;               // dynamic surface audio (settings in the [Audio] section of ForceFX.ini); off until switched on
+    float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in [Audio] of ForceFX.ini)
     float audioImpact = 1.0f;        // 0..4 live multiplier on impacts and landings (on top of EventLevel)
     float audioSusp = 1.0f;          // 0..4 live multiplier on suspension creaks and bottoming out (on top of SqueakLevel / BottomOutLevel)
 #endif
 #ifdef FORCEFX_CAMERA
-    int   fxCamera = 1;              // head movement in the cockpit camera (settings in ForceFXCamera.ini)
+    int   fxCamera = 1;              // head movement in the cockpit camera (settings in the [Camera...] sections of ForceFX.ini)
     int   fxWindscreen = 0;          // rain, snow and mud on the windscreen; off by default. Its hooks are installed at startup, so switching it on needs a restart
 #endif
 
@@ -447,7 +447,7 @@ struct CarDb {
             pos = e + 1;
             if (line.empty() || line[0] == ';' || line[0] == '#') continue;
             if (line[0] == '[') { size_t r = line.find(']'); secs.push_back(std::make_pair(TrimStr(line.substr(1, r == std::string::npos ? std::string::npos : r - 1)), KV())); continue; }
-            size_t eq = line.find('=');
+            size_t eq = line.find_first_of("=:");               // "Drivetrain: AWD" works too
             if (eq == std::string::npos || secs.empty()) continue;
             std::string v = TrimStr(line.substr(eq + 1));
             if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
@@ -2939,14 +2939,14 @@ private:
         struct T { const char* k; const char* t; };
         static const T tips[] = {
 #ifdef FORCEFX_AUDIO
-            {"EnableDynamicAudio", "Plays tyre and ground sounds that follow each wheel: rolling noise, squeal, sliding, flying stones, bumps and landings, with the sound of each surface. Needs sound files in ForceFXAudio\\sounds and settings in ForceFXAudio.ini. Off by default; loading takes a moment when you switch it on."},
-            {"AudioDebrisLevel",   "How loud the stones and debris thrown at the car are, on top of StoneLevel in ForceFXAudio.ini. Changes apply while you drive."},
-            {"AudioImpactLevel",   "How loud bump impacts and landings are, on top of EventLevel in ForceFXAudio.ini."},
-            {"AudioSuspensionLevel", "How loud suspension creaks and bottoming-out thumps are, on top of SqueakLevel and BottomOutLevel in ForceFXAudio.ini."},
+            {"EnableDynamicAudio", "Plays tyre and ground sounds that follow each wheel: rolling noise, squeal, sliding, flying stones, bumps and landings, with the sound of each surface. Needs sound files in ForceFXAudio\\sounds; the mix levels are in the [Audio] section of ForceFX.ini. Off by default; loading takes a moment when you switch it on."},
+            {"AudioDebrisLevel",   "How loud the stones and debris thrown at the car are, on top of StoneLevel in [Audio] of ForceFX.ini. Changes apply while you drive."},
+            {"AudioImpactLevel",   "How loud bump impacts and landings are, on top of EventLevel in [Audio] of ForceFX.ini."},
+            {"AudioSuspensionLevel", "How loud suspension creaks and bottoming-out thumps are, on top of SqueakLevel and BottomOutLevel in [Audio] of ForceFX.ini."},
 #endif
 #ifdef FORCEFX_CAMERA
-            {"EnableCamera",       "Moves your head in the cockpit view with the car: leaning into braking and corners, nodding, bouncing over bumps and shaking on crashes and landings. Strength and everything else is in ForceFXCamera.ini (Intensity is the main one). Changes apply at once."},
-            {"EnableWindscreen",   "Rain, snow and mud on the windscreen of the cockpit view, with wipers. It is off by default and is read at startup, so after switching it on restart RBR. Settings are in the [Windscreen] section of ForceFXCamera.ini."},
+            {"EnableCamera",       "Moves your head in the cockpit view with the car: leaning into braking and corners, nodding, bouncing over bumps and shaking on crashes and landings. Strength and everything else is in the [Camera] sections of ForceFX.ini (Intensity is the main one). Changes apply at once."},
+            {"EnableWindscreen",   "Rain, snow and mud on the windscreen of the cockpit view, with wipers. It is off by default and is read at startup, so after switching it on restart RBR. Settings are in the [Windscreen] section of ForceFX.ini."},
 #endif
             {"EnableEngine",       "Turns the engine vibration on or off. Handy for feeling what each effect does on its own."},
             {"EnableRoad",         "Turns the road feel (texture, bumps and ground) on or off."},
@@ -3075,6 +3075,7 @@ public:
             h.idsStatus = []() { return Surf::Status(); };
             h.log = [](const std::string& s) { Logf("%s", s.c_str()); };
             m_audio.configure(g_dir, h);
+            m_audio.setSpeedUnits(m_cfg.speedIsKph != 0);
         }
         {
             ffx::Camera::Hooks h;

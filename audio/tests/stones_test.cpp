@@ -224,6 +224,23 @@ TEST(stone_level_ini_key_is_read_and_clamped) {
     std::filesystem::remove(p);
 }
 
+TEST(settings_are_read_only_from_the_named_section) {
+    std::string p = (std::filesystem::temp_directory_path() / "section.ini").string();
+    { std::ofstream f(p);
+      f << "[ForceFX]\nStoneLevel = 5\nSpeedIsKph = 0\n"
+           "[Audio]   ; trailing comment\nStoneLevel = 1.5\nEventLevel = 0.5\n"
+           "[CameraInput]\nEventLevel = 3\n"; }
+    Settings s; CHECK(loadSettings(p, s, "Audio"));
+    CHECK(s.stoneLevel > 1.49 && s.stoneLevel < 1.51);       // not the 5 from [ForceFX]
+    CHECK(s.eventLevel > 0.49 && s.eventLevel < 0.51);       // not the 3 from the next section
+    CHECK(s.speedIsKph);                                      // [ForceFX]'s SpeedIsKph=0 is not read here
+    Settings t; CHECK(loadSettings(p, t, "audio")); CHECK(t.stoneLevel > 1.49 && t.stoneLevel < 1.51);   // names are case-insensitive
+    Settings u; CHECK(loadSettings(p, u, "Missing")); CHECK(u.stoneLevel > 1.99 && u.stoneLevel < 2.01);  // no such section: defaults
+    Settings v; CHECK(loadSettings(p, v)); CHECK(v.eventLevel > 2.99 && v.eventLevel < 3.01);             // no section named: every line, last one wins
+    CHECK(!loadSettings(p + ".nope", s, "Audio"));
+    std::filesystem::remove(p);
+}
+
 int main() {
     for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
     std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);
