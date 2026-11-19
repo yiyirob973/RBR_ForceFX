@@ -1,0 +1,194 @@
+// Tests for the surface classes, the Map= overrides, the ridge pitch and the cobble detector (surface_feel.hpp). Self-contained:
+//   g++ -std=c++17 -O1 surface_feel_test.cpp -o surface_feel_test && ./surface_feel_test
+#include <cstdio>
+#include <functional>
+#include <string>
+#include <vector>
+#include "../surface_feel.hpp"
+
+using namespace Surf;
+
+static int g_fail = 0, g_checks = 0;
+struct Reg { const char* name; std::function<void()> fn; };
+static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
+struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
+#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
+#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
+static bool near(float a, float b, float e = 1e-4f) { return std::fabs(a - b) <= e; }
+static void resetMap() { for (int i = 0; i < 256; ++i) IdMap()[i] = 0; }
+
+// ---------------------------------------------------------------- classes by id
+TEST(verified_material_families_keep_their_classes) {
+    resetMap();
+    CHECK(ClassOfId(37) == C_TARMAC && ClassOfId(87) == C_TARMAC);      // clean and covered tarmac
+    CHECK(ClassOfId(1) == C_GRAVEL && ClassOfId(199) == C_GRAVEL);       // gravel, including the BR2 set
+    CHECK(ClassOfId(133) == C_GRAVEL);                                   // dirt
+    CHECK(ClassOfId(101) == C_SNOW && ClassOfId(88) == C_SNOW);
+    CHECK(ClassOfId(117) == C_ICE);
+    CHECK(ClassOfId(97) == C_SOFT && ClassOfId(129) == C_SOFT);          // grass, rough
+}
+TEST(objects_and_out_of_range_ids_stay_unknown) {
+    resetMap();
+    CHECK(ClassOfId(30) == C_NONE);      // tree
+    CHECK(ClassOfId(63) == C_NONE);      // metal pole
+    CHECK(ClassOfId(157) == C_SOFT);     // water surface: it has its own ground in road_feel.hpp, the class is only for the status line
+    CHECK(ClassOfId(255) == C_NONE);     // spectator
+    CHECK(ClassOfId(-1) == C_NONE && ClassOfId(256) == C_NONE && ClassOfId(100000) == C_NONE);
+}
+TEST(no_id_maps_to_cobble_or_wood_until_the_user_assigns_it) {
+    resetMap();
+    for (int id = -2; id < 300; ++id) CHECK(ClassOfId(id) != C_COBBLE && ClassOfId(id) != C_WOOD);
+}
+
+// ---------------------------------------------------------------- Map= parsing
+TEST(map_assigns_cobble_and_wood_by_id) {
+    resetMap();
+    CHECK(ParseIdMap("200:cobble,201:wood") == 2);
+    CHECK(ClassOfId(200) == C_COBBLE && ClassOfId(201) == C_WOOD);
+    CHECK(ClassOfId(202) == C_NONE);                                      // neighbours untouched
+}
+TEST(map_tolerates_spaces_case_and_the_old_names) {
+    resetMap();
+    CHECK(ParseIdMap(" 210 : Cobble , 211:WOOD,88:snow,92:none") == 4);
+    CHECK(ClassOfId(210) == C_COBBLE && ClassOfId(211) == C_WOOD && ClassOfId(88) == C_SNOW && ClassOfId(92) == C_NONE);
+}
+TEST(map_can_override_a_built_in_class_and_none_switches_one_off) {
+    resetMap();
+    CHECK(ClassOfId(69) == C_TARMAC);                                     // Tarmac_Coarse_Clean_Dry
+    ParseIdMap("69:cobble");
+    CHECK(ClassOfId(69) == C_COBBLE);                                     // cobbles that reuse a tarmac id
+    ParseIdMap("69:none");
+    CHECK(ClassOfId(69) == C_NONE);
+}
+TEST(map_ignores_bad_entries_and_keeps_the_good_ones) {
+    resetMap();
+    const int n = ParseIdMap("abc,300:cobble,-4:wood,220:marble,221 cobble,,222:cobble,:wood,x7:wood,1e2:wood");
+    CHECK(n == 1);                                                        // only 222:cobble is valid
+    CHECK(ClassOfId(222) == C_COBBLE);
+    CHECK(ClassOfId(0) == C_NONE);                                        // ":wood" and "abc" did not touch id 0
+    CHECK(ParseIdMap("") == 0);
+}
+
+// ---------------------------------------------------------------- blending
+TEST(ridge_pitch_is_speed_over_spacing_when_it_fits) {
+    CHECK(near(RidgeHz(5.0f, 0.12f, 25.0f, 100.0f), 5.0f / 0.12f, 1e-3f));
+    CHECK(near(RidgeHz(10.0f, 0.25f, 25.0f, 100.0f), 40.0f, 1e-3f));
+}
+TEST(ridge_pitch_rises_with_speed_inside_an_octave) {
+    float last = 0;
+    for (float v = 4.0f; v <= 12.0f; v += 1.0f) { const float h = RidgeHz(v, 0.12f, 25.0f, 100.0f); CHECK(h > last); last = h; }
+}
+TEST(ridge_pitch_folds_by_octaves_instead_of_pinning_at_the_ceiling) {
+    CHECK(near(RidgeHz(30.0f, 0.12f, 25.0f, 100.0f), 62.5f, 1e-3f));    // 250 Hz -> 125 -> 62.5
+    CHECK(RidgeHz(20.0f, 0.12f, 25.0f, 100.0f) != RidgeHz(30.0f, 0.12f, 25.0f, 100.0f));   // still follows speed at the top
+    for (float v = 0.0f; v < 80.0f; v += 0.5f) { const float h = RidgeHz(v, 0.12f, 25.0f, 100.0f); CHECK(h >= 25.0f && h <= 100.0f); }
+}
+TEST(ridge_pitch_edges_are_safe) {
+    CHECK(near(RidgeHz(0.0f, 0.12f, 25.0f, 100.0f), 25.0f));             // standing still
+    CHECK(near(RidgeHz(-3.0f, 0.12f, 25.0f, 100.0f), 25.0f));            // reversing telemetry
+    CHECK(near(RidgeHz(10.0f, 0.0f, 25.0f, 100.0f), 25.0f));             // no ridge
+    CHECK(near(RidgeHz(1.0f, 0.12f, 25.0f, 100.0f), 25.0f));             // too slow: clamped up to the floor
+    CHECK(RidgeHz(1e9f, 0.03f, 25.0f, 100.0f) <= 100.0f);                // absurd input
+}
+
+// ---------------------------------------------------------------- ini names
+TEST(map_accepts_everyday_names_for_the_types) {
+    resetMap();
+    CHECK(ParseIdMap("300:cobble,89:cobblestone,90:Cobbles,91:wooden,92:bridge,93:planks,94:asphalt,95:dirt,96:grass") == 8);   // eight valid, 300 is out of range
+    CHECK(ClassOfId(89) == C_COBBLE && ClassOfId(90) == C_COBBLE);
+    CHECK(ClassOfId(91) == C_WOOD && ClassOfId(92) == C_WOOD && ClassOfId(93) == C_WOOD);
+    CHECK(ClassOfId(94) == C_TARMAC && ClassOfId(95) == C_GRAVEL && ClassOfId(96) == C_SOFT);
+}
+TEST(class_from_name_rejects_unknown_types) {
+    CHECK(ClassFromName("cobble") == C_COBBLE && ClassFromName("none") == C_NONE);
+    CHECK(ClassFromName("marble") == -1 && ClassFromName("") == -1 && ClassFromName("Cobble") == -1);   // callers lower-case first
+}
+TEST(map_reports_every_entry_it_could_not_use) {
+    resetMap();
+    std::vector<std::string> bad;
+    const int n = ParseIdMap("89:cobble, 90:marble, 400:wood, x:wood, 91 wood, 92:wood", &bad);
+    CHECK(n == 2);                                                         // 89 and 92
+    CHECK(bad.size() == 4);
+    bool sawMarble = false, sawRange = false, sawNumber = false, sawFormat = false;
+    for (const std::string& b : bad) {
+        if (b.find("marble") != std::string::npos) sawMarble = true;
+        if (b.find("400") != std::string::npos) sawRange = true;
+        if (b.find("x:wood") != std::string::npos) sawNumber = true;
+        if (b.find("91 wood") != std::string::npos && b.find("id:type") != std::string::npos) sawFormat = true;
+    }
+    CHECK(sawMarble && sawRange && sawNumber && sawFormat);
+    CHECK(ClassOfId(89) == C_COBBLE && ClassOfId(92) == C_WOOD && ClassOfId(90) == C_NONE);
+}
+TEST(map_without_a_report_list_still_works_and_blank_entries_are_not_errors) {
+    resetMap();
+    std::vector<std::string> bad;
+    CHECK(ParseIdMap(" , ,89:cobble,", &bad) == 1);
+    CHECK(bad.empty());
+    CHECK(ParseIdMap("90:wood") == 1);
+}
+
+// ---------------------------------------------------------------- telemetry cobble detection
+static float settle(CobbleDetector& d, float rough, float speed, int ticks, bool air = false) {
+    float s = 0; for (int i = 0; i < ticks; ++i) s = d.update(rough, speed, air, 0.01f, 0.5f, 1.0f); return s;
+}
+TEST(detector_reads_plain_tarmac_as_not_cobbled) {
+    CobbleDetector d;
+    CHECK(settle(d, 0.06f, 30.0f, 600) < 0.01f);                                            // 0.06 at 30 m/s -> 0.2: smooth tarmac
+}
+TEST(detector_levels_match_the_probe_drive) {
+    CobbleDetector t, c;
+    CHECK(settle(t, 0.12f, 30.0f, 600) < 0.05f);      // 0.12 at 30 m/s -> 0.4: tarmac
+    CHECK(settle(c, 0.30f, 30.0f, 600) > 0.95f);      // 0.30 at 30 m/s -> 1.0: cobbles
+}
+TEST(detector_ramps_smoothly_between_the_edges) {
+    float last = -1;
+    for (float r = 0.12f; r <= 0.33f; r += 0.03f) { CobbleDetector d; const float s = settle(d, r, 30.0f, 800); CHECK(s >= last); last = s; }
+    CobbleDetector m; const float mid = settle(m, 0.225f, 30.0f, 800);                       // 0.75: halfway
+    CHECK(mid > 0.4f && mid < 0.6f);
+}
+TEST(detector_does_not_jump_on_a_single_spike) {
+    CobbleDetector d; settle(d, 0.12f, 30.0f, 600);
+    const float s = d.update(3.0f, 30.0f, false, 0.01f, 0.5f, 1.0f);                         // one huge reading
+    CHECK(s < 0.2f);                                                                         // smoothing keeps it from flipping to cobble
+}
+TEST(detector_needs_time_to_settle_and_then_follows_the_ground) {
+    CobbleDetector d; settle(d, 0.12f, 30.0f, 600);
+    const float soon = settle(d, 0.30f, 30.0f, 10), later = settle(d, 0.30f, 30.0f, 400);    // 0.1 s, then 4 s more
+    CHECK(soon < 0.5f && later > 0.9f);
+    const float back = settle(d, 0.12f, 30.0f, 800);
+    CHECK(back < 0.1f);
+}
+TEST(detector_ignores_crawling_speed_and_resets) {
+    CobbleDetector d; settle(d, 0.30f, 30.0f, 600);
+    CHECK(settle(d, 0.30f, 5.0f, 5) == 0.0f);                                                // too slow to say
+    CHECK(d.init == false);
+    CHECK(d.update(0.30f, 0.0f, false, 0.01f, 0.5f, 1.0f) == 0.0f);                          // standing still
+}
+TEST(detector_holds_while_airborne) {
+    CobbleDetector d; const float before = settle(d, 0.30f, 30.0f, 600);
+    const float air = settle(d, 0.0f, 30.0f, 300, true);                                     // no roughness in the air must not read as smooth tarmac
+    CHECK(near(air, before, 1e-4f));
+}
+TEST(detector_is_safe_with_bad_numbers) {
+    CobbleDetector d;
+    CHECK(d.update(NAN, 30.0f, false, 0.01f, 0.5f, 1.0f) == 0.0f);
+    CHECK(d.update(0.3f, INFINITY, false, 0.01f, 0.5f, 1.0f) == 0.0f);
+    CHECK(d.update(-1.0f, 30.0f, false, 0.01f, 0.5f, 1.0f) == 0.0f);                         // negative roughness counts as none
+    CHECK(d.update(0.3f, 30.0f, false, 0.0f, 0.5f, 1.0f) >= 0.0f);                           // zero dt: no division, no change
+    CHECK(d.update(0.3f, 30.0f, false, -1.0f, 0.5f, 1.0f) <= 1.0f);
+    CHECK(near(CobbleDetector::Ramp(0.7f, 1.0f, 0.5f), 0.0f));                               // edges the wrong way round don't divide by zero
+    CHECK(near(CobbleDetector::Ramp(2.0f, 1.0f, 1.0f), 1.0f));
+}
+TEST(detector_keeps_its_last_score_for_display_and_resets_it) {
+    CobbleDetector d;
+    const float s = settle(d, 0.30f, 30.0f, 600);
+    CHECK(near(d.score, s) && d.ema > 0.9f);
+    d.update(0.30f, 2.0f, false, 0.01f, 0.5f, 1.0f);                                        // slows to a crawl
+    CHECK(d.score == 0.0f && d.ema == 0.0f);
+}
+
+int main() {
+    for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
+    std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);
+    return g_fail ? 1 : 0;
+}
