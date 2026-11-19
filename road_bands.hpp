@@ -1,9 +1,9 @@
-// Road bands: the road vibration as three sine effects, each carrying one band of the road's spectrum (low, mid, high).
+// Road bands: the road vibration as three sine bands (low, mid, high), each carrying part of the road's spectrum. They are added to RBR's
+// own force, or, as a fallback, merged into one sine effect (Consolidate).
 // Pure logic, no Windows or game access, so it can be tested on its own (see tests/road_bands_test.cpp).
 //
-// A wheel can only play periodic effects, and one periodic effect is a single pitch. Road noise has many pitches at once, so the
-// road is split over three sine effects, each covering a third (in pitch) of the road frequency range. This follows the usual way
-// of building a road surface from its spectrum:
+// Road noise has many pitches at once, and one sine is a single pitch. So the road is split over three sines, each covering a third (in
+// pitch) of the road frequency range. This follows the usual way of building a road surface from its spectrum:
 //   - A road is made of bumps of every length. The pitch you feel from a bump is the speed divided by its length, so each band
 //     follows the speed of the car: faster means higher. A band stays inside its own third of the range, because the wheel can
 //     not play beyond it.
@@ -26,7 +26,7 @@ constexpr int   kBands    = 3;
 constexpr float kPatchLen = 0.13f;    // length of a tyre's contact patch in metres
 constexpr float kRefSpeed = 20.0f;    // m/s: the speed at which each band sits in the middle of its third
 constexpr float kPatchMin = 0.05f;    // the least a band is let through by the contact patch, so no band is ever completely dead
-// Scale of the three sine effects together, kept from the earlier road feel so the road gain means the same as before.
+// Scale of the three sines together, kept from the earlier road feel so the road gain means the same as before.
 constexpr float kSineEq   = 0.816f;
 
 // The range of band i: the road range [minHz, maxHz] cut into three equal parts on a pitch (logarithmic) scale.
@@ -136,6 +136,23 @@ inline void Combine(const SideIn side[2], const float share[2][kBands], const fl
         }
         mag[b] = std::isfinite(e) ? kSineEq * std::sqrt(e) : 0.0f;
     }
+}
+
+// The three bands as ONE sine, for when the road is played as a single wheel effect: the amplitude carries the same energy as the three
+// bands together (so the road is as strong), and the pitch is the geometric mean of the band pitches weighted by their energy (so it sits
+// where most of the vibration is). Less detailed than the bands, but only one effect for the wheel to play.
+inline void Consolidate(const float mag[kBands], const float hz[kBands], float& amp, float& pitch) {
+    float e = 0.0f, lnf = 0.0f;
+    for (int b = 0; b < kBands; ++b) {
+        const float m = (std::isfinite(mag[b]) && mag[b] > 0.0f) ? mag[b] : 0.0f;
+        const float f = (std::isfinite(hz[b]) && hz[b] > 0.0f) ? hz[b] : 1.0f;
+        e += m * m; lnf += m * m * std::log(f);
+    }
+    const float mid = (std::isfinite(hz[kBands / 2]) && hz[kBands / 2] > 0.0f) ? hz[kBands / 2] : 1.0f;
+    amp = std::sqrt(e);
+    pitch = e > 1e-6f ? std::exp(lnf / e) : mid;
+    if (!std::isfinite(amp)) amp = 0.0f;
+    if (!std::isfinite(pitch)) pitch = mid;
 }
 
 }  // namespace Road

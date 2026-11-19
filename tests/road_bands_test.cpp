@@ -202,6 +202,48 @@ TEST(combine_stays_finite_and_never_negative_for_bad_input) {
     }
 }
 
+// ---------------------------------------------------------------- the three bands as one sine
+TEST(one_sine_carries_the_same_energy_as_the_three_bands) {
+    const float m[3] = {300.0f, 200.0f, 100.0f}, f[3] = {30.0f, 50.0f, 80.0f};
+    float a, p; Road::Consolidate(m, f, a, p);
+    CHECK(near(a * a, 300.0f * 300.0f + 200.0f * 200.0f + 100.0f * 100.0f, 1.0f));
+}
+TEST(the_single_pitch_sits_among_the_bands_and_leans_to_the_strongest) {
+    const float f[3] = {30.0f, 50.0f, 80.0f};
+    { const float m[3] = {300.0f, 100.0f, 50.0f}; float a, p; Road::Consolidate(m, f, a, p); CHECK(p > 30.0f && p < 50.0f); }
+    { const float m[3] = {50.0f, 100.0f, 300.0f}; float a, p; Road::Consolidate(m, f, a, p); CHECK(p > 50.0f && p < 80.0f); }
+    { const float m[3] = {200.0f, 200.0f, 200.0f}; float a, p; Road::Consolidate(m, f, a, p); CHECK(near(p, std::cbrt(30.0f * 50.0f * 80.0f), 0.05f)); }
+}
+TEST(a_single_active_band_comes_through_unchanged) {
+    const float f[3] = {30.0f, 50.0f, 80.0f};
+    for (int i = 0; i < 3; ++i) {
+        float m[3] = {0, 0, 0}; m[i] = 250.0f;
+        float a, p; Road::Consolidate(m, f, a, p);
+        CHECK(near(a, 250.0f, 0.01f) && near(p, f[i], 0.01f));
+    }
+}
+TEST(with_no_road_the_single_sine_is_silent_and_sits_at_the_middle_pitch) {
+    const float m[3] = {0, 0, 0}, f[3] = {30.0f, 50.0f, 80.0f};
+    float a, p; Road::Consolidate(m, f, a, p);
+    CHECK(a == 0.0f && near(p, 50.0f, 0.01f));
+}
+TEST(the_single_sine_is_never_stronger_than_the_bands_added_up_and_never_weaker_than_the_loudest) {
+    const float f[3] = {30.0f, 50.0f, 80.0f};
+    const float cases[][3] = {{300, 200, 100}, {100, 100, 100}, {1000, 0, 0}, {10, 400, 20}};
+    for (const auto& m : cases) {
+        float a, p; Road::Consolidate(m, f, a, p);
+        CHECK(a <= m[0] + m[1] + m[2] + 0.01f && a >= std::max(m[0], std::max(m[1], m[2])) - 0.01f);
+    }
+}
+TEST(the_single_sine_stays_finite_for_bad_input) {
+    const float bad[] = {NAN, -5.0f, INFINITY, 0.0f, 1e9f};
+    for (float x : bad) for (float y : bad) {
+        const float m[3] = {x, y, x}, f[3] = {y, x, y};
+        float a, p; Road::Consolidate(m, f, a, p);
+        CHECK(std::isfinite(a) && a >= 0.0f && std::isfinite(p) && p > 0.0f);
+    }
+}
+
 // ---------------------------------------------------------------- with the game's real grounds
 TEST(every_ground_in_the_game_gives_a_finite_plan_with_sensible_bands) {
     int n = 0;

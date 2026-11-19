@@ -92,6 +92,7 @@
 #include "IPlugin.h"
 #include "materials.hpp"      // ground material table, shared by the surface feel and the audio
 #include "audio_module.hpp"   // dynamic surface audio: only built in when FORCEFX_AUDIO is defined (off until the menu switch is turned on)
+#include "camera_module.hpp"  // head movement and windscreen effects: only built in when FORCEFX_CAMERA is defined
 #include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
 #include "tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slides (shared with the audio module)
 
@@ -108,6 +109,8 @@ constexpr int   kHardTotalMax = 5000;    // sum of all layer magnitudes (0..1000
 constexpr float kHardMinHz    = 12.0f;   // below this a vibration becomes a visible wheel swing
 constexpr float kHardMaxHz    = 120.0f;
 constexpr int   kMagDeadband  = 60;      // skip USB updates for changes smaller than this
+constexpr int   kMinUpdateGapMs = 15;    // an effect is updated at most this often (about every other 10 ms step), so the wheel has room for RBR's own force updates
+constexpr int   kPushMinForce = 300;     // RBR force magnitude (of 10000) below which the landing push is not added
 constexpr float kApplyPeriod  = 0.010f;  // seconds between effect updates (~100 Hz)
 
 inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -159,12 +162,17 @@ struct Config {
 
     // effect switches (menu): 1 = on, 0 = off
     int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandBoost = 1, fxSurface = 1;
+    int   roadViaRbr = 1;            // 1 = the road vibration is added to RBR's own force updates, so the wheel gets no extra road effect; 0 = one sine effect of its own
     int   probe = 0;                 // 1 = write ForceFX_probe.csv (ground ids and road signals ten times a second) for tuning surfaces; read at start only
 #ifdef FORCEFX_AUDIO
     int   fxAudio = 0;               // dynamic surface audio (settings in ForceFXAudio.ini); off until switched on
     float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in ForceFXAudio.ini)
     float audioImpact = 1.0f;        // 0..4 live multiplier on impacts and landings (on top of EventLevel)
     float audioSusp = 1.0f;          // 0..4 live multiplier on suspension creaks and bottoming out (on top of SqueakLevel / BottomOutLevel)
+#endif
+#ifdef FORCEFX_CAMERA
+    int   fxCamera = 1;              // head movement in the cockpit camera (settings in ForceFXCamera.ini)
+    int   fxWindscreen = 0;          // rain, snow and mud on the windscreen; off by default. Its hooks are installed at startup, so switching it on needs a restart
 #endif
 
     // per-layer ceilings (DirectInput units 0..10000), a combined ceiling, and one live level (userGain)
@@ -248,10 +256,13 @@ void ClampConfig(Config& c) {
     c.drivetrain = std::max((int)Tyre::FWD, std::min(c.drivetrain, (int)Tyre::AWD));
     c.wheelbase = clampf(c.wheelbase, 1.5f, 4.0f); c.trackWidth = clampf(c.trackWidth, 1.0f, 2.2f); c.cgToFront = clampf(c.cgToFront, 0.4f * c.wheelbase, 0.6f * c.wheelbase);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
-    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0;
+    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0; c.roadViaRbr = c.roadViaRbr ? 1 : 0;
 #ifdef FORCEFX_AUDIO
     c.fxAudio = c.fxAudio ? 1 : 0;
     c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f);
+#endif
+#ifdef FORCEFX_CAMERA
+    c.fxCamera = c.fxCamera ? 1 : 0; c.fxWindscreen = c.fxWindscreen ? 1 : 0;
 #endif
     c.landingBoost = clampf(c.landingBoost, 0.0f, 4.0f);
     c.landingAdd = clampf(c.landingAdd, 0.0f, 1.0f);
@@ -295,10 +306,13 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
     F("ImpactGain", c.impactGain);
     F("BrakeHzScale", c.brakeHzScale); F("PriorityDuck", c.priorityDuck);
-    I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("EnableBrake", c.fxBrake);
+    I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("RoadViaRbr", c.roadViaRbr); I("EnableBrake", c.fxBrake);
     I("SurfaceProbe", c.probe);
 #ifdef FORCEFX_AUDIO
     I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp);
+#endif
+#ifdef FORCEFX_CAMERA
+    I("EnableCamera", c.fxCamera); I("EnableWindscreen", c.fxWindscreen);
 #endif
     I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
@@ -555,7 +569,17 @@ void ApplyProfile(const Config& base, const CarProfile& p, Config& e) {
 // effect is multiplied by g_boostMul, plus a minimum extra push (g_boostAdd, a share of full torque) in the direction
 // RBR is already pushing. Our own effects are periodic, so they never go through this path.
 std::atomic<float> g_boostMul{1.0f}, g_boostAdd{0.0f};
+std::atomic<int>   g_fxUpdates{0};                              // effect updates sent to the wheel; the Diagnostics page shows them per second
 std::atomic<int>   g_rbrSeen{0}, g_rbrRaw{0}, g_rbrOut{0};      // for the diagnostics page: updates seen, last magnitude in and out
+// Road vibration through RBR's own force: the sine bands are computed here and added to the magnitude RBR sends, so the wheel
+// sees RBR's one constant-force effect and nothing extra for the road. RBR only updates its force every so often, so a small
+// thread (RoadVib, below) repeats the last force plus the vibration on that same effect a few hundred times a second.
+inline long long SteadyMs() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+std::atomic<IDirectInputEffect*> g_rbrFx{nullptr};              // RBR's constant-force effect, as last seen in SetParameters
+std::atomic<long long> g_rbrFxMs{0};                            // when RBR last updated it
+std::atomic<int>   g_rbrBase{0};                                // RBR's force after the landing boost, without the road vibration
+std::atomic<int>   g_vibNow{0}, g_vibSends{0};                  // the road vibration added right now; sends of it to the wheel (counted for the diagnostics page)
+std::atomic<bool>  g_vibOn{false};
 typedef HRESULT (WINAPI *PFN_SetParams)(IDirectInputEffect*, LPCDIEFFECT, DWORD);
 enum { VT_FX_SETPARAMETERS = 6 };
 
@@ -571,9 +595,11 @@ struct EffectTap {
             LONG out = raw;
             if (mul != 1.0f || add > 0.0f) {
                 float f = (float)raw * mul;
-                if (raw > 0) f += add * 10000.0f; else if (raw < 0) f -= add * 10000.0f;
+                if (raw > kPushMinForce) f += add * 10000.0f; else if (raw < -kPushMinForce) f -= add * 10000.0f;   // no push while RBR's force is about zero: its sign is noise there
                 out = (LONG)clampf(f, -10000.0f, 10000.0f);
             }
+            g_rbrBase = (int)out; g_rbrFx = self; g_rbrFxMs = SteadyMs();
+            if (g_vibOn.load()) out = (LONG)clampf((float)out + (float)g_vibNow.load(), -10000.0f, 10000.0f);
             g_rbrRaw = (int)raw; g_rbrOut = (int)out;
             if (out != raw) {
                 DICONSTANTFORCE cf{}; cf.lMagnitude = out;
@@ -600,6 +626,7 @@ struct EffectTap {
     }
     static bool Unpatch() {
         g_boostMul = 1.0f; g_boostAdd = 0.0f;
+        g_vibOn = false; g_vibNow = 0; g_rbrFx = nullptr;
         if (!vtbl) return true;
         bool clean = vtbl[VT_FX_SETPARAMETERS] == (void*)&HSetParameters;
         if (clean) {
@@ -615,6 +642,71 @@ struct EffectTap {
 };
 void** EffectTap::vtbl = nullptr;
 void*  EffectTap::orig = nullptr;
+
+namespace RoadVib {
+std::atomic<int>   g_mag[3];                                    // sine amplitude of each road band, wheel units (set by the worker thread)
+std::atomic<float> g_hz[3];
+std::atomic<bool>  g_run{false};
+std::thread        g_thread;
+constexpr int       kStreamMs = 3;                              // one send about every 3 ms
+constexpr long long kFreshMs  = 100;                            // RBR must have updated its force this recently, or we leave it alone
+
+// True while RBR is updating its force often enough for the road vibration to ride along on it.
+bool Ready() { return g_rbrFx.load() != nullptr && SteadyMs() - g_rbrFxMs.load() < kFreshMs; }
+
+// Changes only the magnitude of RBR's effect. Calls the original SetParameters, so our own send does not go through the hook.
+bool Send(IDirectInputEffect* fx, int magnitude) {
+    DICONSTANTFORCE cf{}; cf.lMagnitude = magnitude;
+    DIEFFECT e{}; e.dwSize = sizeof(DIEFFECT); e.cbTypeSpecificParams = sizeof(cf); e.lpvTypeSpecificParams = &cf;
+    HRESULT hr = E_FAIL;
+    __try { hr = ((PFN_SetParams)EffectTap::orig)(fx, &e, DIEP_TYPESPECIFICPARAMS | DIEP_NORESTART); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_rbrFx = nullptr; return false; }       // RBR released the effect
+    return SUCCEEDED(hr);
+}
+
+void Loop() {
+    typedef UINT (WINAPI *PFN_Period)(UINT);
+    HMODULE wm = LoadLibraryA("winmm.dll");                    // loaded by name so the build needs no extra library
+    PFN_Period begin = wm ? (PFN_Period)GetProcAddress(wm, "timeBeginPeriod") : nullptr;
+    PFN_Period end   = wm ? (PFN_Period)GetProcAddress(wm, "timeEndPeriod") : nullptr;
+    if (begin) begin(1);                                        // 1 ms timer, otherwise Sleep(3) would take 15 ms
+    float ph[3] = {0.0f, 0.0f, 0.0f};
+    auto last = Clock::now();
+    int lastSent = 0;
+    while (g_run.load()) {
+        Sleep(g_vibOn.load() ? kStreamMs : 10);                 // idle most of the time: nothing to send while the road is off
+        const auto now = Clock::now();
+        const float dt = clampf(std::chrono::duration<float>(now - last).count(), 0.0005f, 0.03f);
+        last = now;
+        IDirectInputEffect* fx = g_rbrFx.load();
+        if (!g_vibOn.load() || !fx || !Ready()) {
+            g_vibNow = 0;
+            if (lastSent != 0 && fx && Ready() && Send(fx, g_rbrBase.load())) g_vibSends++;   // take the vibration off RBR's force again
+            lastSent = 0;
+            continue;
+        }
+        float v = 0.0f;
+        for (int b = 0; b < 3; ++b) {
+            const float f = clampf(g_hz[b].load(), 0.0f, 200.0f), m = (float)g_mag[b].load();
+            ph[b] = std::fmod(ph[b] + 6.2831853f * f * dt, 6.2831853f);
+            v += m * std::sin(ph[b]);
+        }
+        // If RBR stops updating its force (menu, stage end), fade the vibration out before we stop sending, so the effect is never left
+        // sitting at an arbitrary point of a vibration cycle.
+        const long long age = SteadyMs() - g_rbrFxMs.load();
+        if (age > kFreshMs / 2) v *= clampf((float)(kFreshMs - age) / (float)(kFreshMs / 2), 0.0f, 1.0f);
+        const int vib = (int)std::lround(clampf(v, -10000.0f, 10000.0f));
+        g_vibNow = vib;
+        if (vib == 0 && lastSent == 0) continue;
+        if (Send(fx, (int)clampf((float)g_rbrBase.load() + (float)vib, -10000.0f, 10000.0f))) { g_vibSends++; lastSent = vib; }
+    }
+    g_vibNow = 0;
+    if (end) end(1);
+}
+
+void Start() { if (g_run.exchange(true)) return; g_thread = std::thread(Loop); }
+void Stop()  { g_run = false; if (g_thread.joinable()) g_thread.join(); g_vibOn = false; g_vibNow = 0; }
+}  // namespace RoadVib
 
 // -------------------------------------------------- tap on RBR's own device
 // IDirectInputDevice8 vtable slots
@@ -836,6 +928,8 @@ Slot g_ring[kRing];
 std::atomic<uint32_t> g_head{0}, g_tail{0};
 std::atomic<bool>     g_spin{false};          // only matters if NGP ever sends from more than one thread
 std::atomic<bool>     g_consume{false};       // true while the worker thread wants packets
+typedef void (*Sink)(const uint8_t*, int);
+std::atomic<Sink>     g_sink{nullptr};        // gets every packet as NGP sends it, whether or not the worker thread is running (the camera module)
 std::atomic<int>      g_minLen{664};
 std::atomic<unsigned long long> g_destKey{0};
 std::atomic<DWORD>    g_destSeen{0};
@@ -863,6 +957,7 @@ void Offer(const uint8_t* data, int len, uint32_t ipNet, uint16_t portNet) {
     }
     if (locked != key) { g_otherDest++; return; }
     g_destSeen.store(nowMs);
+    if (Sink sink = g_sink.load(std::memory_order_acquire)) sink(data, len);
     if (!g_consume.load()) return;
 
     while (g_spin.exchange(true, std::memory_order_acquire)) {}
@@ -889,6 +984,7 @@ bool Pop(Slot& out) {
     return true;
 }
 
+void SetSink(Sink s) { g_sink.store(s, std::memory_order_release); }
 void Activate()   { g_tail.store(g_head.load()); g_consume.store(true); }    // starts with an empty queue
 void Deactivate() { g_consume.store(false); }
 
@@ -1152,8 +1248,12 @@ BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
     return DIENUM_CONTINUE;
 }
 
-enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD1, S_ROAD2, S_ROAD3, S_BRAKE, S_COUNT };   // the three road slots are sine effects, one per band of the road spectrum, low to high (road_bands.hpp)
-const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-low", "road-mid", "road-high", "brake"};
+// The road is computed as three bands, low to high (road_bands.hpp), so the synth keeps three road slots. Only S_ROAD2 is ever a wheel
+// effect: when the road is played as an effect of its own, the three bands are merged into that one sine (Road::Consolidate). Normally
+// the bands are added to RBR's own force instead and the wheel gets no road effect at all.
+enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD1, S_ROAD2, S_ROAD3, S_BRAKE, S_COUNT };
+const bool kSlotIsEffect[S_COUNT] = {true, true, false, true, false, true};
+const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-low", "road", "road-high", "brake"};
 
 class FFLayer {
 public:
@@ -1175,7 +1275,10 @@ public:
         const GUID* guids[S_COUNT] = { &GUID_Sine, &GUID_Sine, &GUID_Sine, &GUID_Sine, &GUID_Sine, &GUID_Sine };
         HRESULT firstErr = DI_OK;
         int ok = 0;
+        int wanted = 0;
         for (int i = 0; i < S_COUNT; ++i) {
+            if (!kSlotIsEffect[i]) continue;                  // the road bands that only exist inside the synth
+            ++wanted;
             HRESULT hr = Make(i, *guids[i]);
             if (SUCCEEDED(hr)) { ++ok; m_fx[i]->Start(1, 0); }
             else {
@@ -1187,7 +1290,7 @@ public:
         m_fail = 0;
         if (!ok) { Destroy(); return firstErr; }
         for (int i = 0; i < S_COUNT; ++i) if (m_fx[i]) { EffectTap::Patch(*reinterpret_cast<void***>(m_fx[i])); break; }   // RBR's effects share this class
-        Logf("Effects created: %d of %d", ok, (int)S_COUNT);
+        Logf("Effects created: %d of %d", ok, wanted);
         return DI_OK;
     }
 
@@ -1224,6 +1327,7 @@ private:
     IDirectInputEffect* m_fx[S_COUNT] = {};
     int m_lastMag[S_COUNT];
     DWORD m_lastPer[S_COUNT];
+    Clock::time_point m_lastT[S_COUNT];
     DWORD m_axisId = 0;
     int m_fail = 0;
     HRESULT m_lastHr = DI_OK;
@@ -1253,11 +1357,14 @@ private:
         const bool perChanged = m_lastPer[slot] == 0 ||
             (period > m_lastPer[slot] ? period - m_lastPer[slot] : m_lastPer[slot] - period) * 100 > m_lastPer[slot] * 2;
         if (!magChanged && !perChanged) return DI_OK;
+        if (mag == 0 && m_lastMag[slot] == 0) return DI_OK;                         // silent and staying silent: a pitch change is nothing to send
+        const auto now = Clock::now();
+        if (mag != 0 && now - m_lastT[slot] < std::chrono::milliseconds(kMinUpdateGapMs)) return DI_OK;   // silencing an effect is never held back
         DIPERIODIC p{};
         p.dwMagnitude = (DWORD)mag; p.lOffset = 0; p.dwPhase = 0; p.dwPeriod = period;
         e.cbTypeSpecificParams = sizeof(p); e.lpvTypeSpecificParams = &p;
         HRESULT hr = m_fx[slot]->SetParameters(&e, DIEP_TYPESPECIFICPARAMS | DIEP_NORESTART);
-        if (SUCCEEDED(hr)) { m_lastMag[slot] = mag; m_lastPer[slot] = period; }
+        if (SUCCEEDED(hr)) { m_lastMag[slot] = mag; m_lastPer[slot] = period; m_lastT[slot] = now; g_fxUpdates++; }
         return hr;
     }
 };
@@ -1575,7 +1682,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 // same Surf namespace.
 #include "surface_feel.hpp"
 #include "road_feel.hpp"   // how the ground and what the car is doing shape the road vibration
-#include "road_bands.hpp"  // the road vibration as three sine effects: pitch from speed, strength spread by the ground
+#include "road_bands.hpp"  // the road vibration as three sine bands: pitch from speed, strength spread by the ground
 namespace Surf {
 float g_fade = 0.25f;                // seconds to cross-fade between two surfaces
 int   g_cobbleDetect = 1;            // 1 = hard ground that shakes in a regular pattern gets the cobble feel (detected from the telemetry)
@@ -1596,6 +1703,7 @@ struct Synth {
     float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
     float jAge = 5.0f, evAmp = 0.0f;                       // age and severity of the current landing event
     unsigned seenEvt = 0;
+    float evBusy = 0.0f, evGov = 1.0f;                     // how many landings and hits came lately, and how much the current one is held back because of them
     float boostMul = 1.0f, boostAdd = 0.0f;                // landing boost for RBR's own force (the worker thread hands it to the hook)
     float bandHzJit[Road::kBands] = {1.0f, 1.0f, 1.0f}, bandAmpJit[2][Road::kBands] = {{1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}};   // random pitch per band, random strength per side and band
     float engJit = 1.0f, engHzJit = 1.0f, unevPhase = 0;
@@ -1640,10 +1748,10 @@ struct Synth {
                        + 0.55f * grit * (0.6f + 0.4f * thrSm);
         float t2 = s.rpm > 200 ? c.engineMaxMag * 0.8f * clamp01(A2 * c.lumpScale) * engAir : 0.0f;
 
-        // ---------------- ROAD: three sine effects, each carrying one band (low, mid, high) of the road's spectrum. The pitch of
-        // each band follows the car's speed, the ground under each side decides how the strength is spread over the bands, and
-        // the tyre's contact patch takes the high bands away at low speed (road_bands.hpp). Sine effects are zero-mean, so they
-        // never shift RBR's own force, and the two sides add as energy, so they can not cancel each other.
+        // ---------------- ROAD: three sine bands (low, mid, high) of the road's spectrum. The pitch of each band follows the car's
+        // speed, the ground under each side decides how the strength is spread over the bands, and the tyre's contact patch takes
+        // the high bands away at low speed (road_bands.hpp). The sines are zero-mean, so they never shift RBR's own force, and the
+        // two sides add as energy, so they can not cancel each other. How the bands reach the wheel is decided in the worker loop.
         const float spN = clamp01(s.speed / c.maxSpeed);
         const float gSpd = smooth01(1.0f, 10.0f, s.speed);
 
@@ -1744,8 +1852,12 @@ struct Synth {
 
         // ---------------- LANDING: no effect of its own. A detected landing boosts RBR's own steering force (see EffectTap):
         // a fast attack, a short hold, then a decay, scaled by how severe the landing was and by the live level.
-        if (s.evtSeq != seenEvt) { seenEvt = s.evtSeq; jAge = 0.0f; evAmp = s.evtSev; }
-        if (jAge < 0.08f) evAmp = std::max(evAmp, s.evtSev);                         // the detector keeps refining a landing for its first ~100 ms
+        // A jump is rare, rough ground is not: bumps and washboard fire hit events one after another, and boosting RBR's force for each
+        // of them makes the wheel heavy to turn. So the more events came in the last second or two, the less a new one counts. A single
+        // jump is not held back at all; a second hit soon after is, and on rough ground the boost fades to almost nothing.
+        evBusy *= (float)std::exp(-dt / 1.5f);
+        if (s.evtSeq != seenEvt) { seenEvt = s.evtSeq; jAge = 0.0f; evGov = 1.0f / (1.0f + 1.2f * evBusy); evBusy += 1.0f; evAmp = s.evtSev * evGov; }
+        if (jAge < 0.08f) evAmp = std::max(evAmp, s.evtSev * evGov);                 // the detector keeps refining a landing for its first ~100 ms
         jAge = std::min(jAge + dt, 5.0f);
         {
             const float ts = std::sqrt(wf);                                           // a heavier car holds the boost longer
@@ -2220,6 +2332,8 @@ private:
     std::atomic<float> m_userGain{1.0f};   // live level 0..1, changed by the hotkeys and the menu
     std::atomic<bool>  m_muted{false};
     std::atomic<float> m_dBoostMul{1.0f}, m_dBoostAdd{0.0f};   // current landing boost on RBR's force (shown in the menu)
+    std::atomic<int>   m_dUpd{0}, m_dVib{0};   // effect updates sent to the wheel in the last second, and sends of the road vibration on RBR's force (shown in the menu)
+    std::atomic<bool>  m_dViaRbr{false};   // the road is riding on RBR's force right now
     std::atomic<float> m_dHeat{1.0f};      // shown in the menu: 1 = no derating
     std::atomic<int>   m_dCar{-1};
     std::atomic<int>   m_cfgRev{0};         // bumped by the menu whenever m_cfg changes
@@ -2229,6 +2343,9 @@ private:
     FILE*              m_probe = nullptr;   // ForceFX_probe.csv, only while SurfaceProbe=1
     std::chrono::steady_clock::time_point m_probeT{};
     ffx::Audio         m_audio;            // sounds for the ground under each tyre; off until the menu switch is on (empty stand-in without FORCEFX_AUDIO)
+    ffx::Camera        m_camera;           // head movement and windscreen effects (empty stand-in without FORCEFX_CAMERA)
+    static ffx::Camera*& CameraSlot() { static ffx::Camera* p = nullptr; return p; }
+    static void CameraSink(const uint8_t* d, int n) { if (ffx::Camera* c = CameraSlot()) c->feed(d, n); }   // called from NGP's send, so it works without a wheel connected
     std::atomic<bool>  m_carRescan{false};
     std::string m_carName, m_carPreset;    // guarded by m_mtx
     std::mutex m_mtx;
@@ -2377,8 +2494,10 @@ private:
 
     // ------------------------------------------------------------ main loop
     void Loop() {
+        RoadVib::Start();                      // the road vibration thread lives exactly as long as this one, whichever way it ends
         try { LoopImpl(); }
         catch (...) { Logf("The worker thread hit an exception; effects released"); m_ffActive = false; }
+        RoadVib::Stop();
     }
 
     void LoopImpl() {
@@ -2438,7 +2557,7 @@ private:
         auto lastRx = t0 - std::chrono::seconds(10);
         bool cobOn = false; int cobLogs = 0;     // cobble detection state, for the log
         bool audioQuiet = false;               // the audio has been told that telemetry stopped
-        auto lastPkt = t0, lastApply = t0, nextTry = t0, tapLastRx = t0 - std::chrono::seconds(10), nextRescan = t0;
+        auto lastPkt = t0, lastApply = t0, nextTry = t0, tapLastRx = t0 - std::chrono::seconds(10), nextRescan = t0, nextUpdCount = t0 + std::chrono::seconds(1);
 
         // Which car is this? The name comes from RSF / RBR (see ResolveCarIdentity). We keep polling rather than relying on
         // a few events, because the car is changed in the menus where no telemetry flows, and RSF may write its files a
@@ -2488,6 +2607,7 @@ private:
             }
             ParsePacket(eff, data, n, live, dsp, pdt);
             m_audio.feed(data, n, std::chrono::duration<double>(ts.time_since_epoch()).count());
+            if (source == 2) m_camera.feed(data, n);              // packets from the send hook already went to the camera
             if (live.carIndex >= 0 && live.carIndex != curSlot) { curSlot = live.carIndex; carForce = true; }
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
@@ -2601,6 +2721,7 @@ private:
             // Landing boost: EffectTap applies it to RBR's own constant-force updates (not in test mode, where RBR sends no force)
             g_boostMul = m_test ? 1.0f : synth.boostMul; g_boostAdd = m_test ? 0.0f : synth.boostAdd;
             m_dBoostMul = synth.boostMul; m_dBoostAdd = synth.boostAdd;
+            if (now >= nextUpdCount) { nextUpdCount = now + std::chrono::seconds(1); m_dUpd = g_fxUpdates.exchange(0); m_dVib = g_vibSends.exchange(0); }
             m_dHeat = synth.heat > base.sustainedLimit ? std::sqrt(base.sustainedLimit / synth.heat) : 1.0f;
             DWORD per[S_COUNT];
             for (int i = 0; i < S_COUNT; ++i) {
@@ -2608,6 +2729,22 @@ private:
                 m_mag[i] = (float)mag[i]; m_hz[i] = hz[i];
                 per[i] = (DWORD)(1000000.0f / hz[i]);
             }
+            // Road vibration through RBR's own force: hand the three bands to the vibration thread and keep them off the wheel's own
+            // effects. Without RBR's constant-force updates (no hook yet, test mode, menus), or when switched off in the settings,
+            // the road is merged into one sine effect of its own.
+            const bool viaRbr = eff.roadViaRbr != 0 && RoadVib::Ready();
+            if (viaRbr) {
+                for (int b = 0; b < Road::kBands; ++b) { RoadVib::g_mag[b] = mag[S_ROAD1 + b]; RoadVib::g_hz[b] = hz[S_ROAD1 + b]; mag[S_ROAD1 + b] = 0; }
+            } else {                                          // the road as one effect of its own: all three bands merged into one sine
+                float bm[Road::kBands], bh[Road::kBands], amp, pitch;
+                for (int b = 0; b < Road::kBands; ++b) { bm[b] = (float)mag[S_ROAD1 + b]; bh[b] = hz[S_ROAD1 + b]; mag[S_ROAD1 + b] = 0; }
+                Road::Consolidate(bm, bh, amp, pitch);
+                mag[S_ROAD2] = (int)std::lround(clampf(amp, 0.0f, 10000.0f));
+                hz[S_ROAD2] = clampf(pitch, kHardMinHz, kHardMaxHz);
+                per[S_ROAD2] = (DWORD)(1000000.0f / hz[S_ROAD2]);
+            }
+            RoadVib::g_vibOn = viaRbr;
+            m_dViaRbr = viaRbr;
 
             // ------------------------------------------------ send to the wheel
             if (!ff.Ready()) {
@@ -2694,9 +2831,14 @@ private:
             {"Audio: impact / landing level",    "AudioImpactLevel",   nullptr, &Config::audioImpact, 0.0f,   4.0f, 0.1f,  'x', false},
             {"Audio: suspension level",          "AudioSuspensionLevel", nullptr, &Config::audioSusp, 0.0f,   4.0f, 0.1f,  'x', false},
 #endif
+#ifdef FORCEFX_CAMERA
+            {"Camera movement",                  "EnableCamera",       &Config::fxCamera,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
+            {"Windscreen effects (restart)",     "EnableWindscreen",   &Config::fxWindscreen, nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
+#endif
             // effect switches (turn effects off to feel the others on their own)
             {"Effect: Engine",                   "EnableEngine",       &Config::fxEngine,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Road feel",                "EnableRoad",         &Config::fxRoad,       nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
+            {"Road feel delivery",               "RoadViaRbr",         &Config::roadViaRbr,   nullptr,  0.0f,   1.0f, 1.0f, 'r', false},
             {"Effect: Surface feel",             "EnableSurfaceFeel",  &Config::fxSurface,    nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Braking",                  "EnableBrake",        &Config::fxBrake,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Landing boost",            "EnableLandingBoost", &Config::fxLandBoost,  nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
@@ -2731,8 +2873,17 @@ private:
             case '%': snprintf(out, n, "%.0f%%", v * 100.0f); break;
             case 'H': snprintf(out, n, "%.0f Hz", v); break;
             case 'o': snprintf(out, n, "%s", v >= 0.5f ? "ON" : "OFF"); break;
+            case 'r': snprintf(out, n, "%s", v >= 0.5f ? "Through RBR's force" : "Own effect"); break;
             default:  snprintf(out, n, "x%.2f", v); break;
         }
+    }
+
+    // The camera works with or without a wheel connected, so its switches are applied here and not in the telemetry loop.
+    void ApplyCameraSwitches() {
+#ifdef FORCEFX_CAMERA
+        m_camera.setActive(m_cfg.fxCamera != 0);
+        m_camera.setWindscreen(m_cfg.fxWindscreen != 0);
+#endif
     }
 
     void SaveRow(const MenuRow& r) {
@@ -2754,6 +2905,7 @@ private:
             ClampConfig(m_cfg);
         }
         m_cfgRev++;
+        ApplyCameraSwitches();
         for (size_t i = 0; i < m_rows.size(); ++i)
             if (RowValue(m_rows[i]) != before[i]) SaveRow(m_rows[i]);
         Logf("Menu: %s -> %g", r.key, (double)RowValue(r));
@@ -2770,6 +2922,7 @@ private:
             ClampConfig(m_cfg);
         }
         m_cfgRev++;
+        ApplyCameraSwitches();
         for (const MenuRow& r : m_rows) SaveRow(r);
         Logf("Menu: switches, gains and frequencies reset to the defaults");
     }
@@ -2791,8 +2944,13 @@ private:
             {"AudioImpactLevel",   "How loud bump impacts and landings are, on top of EventLevel in ForceFXAudio.ini."},
             {"AudioSuspensionLevel", "How loud suspension creaks and bottoming-out thumps are, on top of SqueakLevel and BottomOutLevel in ForceFXAudio.ini."},
 #endif
+#ifdef FORCEFX_CAMERA
+            {"EnableCamera",       "Moves your head in the cockpit view with the car: leaning into braking and corners, nodding, bouncing over bumps and shaking on crashes and landings. Strength and everything else is in ForceFXCamera.ini (Intensity is the main one). Changes apply at once."},
+            {"EnableWindscreen",   "Rain, snow and mud on the windscreen of the cockpit view, with wipers. It is off by default and is read at startup, so after switching it on restart RBR. Settings are in the [Windscreen] section of ForceFXCamera.ini."},
+#endif
             {"EnableEngine",       "Turns the engine vibration on or off. Handy for feeling what each effect does on its own."},
             {"EnableRoad",         "Turns the road feel (texture, bumps and ground) on or off."},
+            {"RoadViaRbr",         "How the road vibration reaches the wheel. Through RBR's force: it is added to RBR's own steering force, so the wheel gets no extra road effect. Own effect: the road is one sine effect of its own, less detailed but easy on the wheel. If the road makes the wheel feel heavy or sticky to turn, use Through RBR's force; it may need a higher road gain. Without RBR's force updates it falls back to the own effect by itself."},
             {"EnableBrake",        "Turns the braking judder and front-wheel lock-up shake on or off."},
             {"EnableSurfaceFeel",  "Lets the ground under each tyre shape the road feel, together with how fast the car goes and how much the wheels slip: loose ground is grainy and throws stones, soft ground is dull, slippery hard ground is quiet with sharp cracks, cobbles hammer in time with your speed. Needs the road feel effect. Off, the road feels the same on every surface."},
             {"EnableLandingBoost", "Turns the landing boost on or off. With it off, landings feel exactly as RBR sends them."},
@@ -2857,6 +3015,9 @@ private:
 #ifdef FORCEFX_AUDIO
         line(m_audio.status().c_str());
 #endif
+#ifdef FORCEFX_CAMERA
+        line(m_camera.status().c_str());
+#endif
         { char cb[160]; snprintf(cb, sizeof(cb), "Cobble detection: %s, roughness per speed %.2f (blend starts %.1f, full at %.1f), cobble feel %d%%",
                                  Surf::g_cobbleDetect ? "on" : "off", (double)m_cobLevel.load(), (double)Surf::g_cobbleLo, (double)Surf::g_cobbleHi, (int)(m_cobScore.load() * 100.0f + 0.5f));
           line(cb); }
@@ -2915,10 +3076,24 @@ public:
             h.log = [](const std::string& s) { Logf("%s", s.c_str()); };
             m_audio.configure(g_dir, h);
         }
+        {
+            ffx::Camera::Hooks h;
+            h.log = [](const std::string& s) { Logf("%s", s.c_str()); };
+#ifdef FORCEFX_CAMERA
+            Logf("Build: with camera module");
+            m_camera.configure(g_dir, h, m_cfg.fxCamera != 0, m_cfg.fxWindscreen != 0);
+#else
+            Logf("Build: without camera module");
+#endif
+        }
 
         if (m_cfg.telemetrySource != 2) {
             const bool ok = PacketTap::Install(m_cfg.minPacket);
             Logf("Telemetry hook: %s (%s)", ok ? "installed" : "not available", PacketTap::Describe().c_str());
+#ifdef FORCEFX_CAMERA
+            CameraSlot() = &m_camera;
+            PacketTap::SetSink(&ForceFXPlugin::CameraSink);
+#endif
         }
 
         BuildRows();
@@ -2956,8 +3131,10 @@ public:
 
     ~ForceFXPlugin() {
         if (m_probe) { fclose(m_probe); m_probe = nullptr; }
+        PacketTap::SetSink(nullptr);       // no more packets for the camera
         Disconnect();                      // stops the telemetry thread, the only one that feeds the audio
         m_audio.shutdown();
+        m_camera.shutdown();
         Surf::Stop();
         GameDeviceTap::I().Remove();       // put the original vtable entries back before our DLL goes away
         if (!PacketTap::Remove()) {
@@ -3012,7 +3189,10 @@ public:
                  m_mag[S_ENG1].load(), m_hz[S_ENG1].load(), m_mag[S_ENG2].load(),
                  m_mag[S_ROAD1].load(), m_mag[S_ROAD2].load(), m_mag[S_ROAD3].load(), m_mag[S_BRAKE].load(), m_hz[S_BRAKE].load());
         line(buf);
-        snprintf(buf, sizeof(buf), "landing boost on RBR's force: x%.2f  +%.0f", m_dBoostMul.load(), m_dBoostAdd.load() * 10000.0f);
+        snprintf(buf, sizeof(buf), "landing boost on RBR's force: x%.2f  +%.0f     effect updates to the wheel: %d/s", m_dBoostMul.load(), m_dBoostAdd.load() * 10000.0f, m_dUpd.load());
+        line(buf);
+        if (m_dViaRbr.load()) snprintf(buf, sizeof(buf), "road: through RBR's force, %d sends/s (RBR updates seen: %d)", m_dVib.load(), g_rbrSeen.load());
+        else snprintf(buf, sizeof(buf), "road: one wheel effect of its own%s", m_cfg.roadViaRbr ? " (waiting for RBR's force updates)" : "");
         line(buf);
         y += 6.0f;
 
@@ -3107,7 +3287,7 @@ public:
     }
 
     void TickFrontEndPage(float) override {}
-    void StageStarted(int, const char*, bool) override { m_stageReset = true; m_carRescan = true; Surf::OnStage(); }
+    void StageStarted(int iMap, const char*, bool) override { m_stageReset = true; m_carRescan = true; Surf::OnStage(); m_camera.stageStarted(iMap); }
     void HandleResults(float, float, float, const char*) override {}
     void CheckPoint(float, int, const char*) override {}
 };
