@@ -2743,7 +2743,7 @@ private:
                 hz[S_ROAD2] = clampf(pitch, kHardMinHz, kHardMaxHz);
                 per[S_ROAD2] = (DWORD)(1000000.0f / hz[S_ROAD2]);
             }
-            RoadVib::g_vibOn = viaRbr;
+            g_vibOn = viaRbr;
             m_dViaRbr = viaRbr;
 
             // ------------------------------------------------ send to the wheel
