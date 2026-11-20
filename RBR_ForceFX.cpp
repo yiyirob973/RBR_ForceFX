@@ -101,6 +101,7 @@
 #pragma comment(lib, "dxguid.lib")
 
 namespace {
+#include "road_guard.hpp"   // keeps the road vibration from pushing or pulling the wheel (low cut, headroom, ceiling)
 
 typedef std::chrono::steady_clock Clock;
 
@@ -176,7 +177,7 @@ struct Config {
 #endif
 
     // per-layer ceilings (DirectInput units 0..10000), a combined ceiling, and one live level (userGain)
-    int   engineMaxMag = 1200, roadMaxMag = 3000, brakeMaxMag = 2000;
+    int   engineMaxMag = 1200, roadMaxMag = 500, brakeMaxMag = 2000;
     int   totalMaxMag = 4000;        // all layers together are scaled down to this (never above kHardTotalMax)
     float priorityDuck = 0.85f;      // 0..1: how far lower layers back off while a higher one is active (landing > road > engine)
     float sustainedLimit = 0.10f;    // thermal derate: long-term mean-square level (0.10 is roughly 32% RMS)
@@ -232,7 +233,7 @@ struct Config {
     float rpmScale = 1.0f;
 
     // live level and hotkeys (polled while RBR is the foreground window). Keys are VK codes, 0 = disabled.
-    float userGain = 1.0f;           // saved live level 0..1 (it can only turn things down)
+    float userGain = 0.85f;          // saved live level 0..1 (it can only turn things down)
     float gainRatio = 0.85f;         // each key press multiplies or divides the level by this (about 1.4 dB per step)
     int   keyGainUp = 0x6B, keyGainDown = 0x6D, keyMute = 0x6A;   // Numpad + / - / *
     int   keyModifier = 0;           // 0 = no modifier (0x11 = Ctrl)
@@ -599,7 +600,7 @@ struct EffectTap {
                 out = (LONG)clampf(f, -10000.0f, 10000.0f);
             }
             g_rbrBase = (int)out; g_rbrFx = self; g_rbrFxMs = SteadyMs();
-            if (g_vibOn.load()) out = (LONG)clampf((float)out + (float)g_vibNow.load(), -10000.0f, 10000.0f);
+            if (g_vibOn.load()) out = (LONG)clampf((float)out + (float)Road::FitHeadroom((int)out, g_vibNow.load()), -10000.0f, 10000.0f);
             g_rbrRaw = (int)raw; g_rbrOut = (int)out;
             if (out != raw) {
                 DICONSTANTFORCE cf{}; cf.lMagnitude = out;
@@ -671,6 +672,7 @@ void Loop() {
     PFN_Period end   = wm ? (PFN_Period)GetProcAddress(wm, "timeEndPeriod") : nullptr;
     if (begin) begin(1);                                        // 1 ms timer, otherwise Sleep(3) would take 15 ms
     float ph[3] = {0.0f, 0.0f, 0.0f};
+    Road::LowCut lowCut;
     auto last = Clock::now();
     int lastSent = 0;
     while (g_run.load()) {
@@ -680,7 +682,7 @@ void Loop() {
         last = now;
         IDirectInputEffect* fx = g_rbrFx.load();
         if (!g_vibOn.load() || !fx || !Ready()) {
-            g_vibNow = 0;
+            g_vibNow = 0; lowCut.Reset();
             if (lastSent != 0 && fx && Ready() && Send(fx, g_rbrBase.load())) g_vibSends++;   // take the vibration off RBR's force again
             lastSent = 0;
             continue;
@@ -695,10 +697,12 @@ void Loop() {
         // sitting at an arbitrary point of a vibration cycle.
         const long long age = SteadyMs() - g_rbrFxMs.load();
         if (age > kFreshMs / 2) v *= clampf((float)(kFreshMs - age) / (float)(kFreshMs / 2), 0.0f, 1.0f);
-        const int vib = (int)std::lround(clampf(v, -10000.0f, 10000.0f));
+        v = lowCut.Step(v, dt);                                 // no slow push, only vibration
+        const int base = g_rbrBase.load();
+        const int vib = Road::FitHeadroom(base, (int)std::lround(clampf(v, -10000.0f, 10000.0f)));   // never cut off one side of the vibration
         g_vibNow = vib;
         if (vib == 0 && lastSent == 0) continue;
-        if (Send(fx, (int)clampf((float)g_rbrBase.load() + (float)vib, -10000.0f, 10000.0f))) { g_vibSends++; lastSent = vib; }
+        if (Send(fx, (int)clampf((float)base + (float)vib, -10000.0f, 10000.0f))) { g_vibSends++; lastSent = vib; }
     }
     g_vibNow = 0;
     if (end) end(1);
@@ -1838,6 +1842,7 @@ struct Synth {
         }
         float roadTarget[Road::kBands];
         Road::Combine(rside, plan.share, bandAmpJit, roadTarget);
+        { const float cs = Road::CeilingScale(roadTarget, (float)c.roadMaxMag); for (int b = 0; b < Road::kBands; ++b) roadTarget[b] *= cs; }   // very rough ground can not make the road grow without limit
         for (int b = 0; b < Road::kBands; ++b)
             hz[S_ROAD1 + b] = clampf(plan.hz[b] * bandHzJit[b] / std::sqrt(wf), 20.0f, kHardMaxHz);   // heavier cars sound lower
 
@@ -2329,7 +2334,7 @@ private:
     std::atomic<float> m_dRpm{0}, m_dSpeed{0}, m_dThr{0}, m_dBrk{0}, m_dTex{0}, m_dRough{0}, m_dBump{0},
                        m_dDive{0}, m_dLock{0};
     std::atomic<bool> m_ffActive{false};
-    std::atomic<float> m_userGain{1.0f};   // live level 0..1, changed by the hotkeys and the menu
+    std::atomic<float> m_userGain{0.85f};   // live level 0..1, changed by the hotkeys and the menu
     std::atomic<bool>  m_muted{false};
     std::atomic<float> m_dBoostMul{1.0f}, m_dBoostAdd{0.0f};   // current landing boost on RBR's force (shown in the menu)
     std::atomic<int>   m_dUpd{0}, m_dVib{0};   // effect updates sent to the wheel in the last second, and sends of the road vibration on RBR's force (shown in the menu)
