@@ -59,6 +59,7 @@
 #include "../thirdparty/minhook/include/MinHook.h"
 #include "../materials.hpp"
 #include "ws_logic.hpp"
+#include "ws_art.hpp"
 
 namespace ffx {
 namespace cam {
@@ -92,11 +93,11 @@ struct Cfg {
     float maxPos = 0.025f, maxAng = 3.0f, maxRoll = 3.0f;
     // [Windscreen]  proof-of-concept overlay
     int   wsRainSource = 1, wsProbe = 0, wsWetFromGame = 0, wsDrawAt = 1, wsDepthTest = 1, wsEnable = 0, wsMode = 3, wsDrops = 200, wsMud = 16, wsSignSway = 1, wsSignSurge = 1, wsToggleKey = 119,
-          wsWiperSource = 1, wsWiperAxis = 0, wsWiperAxisSign = 1, wsHideGameWipers = 0, wsWiperDraw = 0, wsMicro = 3500, wsPools = 1, wsHideGameFx = 1, wsRefraction = 1, wsSnowMax = 140, wsMudSmear = 1, wsWipers = 0, wsWiperAuto = 1, wsWiperDebug = 0, wsWiperSyncKey = 118, wsFly = 1, wsWiperBow = 1, wsWiperBlur = 1, wsGround = 1, wsWiperMeasure = 1;
-    float wsRainLight = 0.45f, wsRainHeavy = 1.0f, wsMudDry = 0.15f, wsMudDamp = 0.7f, wsMudWet = 1.0f, wsSpeedRef = 120.f, wsRainLevel = 0.7f, wsRoughRef = 0.25f, wsRain = 20.f, wsMudRate = 6.f, wsTrail = 5.f, wsGlassDist = 0.9f, wsDropSize = 1.0f, wsMudSize = 1.0f, wsOpacity = 1.0f, wsWind = 1.0f, wsGravity = 1.0f,
-          wsWiperLenM = 0.5f, wsMicroRate = 200.f, wsVeil = 0.8f, wsPoolMinPx = 8.f, wsRefractK = 2.0f, wsRefractMinPx = 4.0f, wsSnowLight = 0.5f, wsSnowHeavy = 1.0f, wsSnowLevel = 0.f, wsSnowRate = 18.f, wsSnowMelt = 14.f, wsSnowSize = 1.0f, wsMudSnow = 0.6f,
+          wsWiperSource = 1, wsWiperAxis = 0, wsWiperAxisSign = 1, wsHideGameWipers = 0, wsWiperDraw = 0, wsMicro = 3500, wsPools = 0, wsHideGameFx = 1, wsRefraction = 1, wsSnowMax = 140, wsMudSmear = 1, wsWipers = 0, wsWiperAuto = 1, wsWiperDebug = 0, wsWiperSyncKey = 118, wsFly = 1, wsWiperBow = 1, wsWiperBlur = 1, wsGround = 1, wsWiperMeasure = 1;
+    float wsRainLight = 0.45f, wsRainHeavy = 1.0f, wsMudDry = 0.15f, wsMudDamp = 0.7f, wsMudWet = 1.0f, wsSpeedRef = 120.f, wsRainLevel = 0.7f, wsRoughRef = 0.25f, wsRain = 20.f, wsMudRate = 6.f, wsTrail = 3.f, wsGlassDist = 0.9f, wsDropSize = 1.0f, wsMudSize = 1.0f, wsOpacity = 1.0f, wsWind = 1.0f, wsGravity = 1.0f,
+          wsWiperLenM = 0.5f, wsMicroRate = 200.f, wsVeil = 0.4f, wsPoolMinPx = 8.f, wsRefractK = 2.0f, wsRefractMinPx = 4.0f, wsSnowLight = 0.5f, wsSnowHeavy = 1.0f, wsSnowLevel = 0.f, wsSnowRate = 18.f, wsSnowMelt = 14.f, wsSnowSize = 1.0f, wsMudSnow = 0.6f,
           wsWiperPeriod = 1.4f, wsWiperPause = 0.f, wsGrimeLife = 120.f, wsWiperInner = 0.25f,
-          wsDirt = 1.0f, wsGlow = 0.10f, wsFlyTime = 0.28f, wsMudR = 0.52f, wsMudG = 0.40f, wsMudB = 0.28f, wsWiperThick = 1.0f, wsFilmDecay = 0.15f, wsSpray = 1.0f,
+          wsDirt = 1.0f, wsGlow = 0.05f, wsFlyTime = 0.28f, wsMudR = 0.52f, wsMudG = 0.40f, wsMudB = 0.28f, wsWiperThick = 1.0f, wsFilmDecay = 0.15f, wsSpray = 1.0f,
           wsW1X = 0.30f, wsW1Y = 1.0f, wsW1Len = 0.70f, wsW1A0 = 5.f, wsW1A1 = 100.f, wsW2X = 0.60f, wsW2Y = 1.0f, wsW2Len = 0.f, wsW2A0 = 5.f, wsW2A1 = 100.f;
     // [Axes]  camera frame (from your log: forward = -Z, up = +Y, right = +X)
     int   axRight = 0, axUp = 1, axFwd = 2;
@@ -1021,34 +1022,10 @@ template <class F> bool wsMakeTex(IDirect3DDevice9* d, IDirect3DTexture9** t, in
     return true;
 }
 
-// Water bead height fields on a unit cell (v grows downwards). The comet has a round head at the bottom and a tail that tapers to the top;
-// moving drops are rotated so the head leads.
-float wsHRound(float u, float v) { const float dx = u - 0.5f, dy = v - 0.5f, d = std::sqrt(dx * dx + dy * dy) / 0.46f; return d < 1.f ? std::sqrt(1.f - d * d) : 0.f; }
-float wsHComet(float u, float v) {
-    const float cy = 0.62f, R = 0.34f;
-    if (v >= cy) { const float dx = u - 0.5f, dy = v - cy, d = std::sqrt(dx * dx + dy * dy) / R; return d < 1.f ? std::sqrt(1.f - d * d) : 0.f; }
-    const float t = clamp01((v - 0.03f) / (cy - 0.03f)), hw = R * std::pow(t, 0.5f);
-    if (hw < 1e-3f) return 0.f;
-    const float s = (u - 0.5f) / hw; if (std::fabs(s) >= 1.f) return 0.f;
-    return std::sqrt(1.f - s * s) * std::pow(t, 0.5f);
-}
-float wsBeadH(int cell, float u, float v) { return cell == 0 ? wsHRound(u, v) : wsHComet(u, v); }
-void wsBeadShade(int cell, float u, float v, WsPx& p) {            // rim, specular, caustic: no interior fill, the refraction provides that
-    const float h = wsBeadH(cell, u, v); if (h <= 0.f) return;
-    const float e = 1.f / 64.f, S = 0.30f / (2.f * e);
-    const float hx = wsBeadH(cell, u + e, v) - wsBeadH(cell, u - e, v), hy = wsBeadH(cell, u, v + e) - wsBeadH(cell, u, v - e);
-    float nx = -hx * S, ny = -hy * S, nz = 1.f; const float nl = std::sqrt(nx * nx + ny * ny + nz * nz); nx /= nl; ny /= nl; nz /= nl;
-    const float Lx = -0.45f, Ly = -0.55f, Lz = 0.70f;                // light from upper left, towards the viewer
-    const float diff = nx * Lx + ny * Ly + nz * Lz;
-    const float rim = 1.f - nz;
-    wsOver(p, 0.06f, 0.08f, 0.09f, 0.06f);                              // slightly darker than the glass around it
-    wsOver(p, 0.05f, 0.07f, 0.10f, std::pow(rim, 1.3f) * (0.25f + 0.55f * std::max(0.f, -diff)));
-    wsOver(p, 0.88f, 0.94f, 1.00f, std::max(0.f, -diff) * (1.f - rim) * (1.f - rim) * 0.32f);          // caustic on the side away from the light
-    wsOver(p, 1.f, 1.f, 1.f, std::pow(std::max(0.f, diff), 4.f) * 0.16f);
-    float hxv = Lx, hyv = Ly, hzv = Lz + 1.f; const float hl = std::sqrt(hxv * hxv + hyv * hyv + hzv * hzv); hxv /= hl; hyv /= hl; hzv /= hl;
-    wsOver(p, 1.f, 1.f, 1.f, std::pow(std::max(0.f, nx * hxv + ny * hyv + nz * hzv), 60.f) * 0.55f);   // specular (small: rain beads on a car windscreen are not glossy)
-    wsScale(p, wsSmooth(0.f, 0.10f, h));
-}
+// Water bead artwork lives in ws_art.hpp (it can be rendered offline, see tests/ws_art_preview.cpp). Cell 0 is a standing drop, cell 1 a running one.
+float wsBeadH(int cell, float u, float v) { return wsl::art::height(cell, u, v); }
+void wsFromArt(const wsl::art::Px& q, WsPx& p) { for (int i = 0; i < 3; ++i) p.c[i] = q.c[i]; p.a = q.a; }
+void wsBeadShade(int cell, float u, float v, WsPx& p) { wsl::art::Px q; wsl::art::shade(cell, u, v, q); wsFromArt(q, p); }
 // Mud / slush atlas: 4 x 2 cells of 128 px (luminance in rgb, tinted by the vertex colour). Cells 0-3 are thrown-mud splats like the ones on a rally car's
 // windscreen: ragged spiky outline, translucent lacy interior, darker rim, wet highlights, elongated satellite drops flung outwards. 4 smear (long, streaky),
 // 5 and 7 spray clumps, 6 fine speckle of dirty road water.
@@ -1148,31 +1125,16 @@ void wsPoolPx(int variant, float u, float v, bool shade, WsPx& p) {
     wsOver(p, 0.05f, 0.07f, 0.06f, std::exp(-kd * kd) * (0.25f + 0.60f * upSide));             // dark contact line
     wsOver(p, 0.93f, 0.96f, 0.95f, std::exp(-kb * kb) * (0.08f + 0.80f * lowSide) * 0.62f);    // bright arc inside the lower edge
 }
-void wsMicroPx(float u, float v, WsPx& p) {                                  // a tiny drop: dark body, bright speck low on one side
-    const float d = std::sqrt(u * u + v * v); if (d >= 1.f) return;
-    wsOver(p, 0.06f, 0.08f, 0.08f, wsSmooth(1.0f, 0.55f, d) * 0.42f);
-    const float kr = (d - 0.72f) / 0.16f;
-    wsOver(p, 0.93f, 0.96f, 0.96f, std::exp(-kr * kr) * std::max(0.f, -u * 0.3f + v * 0.95f) * 0.45f);
-    const float sx = u + 0.30f, sy = v - 0.35f;
-    wsOver(p, 1.f, 1.f, 1.f, std::exp(-(sx * sx + sy * sy) / 0.06f) * 0.95f);
-}
+void wsMicroPx(float u, float v, WsPx& p) { wsl::art::Px q; wsl::art::micro(u, v, q); wsFromArt(q, p); }   // a tiny drop: faint body, one bright point
 
 bool wsMakeTextures(IDirect3DDevice9* d) {
     const int N = 64;
     const bool a = wsMakeTex(d, &g_wsSpriteTex, N, N, [&](int x, int y, WsPx& p) {          // small drops: plain alpha sprite
-        const float u = (x + 0.5f) / N * 2.f - 1.f, v = (y + 0.5f) / N * 2.f - 1.f, dd = std::sqrt(u * u + v * v);
-        if (dd >= 1.f) return;
-        const float z = std::sqrt(std::max(0.f, 1.f - dd * dd)), diff = u * -0.45f + v * -0.55f + z * 0.70f;
-        wsOver(p, 0.80f, 0.86f, 0.94f, 0.07f);
-        wsOver(p, 0.08f, 0.10f, 0.14f, wsSmooth(0.55f, 0.98f, dd) * (0.20f + 0.40f * std::max(0.f, -diff)));
-        wsOver(p, 1.f, 1.f, 1.f, std::pow(std::max(0.f, diff), 30.f) * 0.9f);
-        const float hx = u + 0.38f, hy = v + 0.42f;
-        wsOver(p, 1.f, 1.f, 1.f, wsSmooth(0.22f, 0.04f, std::sqrt(hx * hx + hy * hy)) * 0.8f);
-        wsScale(p, wsSmooth(1.0f, 0.88f, dd));
+        wsl::art::Px q; wsl::art::sprite((x + 0.5f) / N * 2.f - 1.f, (y + 0.5f) / N * 2.f - 1.f, q); wsFromArt(q, p);
     });
     const bool b = wsMakeTex(d, &g_wsMaskTex, 2 * N, N, [&](int x, int y, WsPx& p) {         // refraction mask: cell 0 round, cell 1 comet
         const int cell = x / N; const float u = ((x % N) + 0.5f) / N, v = (y + 0.5f) / N;
-        wsOver(p, 1.f, 1.f, 1.f, wsSmooth(0.f, 0.20f, wsBeadH(cell, u, v)) * 0.96f);
+        wsOver(p, 1.f, 1.f, 1.f, wsl::art::mask(cell, u, v));
     });
     const bool c = wsMakeTex(d, &g_wsShadeTex, 2 * N, N, [&](int x, int y, WsPx& p) {        // rim / specular overlay for the same two cells
         const int cell = x / N; wsBeadShade(cell, ((x % N) + 0.5f) / N, (y + 0.5f) / N, p);
@@ -1186,9 +1148,9 @@ bool wsMakeTextures(IDirect3DDevice9* d) {
     });
     const bool f = wsMakeTex(d, &g_wsTrailTex, 16, 16, [&](int x, int, WsPx& p) {            // wet streak: u across, uniform along v
         const float u = (x + 0.5f) / 16.f, t = std::fabs(2.f * u - 1.f), k1 = (t - 0.80f) / 0.12f, k2 = (u - 0.30f) / 0.09f;
-        wsOver(p, 0.75f, 0.85f, 0.95f, 0.10f);
-        wsOver(p, 0.08f, 0.11f, 0.15f, 0.30f * std::exp(-k1 * k1));
-        wsOver(p, 1.f, 1.f, 1.f, 0.40f * std::exp(-k2 * k2));
+        wsOver(p, 0.80f, 0.88f, 0.96f, 0.05f);
+        wsOver(p, 0.08f, 0.11f, 0.15f, 0.16f * std::exp(-k1 * k1));
+        wsOver(p, 1.f, 1.f, 1.f, 0.20f * std::exp(-k2 * k2));
         wsScale(p, wsSmooth(1.0f, 0.82f, t));
     });
     const bool g = wsMakeTex(d, &g_wsSplashTex, N, N, [&](int x, int y, WsPx& p) {           // impact flash: thin ring with spikes
@@ -1372,7 +1334,7 @@ void wsFlyUpdate(float dt) {                                           // advanc
         f.t += dt / std::max(0.05f, f.dur);
         if (f.t < 1.f) continue;
         switch (f.kind) {
-            case 0: wsAddWater(f.x1, f.y1, f.r, 0.f, g_cfg.wsDrops); wsGridAdd(g_wsFilm, f.x1, f.y1, 3.5f, f.r < 0.0055f ? 1.2f : 2.0f); break;
+            case 0: wsAddWater(f.x1, f.y1, f.r, 0.f, g_cfg.wsDrops); wsGridAdd(g_wsFilm, f.x1, f.y1, 3.5f, f.r < 0.0055f ? 0.45f : 0.8f); break;
             case 2: wsAddFlake(f.x1, f.y1, f.r, g_cfg.wsSnowMax); wsGridAdd(g_wsFilm, f.x1, f.y1, 4.f, 1.0f); break;
             default: wsMudLand(f); break;
         }
@@ -1547,8 +1509,8 @@ void wsStep(float dt, float W, float H) {
         for (int guard = 0; g_wsRainAcc >= 1.f && guard < 50; ++guard) {
             g_wsRainAcc -= 1.f;
             const float u = wsRnd();                                                         // many small beads, some medium, a few big flat pools
-            const float pl = 0.06f + 0.16f * g_wsRainEff;                                  // heavier rain: more of the big flat pools
-            float r = u < 0.55f ? wsRange(0.0016f, 0.0055f) : u < 1.f - pl ? wsRange(0.0055f, 0.0115f) : wsRange(0.0115f, 0.030f);
+            const float pl = 0.02f + 0.05f * g_wsRainEff;                                  // a few big drops, more of them in heavier rain
+            float r = u < 0.62f ? wsRange(0.0016f, 0.0050f) : u < 1.f - pl ? wsRange(0.0050f, 0.0105f) : wsRange(0.0105f, 0.0165f);
             const float tx = wsRange(0.03f, 0.97f), ty = 0.06f + 0.74f * std::pow(wsRnd(), 0.85f), rr = r * g_cfg.wsDropSize;
             if (g_cfg.wsFly && rr >= 0.0032f) {                                            // it comes from somewhere: from above when you are slow, from the vanishing point when you are fast
                 WsFly f{}; f.kind = 0; f.mode = 0; f.r = rr; f.x1 = tx; f.y1 = ty; f.shade = 1.f;
@@ -1556,14 +1518,14 @@ void wsStep(float dt, float W, float H) {
                 f.x0 = tx * (1.f - fast) + (0.5f + wsRange(-0.04f, 0.04f)) * fast; f.y0 = (-0.25f) * (1.f - fast) + 0.40f * fast;
                 f.dur = g_cfg.wsFlyTime * wsRange(0.7f, 1.3f) * (1.15f - 0.4f * fast); f.t = -wsRange(0.f, 0.6f / std::max(1.f, rainRate) + 0.02f);
                 g_wsFly.push_back(f);
-            } else { wsAddWater(tx, ty, rr, 0.f, g_cfg.wsDrops); wsGridAdd(g_wsFilm, tx, ty, 3.f, 1.0f); }
+            } else { wsAddWater(tx, ty, rr, 0.f, g_cfg.wsDrops); wsGridAdd(g_wsFilm, tx, ty, 3.f, 0.35f); }
         }
         if (g_cfg.wsMicro > 0) {                                       // the fine speckle of tiny droplets that makes wet glass look wet
             g_wsMicroAcc += g_cfg.wsMicroRate * g_wsRainEff * (0.5f + 0.5f * spdN) * g_wsWet * dt;
             for (int guard = 0; g_wsMicroAcc >= 1.f && guard < 80; ++guard) {
                 g_wsMicroAcc -= 1.f;
                 const float mx = wsRange(0.02f, 0.98f), my = wsRange(0.04f, 0.86f);
-                wsAddMicro(mx, my, wsRange(0.0006f, 0.0020f) * g_cfg.wsDropSize, g_cfg.wsMicro); wsGridAdd(g_wsFilm, mx, my, 3.f, 1.0f);
+                wsAddMicro(mx, my, wsRange(0.0006f, 0.0020f) * g_cfg.wsDropSize, g_cfg.wsMicro); wsGridAdd(g_wsFilm, mx, my, 3.f, 0.25f);
             }
         }
     }
@@ -1619,11 +1581,12 @@ void wsStep(float dt, float W, float H) {
         else if (F < thr * 0.65f) d.sliding = false;                           // static friction is higher than kinetic: once moving it keeps going
         const bool slide = d.sliding;
         if (slide) {
-            const float k = (F - 0.65f * thr) / F * 2.0f * dt;                // kinetic friction is lower than static: a drop that lets go runs
+            const float sizeK = 0.7f + std::min(1.3f, d.r / 0.007f);           // a bigger drop is heavier and runs faster
+            const float k = (F - 0.65f * thr) / F * 4.0f * sizeK * dt;         // kinetic friction is lower than static: a drop that lets go runs
             const float wob = std::sin(d.age * 3.2f + d.rot) * 0.9f * dt;                  // slow heading drift, proportional to speed: smooth meander, no kinks
             const float ovx = d.vx, ovy = d.vy;
             d.vx += Fx * k - ovy * wob; d.vy += Fy * k + ovx * wob;
-            const float drag = std::exp(-2.5f * dt); d.vx *= drag; d.vy *= drag;
+            const float drag = std::exp(-2.0f * dt); d.vx *= drag; d.vy *= drag;
         } else { const float stick = std::exp(-14.f * dt); d.vx *= stick; d.vy *= stick; }
         const float dh = std::sqrt(d.vx * d.vx + d.vy * d.vy) * dt;    // distance travelled this step, in viewport heights
         if (dh > 0.f) {
@@ -1846,7 +1809,7 @@ bool wsDraw(IDirect3DDevice9* d) {
         }
     }
     for (const WsTrail& t : g_wsTrails) {
-        const float a = std::pow(std::max(0.f, 1.f - t.age / life), 1.3f) * op * 0.7f;
+        const float a = std::pow(std::max(0.f, 1.f - t.age / life), 1.6f) * op * 0.55f;
         strip(g_wsVTrail, t.x0 * W, t.y0 * H, t.x1 * W, t.y1 * H, t.w0 * H, t.w1 * H, rgba(1.f, 1.f, 1.f, a));
     }
     for (const WsDrop& dr : g_wsDrops) {
@@ -1864,7 +1827,7 @@ bool wsDraw(IDirect3DDevice9* d) {
         }
         const float vlen = std::sqrt(dr.vx * dr.vx + dr.vy * dr.vy);
         const bool moving = vlen > 0.02f;
-        const float stretch = moving ? 1.15f * (1.f + std::min(1.3f, vlen * 2.4f)) : 1.f;
+        const float stretch = moving ? 1.0f + std::min(0.7f, vlen * 1.6f) : 1.f;        // a runner is a little longer than wide, it does not carry a tail
         const float ang = moving ? std::atan2(-dr.vx, dr.vy) : 0.f;    // local y axis follows the motion, the head leads
         const float sc = 0.4f + 0.6f * wsSmooth(0.f, 0.12f, dr.age);   // impact: the drop spreads out
         const float lf = dr.melt0 > 0.f ? clamp01(dr.melt / 3.f) : 1.f;   // melted snow fades out
@@ -1884,8 +1847,8 @@ bool wsDraw(IDirect3DDevice9* d) {
             }
         }
         if (dr.age < 0.14f) {                                          // impact flash
-            const float k = dr.age / 0.14f, s = rpx * (1.3f + 2.6f * k);
-            quad(g_wsVSplash, dr.x * W, dr.y * H, s, s, 0.f, rgba(1.f, 1.f, 1.f, (1.f - k) * 0.7f * op), 0.f, 0.f, 1.f, 1.f);
+            const float k = dr.age / 0.14f, s = rpx * (1.2f + 1.6f * k);
+            if (rpx >= 3.f) quad(g_wsVSplash, dr.x * W, dr.y * H, s, s, 0.f, rgba(1.f, 1.f, 1.f, (1.f - k) * 0.20f * op), 0.f, 0.f, 1.f, 1.f);
         }
     }
     if (g_cfg.wsWipers && g_wsBladeInit) {
