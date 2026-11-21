@@ -1,7 +1,7 @@
 # ForceFX dynamic audio: copying the RBR sounds
 
-This folder comes with the **audio** build of ForceFX (`ForceFX-<version>.zip`). The no-audio build
-(`ForceFX-<version>-NoAudio.zip`) does not need it.
+This folder comes with the audio builds of ForceFX (`ForceFX-<version>-Full.zip` and `ForceFX-<version>-Audio.zip`). The
+builds without audio (`-Camera` and `-Basic`) do not need it.
 
 ForceFX plays its sounds from WAV files in `Plugins\ForceFXAudio\sounds`, found by name.
 `Copy-RbrSounds.bat` fills that folder from your RBR installation. It only reads RBR's `Audio` folder and never changes it.

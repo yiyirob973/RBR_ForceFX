@@ -6,6 +6,8 @@ rem   out\camera\RBR_ForceFX.dll   camera only
 rem   out\basic\RBR_ForceFX.dll    force feedback only
 rem The camera uses MinHook, which is built for the dynamic C runtime, so the variants with the camera are built with /MD and
 rem need the Microsoft Visual C++ 2015-2022 x86 Redistributable. The others are built with /MT and need nothing.
+rem The version shown in the game is taken from the FORCEFX_VERSION environment variable (the release workflow sets it to the
+rem git tag, for example v0.6.0). Without it the build calls itself "Dev build" and shows the date it was compiled.
 setlocal
 cd /d "%~dp0"
 call :build full 1 1 || goto :fail
@@ -22,6 +24,7 @@ set "DEFS="
 set "CRT=/MT"
 set "LIBS=dinput8.lib dxguid.lib user32.lib ws2_32.lib"
 set "EXTRA="
+if defined FORCEFX_VERSION set "DEFS=%DEFS% /DFORCEFX_VERSION=\"%FORCEFX_VERSION%\""
 if "%~2"=="1" (
     set "DEFS=%DEFS% /DFORCEFX_AUDIO"
     set "LIBS=%LIBS% winmm.lib"

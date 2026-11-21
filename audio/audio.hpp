@@ -348,7 +348,7 @@ private:
 // materials try "<family>_wet" / "<family>_damp" before the plain family. US2_/BR2_ gravel variants try their own
 // names first, then the ordinary gravel ones. Snow on ice also tries "ice", snow tries "snow". Materials that resolve
 // to the same files share one set, so a pack with only tarmac / gravel / grass / snow files still works, and every
-// extra file you add makes that surface more specific. docs/surfaces.md lists the search order for every material.
+// extra file you add makes that surface more specific. audio/surfaces.md lists the search order for every material.
 class SoundSetMap : public ISoundSets {
 public:
     struct Info { std::string loop, slide, squeal, hit, label; float vol = 1.f; };
@@ -368,7 +368,7 @@ public:
     float volume(int set) const override { return set >= 0 && set < (int)sets_.size() ? sets_[set].vol : 1.f; }
     const Info& info(int set) const { return sets_[set]; }
 
-    // Names searched for a material, most specific first (pure function; also used to generate docs/surfaces.md).
+    // Names searched for a material, most specific first (pure function; also used to generate audio/surfaces.md).
     static std::vector<std::string> chainFor(const std::string& materialName, int cls, const Settings& s) {
         std::vector<std::string> t;
         for (const std::string& tok : detail::split(materialName, '_')) {

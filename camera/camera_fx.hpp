@@ -2284,7 +2284,7 @@ void pollKeys() {
 }
 
 std::atomic<long> g_frames{0};
-DWORD g_lastReport = 0; uint32_t g_lastType = 0xFFFFFFFE; bool g_loggedFirst = false; int g_lastTestPhase = -1;
+DWORD g_lastReport = 0; bool g_loggedFirst = false; int g_lastTestPhase = -1;
 
 void logStatus(DWORD now, uint32_t type, const Drive& d) {
     if (g_cfg.method == 4)

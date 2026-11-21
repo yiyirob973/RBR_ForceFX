@@ -1,8 +1,8 @@
 // RBR_ForceFX.cpp
 //
 // Extra force feedback for Richard Burns Rally (RSF with NGP7). It reads NGP's telemetry and adds engine,
-// road and braking vibration on top of RBR's own steering force. When the car lands from a jump or takes a hard
-// hit, it also makes RBR's own force pull harder for a moment.
+// road and braking vibration on top of RBR's own steering force. When the car lands from a jump, it also makes
+// RBR's own force pull harder for a moment.
 //
 // How it reaches the wheel
 //   RBR already holds the wheel exclusively, so a second connection from us could never create effects.
@@ -16,8 +16,10 @@
 //            rev limiter makes it stutter.
 //   Lump     A second, lower sine at half the firing order. It gives you the lumpy idle and, at high revs, a
 //            slightly detuned tone that beats against the main one so the engine doesn't feel like a pure sine.
-//   Road     Three sine effects, each carrying one band (low, mid, high) of the road's spectrum, with a bit of
-//            random pitch and strength jitter. Their pitch follows the car's speed, and the tyre's contact patch
+//   Road     Three sines, each carrying one band (low, mid, high) of the road's spectrum, with a bit of random pitch
+//            and strength jitter. They are added to RBR's own constant-force updates (see EffectTap and RoadVib), so
+//            the wheel gets no road effect of its own; only the wheel test, or a setup where RBR's force updates
+//            can't be seen, plays the road as one effect of its own. Their pitch follows the car's speed, and the tyre's contact patch
 //            takes the high bands away at low speed (road_bands.hpp). How strong the road is follows how rough the
 //            tyres feel (high-passed strut force relative to the average load, the same idea RbrSurfaceAudio uses)
 //            plus damper velocity. Smooth tarmac is silent and rough ground or kerbs turn violent and sharp. What
@@ -26,12 +28,12 @@
 //            see road_feel.hpp. The road gain is the one setting for it.
 //   Brake    A sine that grows with the brake pedal and with weight shifting onto the front tyres. Front wheel
 //            lock-up (tyre segment counter vs car speed) makes it much harsher.
-//   Landing  No effect of its own. When a landing or hard hit is detected, a hook on RBR's constant-force updates
-//            scales RBR's own force up for a split second and adds a minimum push in the direction RBR is
-//            already pulling.
+//   Landing  No effect of its own. When a landing after real airtime is detected (bumps and washboard never count),
+//            a hook on RBR's constant-force updates scales RBR's own force up for a split second and adds a minimum
+//            push in the direction RBR is already pulling.
 //
-//   Engine, lump, road and brake are all zero-mean vibrations, so they never pull the wheel to one side. The
-//   landing boost is the only thing that touches RBR's own steering force.
+//   Engine, lump, road and brake are all zero-mean vibrations, so they never pull the wheel to one side (road_guard.hpp
+//   keeps the road that way). The landing boost is the only thing that changes RBR's own steering force.
 //
 // Building (RBR is 32-bit, so build x86 with the static runtime):
 //   cl /std:c++17 /EHsc /LD /MT /O2 RBR_ForceFX.cpp /Fe:RBR_ForceFX.dll /link /DEF:RBR_ForceFX.def
@@ -151,6 +153,26 @@ void Logf(const char* fmt, ...) {
     if (f) { fprintf(f, "%s\n", b); fclose(f); }
 }
 
+// ------------------------------------------------------------------- version
+// The git tag the build was made from: the release workflow passes it to build.bat, which defines FORCEFX_VERSION. A build
+// without a tag (a branch or a local build) says "Dev build" and the day it was compiled.
+#ifndef FORCEFX_VERSION
+#define FORCEFX_VERSION ""
+#endif
+const std::string& VersionText() {
+    static const std::string v = [] {
+        if (FORCEFX_VERSION[0]) return std::string(FORCEFX_VERSION);
+        static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+        char m[4] = {0, 0, 0, 0}; int d = 0, y = 0;
+        sscanf(__DATE__, "%3s %d %d", m, &d, &y);          // "Nov 21 2026"
+        const char* at = strstr(months, m);
+        char b[48];
+        snprintf(b, sizeof(b), "Dev build %04d-%02d-%02d", y, at ? (int)(at - months) / 3 + 1 : 0, d);
+        return std::string(b);
+    }();
+    return v;
+}
+
 // ------------------------------------------------------------------- config
 struct Config {
     // These defaults match the shipped ForceFX.ini, so "Reset" in the menu gives you a fresh-install setup.
@@ -163,7 +185,6 @@ struct Config {
 
     // effect switches (menu): 1 = on, 0 = off
     int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandBoost = 1, fxSurface = 1;
-    int   roadViaRbr = 1;            // 1 = the road vibration is added to RBR's own force updates, so the wheel gets no extra road effect; 0 = one sine effect of its own
     int   probe = 0;                 // 1 = write ForceFX_probe.csv (ground ids and road signals ten times a second) for tuning surfaces; read at start only
 #ifdef FORCEFX_AUDIO
     int   fxAudio = 0;               // dynamic surface audio (settings in the [Audio] section of ForceFX.ini); off until switched on
@@ -182,10 +203,9 @@ struct Config {
     float priorityDuck = 0.85f;      // 0..1: how far lower layers back off while a higher one is active (landing > road > engine)
     float sustainedLimit = 0.10f;    // thermal derate: long-term mean-square level (0.10 is roughly 32% RMS)
 
-    // landings and hard hits
+    // landings
     float impactGain = 0.7f;         // landing sensitivity 0..3 (0 = off)
     float airLevel = 0.2f;           // 0.2..0.8: total strut load (fraction of static) below which the car counts as airborne; raise it to catch smaller jumps
-    float landingThresh = 3.0f;      // 0.5..3: how hard a hit without airtime must be to count as a landing (higher = fewer false triggers)
     float landingBoost = 1.1f;       // 0..4: extra RBR steering torque at the peak of a full-severity landing (2 = +200%)
     float landingAdd = 0.15f;        // 0..1: minimum extra push (share of full torque) in the direction RBR is already pushing
     float thumpGain = 1.4f;          // compression / landing thump added to the road layer
@@ -257,7 +277,7 @@ void ClampConfig(Config& c) {
     c.drivetrain = std::max((int)Tyre::FWD, std::min(c.drivetrain, (int)Tyre::AWD));
     c.wheelbase = clampf(c.wheelbase, 1.5f, 4.0f); c.trackWidth = clampf(c.trackWidth, 1.0f, 2.2f); c.cgToFront = clampf(c.cgToFront, 0.4f * c.wheelbase, 0.6f * c.wheelbase);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
-    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0; c.roadViaRbr = c.roadViaRbr ? 1 : 0;
+    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0;
 #ifdef FORCEFX_AUDIO
     c.fxAudio = c.fxAudio ? 1 : 0;
     c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f);
@@ -267,7 +287,6 @@ void ClampConfig(Config& c) {
 #endif
     c.landingBoost = clampf(c.landingBoost, 0.0f, 4.0f);
     c.landingAdd = clampf(c.landingAdd, 0.0f, 1.0f);
-    c.landingThresh = clampf(c.landingThresh, 0.5f, 3.0f);
     c.airLevel = clampf(c.airLevel, 0.2f, 0.8f);
     c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, kHardTotalMax));
     c.userGain   = clampf(c.userGain,   0.0f, 1.0f);
@@ -307,7 +326,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
     F("ImpactGain", c.impactGain);
     F("BrakeHzScale", c.brakeHzScale); F("PriorityDuck", c.priorityDuck);
-    I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("RoadViaRbr", c.roadViaRbr); I("EnableBrake", c.fxBrake);
+    I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("EnableBrake", c.fxBrake);
     I("SurfaceProbe", c.probe);
 #ifdef FORCEFX_AUDIO
     I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp);
@@ -315,7 +334,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
 #ifdef FORCEFX_CAMERA
     I("EnableCamera", c.fxCamera); I("EnableWindscreen", c.fxWindscreen);
 #endif
-    I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingThreshold", c.landingThresh); F("LandingAirLevel", c.airLevel);
+    I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
@@ -1423,7 +1442,7 @@ struct Signals {
     float accMag = 0; bool accOk = false;   // the car's acceleration over the ground in m/s^2, if the units are known
     float ground = 0;               // the car's speed over the ground, m/s (0 = not known)
     float thumpL = 0, thumpR = 0;   // compression / landing envelope per side
-    unsigned evtSeq = 0;  // goes up by one for every landing or hard hit; the synth starts one boost per event
+    unsigned evtSeq = 0;  // goes up by one for every landing; the synth starts one boost per event
     float evtSev = 0;     // severity of the current event 0..1 (refined upward while a landing is still compressing)
     float staticLoad = 0; // learned static strut load, all four wheels (units of the telemetry)
 };
@@ -1448,7 +1467,7 @@ struct Dsp {
     float thumpL = 0, thumpR = 0;
     // landing / impact detector (works on raw, unsmoothed load so the spike doesn't get averaged away)
     float peakRw = 0, totRatio = 1;
-    float airT = 0, landWin = 0, landAir = 0, landPeak = 0, landBump = 0, landJump = 0, imRefr = 0;
+    float airT = 0, landWin = 0, landAir = 0, landPeak = 0, landBump = 0, landJump = 0;
     unsigned evtSeq = 0; float evtSev = 0;
     float totLow = 1.0f;   // running minimum of the total strut load (relative): a sudden rise above it means something hit the car
 };
@@ -1548,36 +1567,30 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
     }
     s.bump = clamp01(d.bumpEnv);
 
-    // ---- landings and hard hits. Three cues are combined with max(), so any one strong cue gives a full-strength hit:
+    // ---- landings. Only a real jump counts: the car has to be off the ground for Road::kBoostMinAir first, so bumps, washboard and
+    //      weight transfer never start one. Three cues are combined, so any one strong cue gives a full-strength landing:
     //      peak   the highest strut load on any wheel (relative to its static load)
-    //      jump   how fast the TOTAL strut load rose from its recent minimum (works with no airtime at all: drops,
-    //             crests, bottoming out)
-    //      air    how long the wheels were unloaded before the hit, plus the heave acceleration spike
+    //      jump   how fast the TOTAL strut load rose from its recent minimum
+    //      air    how long the wheels were unloaded before the landing, plus the heave acceleration spike
     //      Severity is continuous (no on/off threshold), so a small hop is a small tap and a big jump is violent.
     {
-        d.imRefr = std::max(0.0f, d.imRefr - dt);
         const float rawTot = d.totRatio;
         d.totLow = std::min(rawTot, d.totLow + (rawTot - d.totLow) * alphaFor(dt, 0.12f));
         const float jump = std::max(0.0f, rawTot - d.totLow);
         const bool off = s.speed > 3.0f && rawTot < c.airLevel;
 
-        // Two tiers: a landing after real airtime (air > 0) is scored sensitively so every jump is felt. The no-airtime
-        // "hit" path (air == 0) is scored strictly, because weight transfer from braking while cornering also moves the
-        // strut loads and must not be mistaken for a landing.
         auto severity = [&](float peak, float air, float bump, float jmp) {
-            const bool sens = air > 0.0f;
-            const float peakT = clamp01((peak - (sens ? 1.15f : 1.3f)) / (sens ? 1.3f : 1.7f));
-            const float jumpT = clamp01((jmp - (sens ? 0.25f : 0.35f)) / (sens ? 1.0f : 1.4f));
+            const float peakT = clamp01((peak - 1.15f) / 1.3f);
+            const float jumpT = clamp01((jmp - 0.25f) / 1.0f);
             const float airT2 = clamp01(air / 0.5f);
             const float bumpT = clamp01(bump);
             const float top = std::max(std::max(peakT, jumpT), std::max(0.85f * airT2, 0.7f * bumpT));
             const float sum = peakT + jumpT + airT2 + bumpT;
-            float sev = clamp01(top + 0.15f * (sum - top));
-            if (air > 0.04f) sev = std::max(sev, 0.55f + 0.45f * airT2);    // anything that left the ground is always felt
-            return sev;
+            const float sev = clamp01(top + 0.15f * (sum - top));
+            return std::max(sev, 0.55f + 0.45f * airT2);                    // anything that really left the ground is always felt
         };
 
-        // Every landing and hard hit fires ONE event with a severity. The synth turns it into a boost of RBR's own force.
+        // Every landing fires ONE event with a severity. The synth turns it into a boost of RBR's own force.
         auto fire = [&](float sev) { ++d.evtSeq; d.evtSev = sev; };
 
         if (off) {
@@ -1597,16 +1610,8 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
             d.evtSev = std::max(d.evtSev, sev);
             d.landWin -= dt;
             if (d.landWin <= 0.0f) {
-                d.landWin = 0.0f; d.imRefr = 0.15f;
+                d.landWin = 0.0f;
                 Logf("landing: severity %.2f  (air %.2fs, peak load %.2f, load jump %.2f, heave %.2f)", d.evtSev, d.landAir, d.landPeak, d.landJump, d.landBump);
-            }
-        } else if (!off && d.imRefr <= 0.0f && jump > 0.35f * c.landingThresh && d.peakRw > 1.0f + 0.5f * c.landingThresh) {   // hard hit / bottoming out with no airtime
-            // Logged only. A hit without airtime is a bump or weight transfer; boosting RBR's force for it (and for the stream of
-            // bumps on rough ground) made the wheel heavy to turn, so it no longer fires an event.
-            const float sev = severity(d.peakRw, 0.0f, clamp01(d.bumpEnv), jump);
-            if (sev > 0.12f) {
-                d.imRefr = 0.15f;
-                Logf("hit (no boost): severity %.2f  (peak load %.2f, load jump %.2f, heave %.2f)", sev, d.peakRw, jump, clamp01(d.bumpEnv));
             }
         }
         s.evtSeq = d.evtSeq;
@@ -2736,9 +2741,9 @@ private:
                 per[i] = (DWORD)(1000000.0f / hz[i]);
             }
             // Road vibration through RBR's own force: hand the three bands to the vibration thread and keep them off the wheel's own
-            // effects. Without RBR's constant-force updates (no hook yet, test mode, menus), or when switched off in the settings,
-            // the road is merged into one sine effect of its own.
-            const bool viaRbr = eff.roadViaRbr != 0 && RoadVib::Ready();
+            // effects. Only without RBR's constant-force updates (no hook yet, test mode, menus) is the road merged into one sine
+            // effect of its own, so that the wheel test can still play it.
+            const bool viaRbr = RoadVib::Ready();
             if (viaRbr) {
                 for (int b = 0; b < Road::kBands; ++b) { RoadVib::g_mag[b] = mag[S_ROAD1 + b]; RoadVib::g_hz[b] = hz[S_ROAD1 + b]; mag[S_ROAD1 + b] = 0; }
             } else {                                          // the road as one effect of its own: all three bands merged into one sine
@@ -2844,7 +2849,6 @@ private:
             // effect switches (turn effects off to feel the others on their own)
             {"Effect: Engine",                   "EnableEngine",       &Config::fxEngine,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Road feel",                "EnableRoad",         &Config::fxRoad,       nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
-            {"Road feel delivery",               "RoadViaRbr",         &Config::roadViaRbr,   nullptr,  0.0f,   1.0f, 1.0f, 'r', false},
             {"Effect: Surface feel",             "EnableSurfaceFeel",  &Config::fxSurface,    nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Braking",                  "EnableBrake",        &Config::fxBrake,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Landing boost",            "EnableLandingBoost", &Config::fxLandBoost,  nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
@@ -2858,7 +2862,6 @@ private:
             {"Landing minimum push",             "LandingMinPush",     nullptr, &Config::landingAdd,    0.0f,  1.0f, 0.05f, '%', false},
             {"Landing sensitivity",              "ImpactGain",         nullptr, &Config::impactGain,    0.0f,  3.0f, 0.05f, 'x', false},
             {"Airborne load level",              "LandingAirLevel",    nullptr, &Config::airLevel,      0.2f,  0.8f, 0.05f, 'x', false},
-            {"Landing trigger level",            "LandingThreshold",   nullptr, &Config::landingThresh, 0.5f,  3.0f, 0.1f,  'x', false},
             {"Priority ducking",                 "PriorityDuck",       nullptr, &Config::priorityDuck,  0.0f,  1.0f, 0.05f, '%', false},
             // frequencies
             {"Engine min frequency",             "EngineMinHz",        nullptr, &Config::engineMinHz,   kHardMinHz, kHardMaxHz - 5.0f, 2.0f, 'H', false},
@@ -2879,7 +2882,6 @@ private:
             case '%': snprintf(out, n, "%.0f%%", v * 100.0f); break;
             case 'H': snprintf(out, n, "%.0f Hz", v); break;
             case 'o': snprintf(out, n, "%s", v >= 0.5f ? "ON" : "OFF"); break;
-            case 'r': snprintf(out, n, "%s", v >= 0.5f ? "Through RBR's force" : "Own effect"); break;
             default:  snprintf(out, n, "x%.2f", v); break;
         }
     }
@@ -2956,7 +2958,6 @@ private:
 #endif
             {"EnableEngine",       "Turns the engine vibration on or off. Handy for feeling what each effect does on its own."},
             {"EnableRoad",         "Turns the road feel (texture, bumps and ground) on or off."},
-            {"RoadViaRbr",         "How the road vibration reaches the wheel. Through RBR's force: it is added to RBR's own steering force, so the wheel gets no extra road effect. Own effect: the road is one sine effect of its own, less detailed but easy on the wheel. If the road makes the wheel feel heavy or sticky to turn, use Through RBR's force; it may need a higher road gain. Without RBR's force updates it falls back to the own effect by itself."},
             {"EnableBrake",        "Turns the braking judder and front-wheel lock-up shake on or off."},
             {"EnableSurfaceFeel",  "Lets the ground under each tyre shape the road feel, together with how fast the car goes and how much the wheels slip: loose ground is grainy and throws stones, soft ground is dull, slippery hard ground is quiet with sharp cracks, cobbles hammer in time with your speed. Needs the road feel effect. Off, the road feels the same on every surface."},
             {"EnableLandingBoost", "Turns the landing boost on or off. With it off, landings feel exactly as RBR sends them."},
@@ -2965,9 +2966,8 @@ private:
             {"EngineMaxMagnitude", "How strong the engine vibration is. It's the quietest layer and steps aside for road and landings."},
             {"RoadMaxMagnitude",   "How strong the road feel is. This is the one setting for it: the ground and what the car is doing decide what it feels like. Higher makes everything from gravel to kerbs feel rougher."},
             {"BrakeMaxMagnitude",  "How strong the braking judder and front-wheel lock-up shake are."},
-            {"ImpactGain",         "How easily a landing or hard hit counts as a big one. Turn it up if small jumps feel too soft."},
+            {"ImpactGain",         "How easily a landing counts as a big one. Turn it up if small jumps feel too soft."},
             {"LandingAirLevel",    "How light the car has to get before it counts as airborne. Raise it to catch smaller hops and crests."},
-            {"LandingThreshold",   "How hard a hit has to be to count when the car stays on the ground. Raise it if braking or weight shifts set it off."},
             {"LandingBoost",       "Extra pull added to RBR's own steering force at the peak of a full landing. At 200%, the wheel gets three times the force RBR was sending."},
             {"LandingMinPush",     "A minimum extra pull on landing, in the direction RBR is already pulling. It helps when RBR's force happens to be small at touchdown."},
             {"PriorityDuck",       "How far engine and road back off while something more important is playing. At 0% nothing backs off."},
@@ -3001,7 +3001,7 @@ private:
         float y = 50.0f;
         game_->SetFont(IRBRGame::FONT_BIG);
         game_->SetMenuColor(IRBRGame::MENU_HEADING);
-        WriteSafe(70.0f, y, "ForceFX Diagnostics");
+        { char head[96]; snprintf(head, sizeof(head), "ForceFX Diagnostics  -  %s", VersionText().c_str()); WriteSafe(70.0f, y, head); }
         y += 28.0f;
         game_->SetFont(IRBRGame::FONT_SMALL);
         game_->SetMenuColor(IRBRGame::MENU_TEXT);
@@ -3069,6 +3069,7 @@ public:
         SyncConfig(m_cfg, m_iniPath, false);
         m_userGain = m_cfg.userGain;
         Surf::Start(m_iniPath);               // reads which ground is under the tyres
+        Logf("Version: %s", VersionText().c_str());
 #ifdef FORCEFX_AUDIO
         Logf("Build: with dynamic audio module");
 #else
@@ -3168,7 +3169,7 @@ public:
         float y = 40.0f;
         game_->SetFont(IRBRGame::FONT_BIG);
         game_->SetMenuColor(IRBRGame::MENU_HEADING);
-        WriteSafe(70.0f, y, "ForceFX Settings");
+        { char head[96]; snprintf(head, sizeof(head), "ForceFX Settings  -  %s", VersionText().c_str()); WriteSafe(70.0f, y, head); }
         y += 28.0f;
 
         game_->SetFont(IRBRGame::FONT_SMALL);
@@ -3199,7 +3200,7 @@ public:
         snprintf(buf, sizeof(buf), "landing boost on RBR's force: x%.2f  +%.0f     effect updates to the wheel: %d/s", m_dBoostMul.load(), m_dBoostAdd.load() * 10000.0f, m_dUpd.load());
         line(buf);
         if (m_dViaRbr.load()) snprintf(buf, sizeof(buf), "road: through RBR's force, %d sends/s (RBR updates seen: %d)", m_dVib.load(), g_rbrSeen.load());
-        else snprintf(buf, sizeof(buf), "road: one wheel effect of its own%s", m_cfg.roadViaRbr ? " (waiting for RBR's force updates)" : "");
+        else snprintf(buf, sizeof(buf), "road: one wheel effect of its own (waiting for RBR's force updates)");
         line(buf);
         y += 6.0f;
 

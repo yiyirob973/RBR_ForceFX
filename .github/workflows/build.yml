@@ -23,6 +23,15 @@ jobs:
         with:
           arch: x86
 
+      - name: Set the version shown in the game
+        # A tag build shows the tag (for example v0.6.0). Any other build leaves FORCEFX_VERSION unset, so the plugin says
+        # "Dev build" and the date it was compiled.
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME -replace '[^A-Za-z0-9._-]', '-'
+          "FORCEFX_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Compile the four 32-bit DLLs (build.bat)
         shell: cmd
         run: build.bat

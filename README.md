@@ -11,7 +11,7 @@ Extra force feedback for Richard Burns Rally. ForceFX reads NGP telemetry and ad
 - **Engine:** vibration that follows rpm, throttle and the rev limit.
 - **Road:** vibration that follows the surface under each tyre (gravel, snow, ice, grass, tarmac, cobbles) together with speed, wheel slip and how rough the tyres measure.
 - **Braking:** front-end judder that gets harsh on lock-up.
-- **Landings:** jumps and hard hits make RBR's own steering force pull harder for a moment.
+- **Landings:** jumps make RBR's own steering force pull harder for a moment. Bumps and rough ground never do.
 - **Optional dynamic surface audio:** tyre and ground sounds that follow each wheel (off by default).
 - **Optional camera movement:** your head moves with the car in the cockpit view: leaning into braking and corners, nodding, bouncing over bumps, shaking on crashes and landings.
 - **Optional windscreen effects:** rain, snow and mud on the glass, with wipers (off by default).
@@ -43,7 +43,6 @@ Extra force feedback for Richard Burns Rally. ForceFX reads NGP telemetry and ad
 Settings live in `ForceFX.ini`, which describes every option. The most useful ones are also in the in-game menu.
 
 - **Road gain** (`RoadMaxMagnitude`) is the one setting for how strong the road feel is. The surface and what the car is doing decide what it feels like.
-- **Road feel delivery** (`RoadViaRbr`, also in the menu): by default the road vibration is added to RBR's own steering force, so the wheel gets no extra road effect. Set it to 0 to play the road as one sine effect of its own: less detailed, but easy on the wheel. It does this by itself when RBR's force updates aren't available. Use the default if bumps make the wheel feel heavy or sticky to turn; the road may then need a higher road gain.
 - **Total output** (`TotalMaxMagnitude`) caps all effects together. If the wheel feels too strong or busy, lower this first.
 - **Live level** scales everything down while you drive: Numpad **+** and **-** change it, Numpad **\*** mutes the added effects (keys are configurable in `ForceFX.ini`). It can only turn effects down, never past your limits.
 - **Per-car profiles** are in `ForceFXCars.ini`. A profile can change a car's engine and road strength and set its `Drivetrain=RWD|FWD|AWD`. Cars without an entry are treated as RWD. The drivetrain decides which tyres can have wheelspin.
@@ -99,6 +98,8 @@ When reporting a problem, attach `ForceFX.log` (it is beside the DLL), plus `For
 ## Build from source
 
 32-bit Windows DLL, built with MSVC. From an x86 Visual Studio command prompt run `build.bat`. It builds four variants into `out\full`, `out\audio`, `out\camera` and `out\basic`. The audio module is behind the `FORCEFX_AUDIO` define and the camera behind `FORCEFX_CAMERA`. The camera variants use `/MD` because the bundled MinHook library is built for the dynamic runtime; the others use `/MT`. A version tag starting with `v` builds a release with all four archives.
+
+The version shown on the in-game ForceFX pages and in `ForceFX.log` is the git tag the build was made from (the release workflow passes it to `build.bat` as `FORCEFX_VERSION`, for example `v0.6.0`). A build without a tag says `Dev build` and the date it was compiled.
 
 Unit tests for the logic headers are in `tests` and `audio/tests`. Each file has its build line at the top.
 
