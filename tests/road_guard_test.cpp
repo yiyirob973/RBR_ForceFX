@@ -63,8 +63,17 @@ static void ceiling_leaves_normal_road_and_bounds_extreme_road() {
     float one[3] = {2 * R, 0, 0}; CHECK(Road::CeilingScale(one, 0.0f) == 1.0f && Road::CeilingScale(one, NAN) == 1.0f);
     float nan3[3] = {NAN, 100.0f, 0}; CHECK(std::isfinite(Road::CeilingScale(nan3, R)));
 }
+static void only_real_jumps_boost() {
+    CHECK(!Road::LandingBoostWorthy(0.0f));
+    CHECK(!Road::LandingBoostWorthy(0.05f));      // washboard and bumps
+    CHECK(!Road::LandingBoostWorthy(0.14f));
+    CHECK(Road::LandingBoostWorthy(0.15f));
+    CHECK(Road::LandingBoostWorthy(0.6f));        // a real jump
+    CHECK(!Road::LandingBoostWorthy(NAN));
+}
 int main() {
     lowcut_passes_the_road_and_removes_slow_movement(); lowcut_removes_a_steady_offset(); lowcut_survives_bad_input();
+    only_real_jumps_boost();
     headroom_keeps_vibration_centred(); ceiling_leaves_normal_road_and_bounds_extreme_road();
     std::printf("%d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

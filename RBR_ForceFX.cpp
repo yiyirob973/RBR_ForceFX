@@ -1583,7 +1583,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
         if (off) {
             d.airT += dt;
         } else {
-            if (d.airT > 0.04f && d.landWin <= 0.0f) {
+            if (Road::LandingBoostWorthy(d.airT) && d.landWin <= 0.0f) {   // only a real jump boosts the wheel, a bump never does
                 d.landWin = 0.10f; d.landAir = d.airT; d.landPeak = 0; d.landBump = 0; d.landJump = 0;
                 fire(severity(0.0f, d.landAir, 0.0f, 0.0f));
             }
@@ -1601,11 +1601,12 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
                 Logf("landing: severity %.2f  (air %.2fs, peak load %.2f, load jump %.2f, heave %.2f)", d.evtSev, d.landAir, d.landPeak, d.landJump, d.landBump);
             }
         } else if (!off && d.imRefr <= 0.0f && jump > 0.35f * c.landingThresh && d.peakRw > 1.0f + 0.5f * c.landingThresh) {   // hard hit / bottoming out with no airtime
+            // Logged only. A hit without airtime is a bump or weight transfer; boosting RBR's force for it (and for the stream of
+            // bumps on rough ground) made the wheel heavy to turn, so it no longer fires an event.
             const float sev = severity(d.peakRw, 0.0f, clamp01(d.bumpEnv), jump);
             if (sev > 0.12f) {
                 d.imRefr = 0.15f;
-                fire(sev);
-                Logf("hit: severity %.2f  (peak load %.2f, load jump %.2f, heave %.2f)", sev, d.peakRw, jump, clamp01(d.bumpEnv));
+                Logf("hit (no boost): severity %.2f  (peak load %.2f, load jump %.2f, heave %.2f)", sev, d.peakRw, jump, clamp01(d.bumpEnv));
             }
         }
         s.evtSeq = d.evtSeq;

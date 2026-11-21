@@ -52,4 +52,9 @@ inline float CeilingScale(const float mag[kBands], float gain) {
     return (k + (L - k) * std::tanh((rms - k) / (L - k))) / rms;
 }
 
+// 4. The landing boost is for jumps. Rough ground drops the load on all four wheels for a moment, and bumps and washboard fired
+//    boost after boost, which is felt as a wheel that is heavy to turn. A landing only counts after this much time off the ground.
+constexpr float kBoostMinAir = 0.15f;
+inline bool LandingBoostWorthy(float airSeconds) { return std::isfinite(airSeconds) && airSeconds >= kBoostMinAir; }
+
 }  // namespace Road
