@@ -20,6 +20,7 @@ class Camera {
 public:
     struct Hooks {
         std::function<void(const std::string&)> log;
+        std::function<bool(int[4])> readIds;       // material id under each tyre (FL, FR, RL, RR); unused in this stand-in
     };
 
     void configure(const std::string&, Hooks, bool, bool) {}
