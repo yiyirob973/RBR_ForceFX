@@ -2359,7 +2359,7 @@ private:
     static ffx::Camera*& CameraSlot() { static ffx::Camera* p = nullptr; return p; }
     static void CameraSink(const uint8_t* d, int n) { if (ffx::Camera* c = CameraSlot()) c->feed(d, n); }   // called from NGP's send, so it works without a wheel connected
     std::atomic<bool>  m_carRescan{false};
-    std::string m_carName, m_carPreset;    // guarded by m_mtx
+    std::string m_carName, m_carPreset, m_carKey;    // guarded by m_mtx (m_carKey: "name|RSFCarID|slot", for the windscreen)
     std::mutex m_mtx;
     std::string m_status;
     uint8_t m_pkt[2048];
@@ -2596,7 +2596,7 @@ private:
                                      prof.preset.empty() ? "" : ", ", prof.preset.c_str(), score);
             else snprintf(lab, sizeof(lab), "-> no matching profile in ForceFXCars.ini");
             { std::lock_guard<std::mutex> lk(m_mtx);
-              m_carName = id.name.empty() ? "(name unknown)" : id.name;
+              m_carName = id.name.empty() ? "(name unknown)" : id.name; m_carKey = kb;
               m_carPreset = lab; }
             m_dCar = curSlot;
             Logf("Car slot %d, RSFCarID %d, name \"%s\" %s  cyl=%d rpmMax=%.0f weightFeel=%.2f drivetrain=%s%s", curSlot, id.rsfId,
@@ -3094,6 +3094,7 @@ public:
         {
             ffx::Camera::Hooks h;
             h.log = [](const std::string& s) { Logf("%s", s.c_str()); };
+            h.carKey = [this]() { std::lock_guard<std::mutex> lk(m_mtx); return m_carKey; };       // a new car starts with a clean windscreen
             h.readIds = [](int ids[4]) { return Surf::Ids(ids); };      // the windscreen colours and amounts follow the ground under the tyres
 #ifdef FORCEFX_CAMERA
             Logf("Build: with camera module");
@@ -3303,8 +3304,8 @@ public:
     }
 
     void TickFrontEndPage(float) override {}
-    void StageStarted(int iMap, const char*, bool) override { m_stageReset = true; m_carRescan = true; Surf::OnStage(); m_camera.stageStarted(iMap); }
-    void HandleResults(float, float, float, const char*) override {}
+    void StageStarted(int iMap, const char* player, bool) override { m_stageReset = true; m_carRescan = true; Surf::OnStage(); m_camera.stageStarted(iMap, player, false); }
+    void HandleResults(float, float, float fFinish, const char*) override { m_camera.stageFinished(fFinish); }
     void CheckPoint(float, int, const char*) override {}
 };
 

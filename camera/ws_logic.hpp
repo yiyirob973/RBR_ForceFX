@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include "../materials.hpp"
 
 namespace ffx {
@@ -197,6 +198,30 @@ inline void smoothGround(Ground& cur, const Ground& tgt, float k) {
     cur.dust = mix1(cur.dust, tgt.dust, k); cur.snow = mix1(cur.snow, tgt.snow, k);
     for (int t = 0; t < kTints; ++t) { cur.clod[t] = mix1(cur.clod[t], tgt.clod[t], k); cur.fine[t] = mix1(cur.fine[t], tgt.fine[t], k); }
 }
+
+// ================================================================================================ mud between stages
+// Mud and dirt stay on the glass from one stage to the next of the same rally, so that cleaning it costs time. Water does not (it runs off while
+// the car is in the service park). The glass is cleaned fully when this is a new rally or a new car. The plugin is never told when a rally
+// starts, so a new rally is recognised by what it looks like from here.
+struct StageHistory {
+    bool have = false;              // a stage has been started before in this session
+    bool finished = false;          // and it was finished (not retired, restarted or left for the menu)
+    int map = -1;                   // which stage that was
+    std::string player;             // and who drove it
+    float secondsSinceFinish = 0.f;
+};
+// nullptr: keep the mud. Otherwise the reason to clean the glass, for the log.
+inline const char* cleanReason(bool carryOn, const StageHistory& h, int map, const std::string& player, float carryMinutes) {
+    if (!carryOn) return "CarryOver is off";
+    if (!h.have) return "first stage since the game started";
+    if (!h.finished) return "the last stage was not finished (retired, restarted or left for the menu)";
+    if (map == h.map) return "the same stage again";
+    if (player != h.player) return "a different driver";
+    if (carryMinutes > 0.f && h.secondsSinceFinish > carryMinutes * 60.f) return "a long break since the last stage, taken as a new rally";
+    return nullptr;
+}
+// Is this a different car from the one the glass was last dirtied in? Empty keys say nothing.
+inline bool carChanged(const std::string& last, const std::string& now) { return !last.empty() && !now.empty() && last != now; }
 
 }  // namespace wsl
 }  // namespace cam

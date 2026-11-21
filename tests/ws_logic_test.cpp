@@ -248,6 +248,22 @@ TEST(smoothing_drops_out_when_the_target_is_not_ok) {
     CHECK(!cur.ok);
 }
 
+
+// ---------------------------------------------------------------- mud between stages
+static StageHistory hist(bool finished = true, int map = 10, const char* who = "Bob", float since = 120.f) { StageHistory h; h.have = true; h.finished = finished; h.map = map; h.player = who; h.secondsSinceFinish = since; return h; }
+TEST(next_stage_of_the_same_rally_keeps_the_mud) { CHECK(cleanReason(true, hist(), 11, "Bob", 10.f) == nullptr); }
+TEST(first_stage_cleans) { StageHistory h; CHECK(cleanReason(true, h, 11, "Bob", 10.f) != nullptr); }
+TEST(a_stage_that_was_not_finished_cleans) { CHECK(cleanReason(true, hist(false), 11, "Bob", 10.f) != nullptr); }
+TEST(the_same_stage_again_cleans) { CHECK(cleanReason(true, hist(true, 10), 10, "Bob", 10.f) != nullptr); }
+TEST(a_different_driver_cleans) { CHECK(cleanReason(true, hist(), 11, "Alice", 10.f) != nullptr); }
+TEST(a_long_break_cleans) { CHECK(cleanReason(true, hist(true, 10, "Bob", 11 * 60.f), 11, "Bob", 10.f) != nullptr); CHECK(cleanReason(true, hist(true, 10, "Bob", 9 * 60.f), 11, "Bob", 10.f) == nullptr); }
+TEST(a_zero_break_limit_never_cleans_by_time) { CHECK(cleanReason(true, hist(true, 10, "Bob", 99999.f), 11, "Bob", 0.f) == nullptr); }
+TEST(carry_over_off_always_cleans) { CHECK(cleanReason(false, hist(), 11, "Bob", 10.f) != nullptr); }
+TEST(car_change_needs_two_known_cars) {
+    CHECK(carChanged("Sunny|3|0", "Sunny|3|1")); CHECK(!carChanged("Sunny|3|0", "Sunny|3|0"));
+    CHECK(!carChanged("", "Sunny|3|0")); CHECK(!carChanged("Sunny|3|0", ""));
+}
+
 int main() {
     for (const Reg& r : regs()) { const int before = g_fail; r.fn(); std::printf("%s  %s\n", g_fail == before ? "ok  " : "FAIL", r.name); }
     std::printf("\n%d checks, %d failed\n", g_checks, g_fail);

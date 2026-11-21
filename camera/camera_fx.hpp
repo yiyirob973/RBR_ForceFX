@@ -92,11 +92,11 @@ struct Cfg {
     // [Limits]
     float maxPos = 0.025f, maxAng = 3.0f, maxRoll = 3.0f;
     // [Windscreen]  proof-of-concept overlay
-    int   wsRainSource = 1, wsProbe = 0, wsWetFromGame = 0, wsDrawAt = 1, wsDepthTest = 1, wsEnable = 0, wsMode = 3, wsDrops = 200, wsMud = 16, wsSignSway = 1, wsSignSurge = 1, wsToggleKey = 119,
-          wsWiperSource = 1, wsWiperAxis = 0, wsWiperAxisSign = 1, wsHideGameWipers = 0, wsWiperDraw = 0, wsMicro = 3500, wsPools = 0, wsHideGameFx = 1, wsRefraction = 1, wsSnowMax = 140, wsMudSmear = 1, wsWipers = 0, wsWiperAuto = 1, wsWiperDebug = 0, wsWiperSyncKey = 118, wsFly = 1, wsWiperBow = 1, wsWiperBlur = 1, wsGround = 1, wsWiperMeasure = 1;
-    float wsRainLight = 0.45f, wsRainHeavy = 1.0f, wsMudDry = 0.15f, wsMudDamp = 0.7f, wsMudWet = 1.0f, wsSpeedRef = 120.f, wsRainLevel = 0.7f, wsRoughRef = 0.25f, wsRain = 20.f, wsMudRate = 6.f, wsTrail = 3.f, wsGlassDist = 0.9f, wsDropSize = 1.0f, wsMudSize = 1.0f, wsOpacity = 1.0f, wsWind = 1.0f, wsGravity = 1.0f,
-          wsWiperLenM = 0.5f, wsMicroRate = 200.f, wsVeil = 0.4f, wsPoolMinPx = 8.f, wsRefractK = 2.0f, wsRefractMinPx = 4.0f, wsSnowLight = 0.5f, wsSnowHeavy = 1.0f, wsSnowLevel = 0.f, wsSnowRate = 18.f, wsSnowMelt = 14.f, wsSnowSize = 1.0f, wsMudSnow = 0.6f,
-          wsWiperPeriod = 1.4f, wsWiperPause = 0.f, wsGrimeLife = 120.f, wsWiperInner = 0.25f,
+    int   wsRainSource = 1, wsProbe = 0, wsWetFromGame = 0, wsDrawAt = 1, wsDepthTest = 1, wsEnable = 0, wsMode = 3, wsDrops = 450, wsMud = 16, wsSignSway = 1, wsSignSurge = 1, wsToggleKey = 119,
+          wsWiperSource = 1, wsWiperAxis = 0, wsWiperAxisSign = 1, wsHideGameWipers = 0, wsWiperDraw = 0, wsMicro = 3500, wsPools = 0, wsHideGameFx = 1, wsRefraction = 1, wsSnowMax = 140, wsMudSmear = 1, wsWipers = 0, wsWiperAuto = 1, wsWiperDebug = 0, wsWiperSyncKey = 118, wsFly = 1, wsWiperBow = 1, wsWiperBlur = 1, wsGround = 1, wsWiperMeasure = 1, wsCarryOver = 1;
+    float wsRainLight = 0.45f, wsRainHeavy = 1.0f, wsMudDry = 0.15f, wsMudDamp = 0.7f, wsMudWet = 1.0f, wsSpeedRef = 120.f, wsRainLevel = 0.7f, wsRoughRef = 0.25f, wsRain = 100.f, wsMudRate = 6.f, wsTrail = 3.f, wsGlassDist = 0.9f, wsDropSize = 1.0f, wsMudSize = 1.0f, wsOpacity = 1.0f, wsWind = 1.0f, wsGravity = 1.0f,
+          wsWiperLenM = 0.5f, wsMicroRate = 380.f, wsVeil = 0.7f, wsPoolMinPx = 8.f, wsRefractK = 2.0f, wsRefractMinPx = 4.0f, wsSnowLight = 0.5f, wsSnowHeavy = 1.0f, wsSnowLevel = 0.f, wsSnowRate = 18.f, wsSnowMelt = 14.f, wsSnowSize = 1.0f, wsMudSnow = 0.6f,
+          wsWiperPeriod = 1.4f, wsWiperPause = 0.f, wsGrimeLife = 300.f, wsCarryMinutes = 10.f, wsWiperInner = 0.25f,
           wsDirt = 1.0f, wsGlow = 0.05f, wsFlyTime = 0.28f, wsMudR = 0.52f, wsMudG = 0.40f, wsMudB = 0.28f, wsWiperThick = 1.0f, wsFilmDecay = 0.15f, wsSpray = 1.0f,
           wsW1X = 0.30f, wsW1Y = 1.0f, wsW1Len = 0.70f, wsW1A0 = 5.f, wsW1A1 = 100.f, wsW2X = 0.60f, wsW2Y = 1.0f, wsW2Len = 0.f, wsW2A0 = 5.f, wsW2A1 = 100.f;
     // [Axes]  camera frame (from your log: forward = -Z, up = +Y, right = +X)
@@ -112,7 +112,8 @@ std::atomic<bool> g_wsOn{false};         // WindscreenFX live switch (ForceFX me
 std::string g_dir;
 FILE* g_log = nullptr;                                 // ForceFXCamera.log, only when Log=1
 std::function<void(const std::string&)> g_hostLog;
-std::function<bool(int[4])> g_hostIds;                  // material ids under the tyres, from the surface scan (may be empty)     // ForceFX.log
+std::function<bool(int[4])> g_hostIds;
+std::function<std::string()> g_hostCarKey;                // the car in use, from the main plugin                  // material ids under the tyres, from the surface scan (may be empty)     // ForceFX.log
 
 // Logf: detail for tuning and bug reports, written to ForceFXCamera.log only when Log=1.
 // Note: what a user needs to know when something does not work (hooks, failures); also goes to ForceFX.log.
@@ -215,7 +216,7 @@ std::vector<Opt> optTable(Cfg& c) {
         {"Windscreen", "Wipers", nullptr, &c.wsWipers, 0, 1}, {"Windscreen", "WiperSource", nullptr, &c.wsWiperSource, 0, 1},
         {"Windscreen", "WiperAxis", nullptr, &c.wsWiperAxis, 0, 2}, {"Windscreen", "WiperAxisSign", nullptr, &c.wsWiperAxisSign, -1, 1}, {"Windscreen", "WiperLenM", &c.wsWiperLenM, nullptr, 0.1f, 2},
         {"Windscreen", "HideGameWipers", nullptr, &c.wsHideGameWipers, 0, 1}, {"Windscreen", "WiperDraw", nullptr, &c.wsWiperDraw, 0, 1}, {"Windscreen", "WiperAuto", nullptr, &c.wsWiperAuto, 0, 1}, {"Windscreen", "WiperDebug", nullptr, &c.wsWiperDebug, 0, 1},
-        {"Windscreen", "Ground", nullptr, &c.wsGround, 0, 1}, {"Windscreen", "GrimeLife", &c.wsGrimeLife, nullptr, 0, 3600},
+        {"Windscreen", "Ground", nullptr, &c.wsGround, 0, 1}, {"Windscreen", "CarryOver", nullptr, &c.wsCarryOver, 0, 1}, {"Windscreen", "CarryMinutes", &c.wsCarryMinutes, nullptr, 0, 600}, {"Windscreen", "GrimeLife", &c.wsGrimeLife, nullptr, 0, 3600},
         {"Windscreen", "WiperMeasure", nullptr, &c.wsWiperMeasure, 0, 1}, {"Windscreen", "WiperInner", &c.wsWiperInner, nullptr, 0, 0.9f},
         {"Windscreen", "WiperSyncKey", nullptr, &c.wsWiperSyncKey, 0, 254}, {"Windscreen", "WiperPeriod", &c.wsWiperPeriod, nullptr, 0.3f, 10}, {"Windscreen", "WiperPause", &c.wsWiperPause, nullptr, 0, 20},
         {"Windscreen", "W1X", &c.wsW1X, nullptr, -0.5f, 1.5f}, {"Windscreen", "W1Y", &c.wsW1Y, nullptr, -0.5f, 1.5f}, {"Windscreen", "W1Len", &c.wsW1Len, nullptr, 0, 3},
@@ -912,7 +913,8 @@ std::vector<WsFly>    g_wsFly;
 std::vector<WsVert>   g_wsVSprite, g_wsVShade, g_wsVShadePool, g_wsVMud, g_wsVTrail, g_wsVFlake, g_wsVSplash, g_wsVDbg, g_wsVMicro, g_wsVVeil, g_wsVDirt, g_wsVGlow, g_wsVFlyMud, g_wsVFlyFlake, g_wsVStreak, g_wsVWBlur;
 std::vector<WsVert2>  g_wsVRefr, g_wsVRefrPool, g_wsVFrost;
 volatile bool g_wsArmed = false, g_wsHooked = false;
-bool          g_wsReset = true, g_wsTexFailed = false;
+bool          g_wsReset = true, g_wsResetWater = false, g_wsTexFailed = false;
+wsl::StageHistory g_wsHist; std::string g_wsLastCar; DWORD g_wsFinishTick = 0, g_wsCarCheckUntil = 0;   // for carrying mud from one stage to the next
 DWORD         g_wsStamp = 0;
 long          g_wsFrameNo = 0, g_wsLastDrawn = -1;
 std::atomic<long> g_wsDrawn{0}, g_wsSkipped{0};
@@ -1334,7 +1336,7 @@ void wsFlyUpdate(float dt) {                                           // advanc
         f.t += dt / std::max(0.05f, f.dur);
         if (f.t < 1.f) continue;
         switch (f.kind) {
-            case 0: wsAddWater(f.x1, f.y1, f.r, 0.f, g_cfg.wsDrops); wsGridAdd(g_wsFilm, f.x1, f.y1, 3.5f, f.r < 0.0055f ? 0.45f : 0.8f); break;
+            case 0: wsAddWater(f.x1, f.y1, f.r, 0.f, g_cfg.wsDrops); wsGridAdd(g_wsFilm, f.x1, f.y1, 3.5f, (f.r < 0.0055f ? 0.30f : 0.55f) * (0.25f + 0.75f * g_wsRainEff * g_wsRainEff)); break;
             case 2: wsAddFlake(f.x1, f.y1, f.r, g_cfg.wsSnowMax); wsGridAdd(g_wsFilm, f.x1, f.y1, 4.f, 1.0f); break;
             default: wsMudLand(f); break;
         }
@@ -1349,6 +1351,13 @@ void wsSync() {                                                        // match 
     if (g_wsReset) {                                                   // new stage: clean glass, rain and mud arrive from here on
         g_wsDrops.clear(); g_wsMud.clear(); g_wsTrails.clear(); g_wsFly.clear(); std::fill(g_wsFilm, g_wsFilm + kGX * kGY, 0.f); std::fill(g_wsDirt, g_wsDirt + kGX * kGY, 0.f);
         g_wsBow[0] = g_wsBow[1] = 0.f; g_wsRainAcc = g_wsSnowAcc = g_wsMudAcc = g_wsMicroAcc = 0.f; g_wsSprayAcc = 0.f; g_wsReset = false; g_wsWipeT0 = GetTickCount(); wsHuntReset(); g_wsDirtCol = wsMudRgb(); g_wsGround = wsl::Ground(); g_wsGroundTick = 0; g_wsGroundSeen = false;
+        g_wsRng = (g_wsRng ^ (uint32_t)GetTickCount()) | 1u;
+    }
+    if (g_wsResetWater) {                                              // next stage of the same rally: the water has dried, the mud is still there
+        g_wsResetWater = false;
+        g_wsDrops.clear(); g_wsTrails.clear(); g_wsFly.clear(); std::fill(g_wsFilm, g_wsFilm + kGX * kGY, 0.f);
+        g_wsBow[0] = g_wsBow[1] = 0.f; g_wsRainAcc = g_wsSnowAcc = g_wsMudAcc = g_wsMicroAcc = 0.f; g_wsSprayAcc = 0.f; g_wsWipeT0 = GetTickCount(); wsHuntReset();
+        g_wsGround = wsl::Ground(); g_wsGroundTick = 0; g_wsGroundSeen = false;
         g_wsRng = (g_wsRng ^ (uint32_t)GetTickCount()) | 1u;
     }
     if (!wantD) { g_wsDrops.clear(); g_wsTrails.clear(); std::fill(g_wsFilm, g_wsFilm + kGX * kGY, 0.f); }
@@ -1497,6 +1506,13 @@ void wsStep(float dt, float W, float H) {
         const bool wetNow = (GetTickCount() - g_wsGameTick.load()) < 300;
         g_wsWet += ((wetNow ? 1.f : 0.f) - g_wsWet) * std::min(1.f, dt * 0.5f);
     } else g_wsWet = 1.f;
+    if (g_hostCarKey && (g_wsLastCar.empty() || GetTickCount() < g_wsCarCheckUntil)) {   // a different car starts with a clean windscreen
+        const std::string k = g_hostCarKey();
+        if (!k.empty() && k != g_wsLastCar) {
+            if (wsl::carChanged(g_wsLastCar, k)) { g_wsReset = true; Logf("windscreen: a different car, glass cleaned"); }
+            g_wsLastCar = k;
+        }
+    }
     wsGroundUpdate(dt);
     const bool gnd = g_cfg.wsGround && g_wsGround.ok;                   // the glass follows what the tyres are on
     wsHuntPose(W, H);
@@ -1509,8 +1525,8 @@ void wsStep(float dt, float W, float H) {
         for (int guard = 0; g_wsRainAcc >= 1.f && guard < 50; ++guard) {
             g_wsRainAcc -= 1.f;
             const float u = wsRnd();                                                         // many small beads, some medium, a few big flat pools
-            const float pl = 0.02f + 0.05f * g_wsRainEff;                                  // a few big drops, more of them in heavier rain
-            float r = u < 0.62f ? wsRange(0.0016f, 0.0050f) : u < 1.f - pl ? wsRange(0.0050f, 0.0105f) : wsRange(0.0105f, 0.0165f);
+            const float pl = 0.03f + 0.10f * g_wsRainEff;                                  // a few big drops, more of them in heavier rain
+            float r = u < 0.62f ? wsRange(0.0016f, 0.0050f) : u < 1.f - pl ? wsRange(0.0050f, 0.0105f) : wsRange(0.0105f, 0.0165f + 0.005f * g_wsRainEff);
             const float tx = wsRange(0.03f, 0.97f), ty = 0.06f + 0.74f * std::pow(wsRnd(), 0.85f), rr = r * g_cfg.wsDropSize;
             if (g_cfg.wsFly && rr >= 0.0032f) {                                            // it comes from somewhere: from above when you are slow, from the vanishing point when you are fast
                 WsFly f{}; f.kind = 0; f.mode = 0; f.r = rr; f.x1 = tx; f.y1 = ty; f.shade = 1.f;
@@ -1518,14 +1534,14 @@ void wsStep(float dt, float W, float H) {
                 f.x0 = tx * (1.f - fast) + (0.5f + wsRange(-0.04f, 0.04f)) * fast; f.y0 = (-0.25f) * (1.f - fast) + 0.40f * fast;
                 f.dur = g_cfg.wsFlyTime * wsRange(0.7f, 1.3f) * (1.15f - 0.4f * fast); f.t = -wsRange(0.f, 0.6f / std::max(1.f, rainRate) + 0.02f);
                 g_wsFly.push_back(f);
-            } else { wsAddWater(tx, ty, rr, 0.f, g_cfg.wsDrops); wsGridAdd(g_wsFilm, tx, ty, 3.f, 0.35f); }
+            } else { wsAddWater(tx, ty, rr, 0.f, g_cfg.wsDrops); wsGridAdd(g_wsFilm, tx, ty, 3.f, 0.12f + 0.45f * g_wsRainEff * g_wsRainEff); }
         }
         if (g_cfg.wsMicro > 0) {                                       // the fine speckle of tiny droplets that makes wet glass look wet
             g_wsMicroAcc += g_cfg.wsMicroRate * g_wsRainEff * (0.5f + 0.5f * spdN) * g_wsWet * dt;
             for (int guard = 0; g_wsMicroAcc >= 1.f && guard < 80; ++guard) {
                 g_wsMicroAcc -= 1.f;
                 const float mx = wsRange(0.02f, 0.98f), my = wsRange(0.04f, 0.86f);
-                wsAddMicro(mx, my, wsRange(0.0006f, 0.0020f) * g_cfg.wsDropSize, g_cfg.wsMicro); wsGridAdd(g_wsFilm, mx, my, 3.f, 0.25f);
+                wsAddMicro(mx, my, wsRange(0.0006f, 0.0020f) * g_cfg.wsDropSize, g_cfg.wsMicro); wsGridAdd(g_wsFilm, mx, my, 3.f, 0.04f + 0.13f * g_wsRainEff * g_wsRainEff);
             }
         }
     }
@@ -2469,6 +2485,7 @@ class CameraFx {
 public:
     struct Hooks {
         std::function<void(const std::string&)> log;
+        std::function<std::string()> carKey;       // identifies the car in use ("name|id|slot"), empty while unknown
         std::function<bool(int[4])> readIds;       // the material id under each tyre (FL, FR, RL, RR) from the surface scan; false until all four are known
     };
 
@@ -2477,7 +2494,7 @@ public:
     void configure(const std::string& dir, Hooks h, bool cameraOn, bool windscreenOn) {
         if (m_started) return;
         m_started = true;
-        g_dir = dir; g_hostLog = h.log; g_hostIds = h.readIds;
+        g_dir = dir; g_hostLog = h.log; g_hostIds = h.readIds; g_hostCarKey = h.carKey;
         g_enabled = cameraOn; g_wsOn = windscreenOn; g_cfg.wsEnable = windscreenOn ? 1 : 0;
         loadConfig();
         if (g_cfg.log) g_log = fopen((g_dir + "ForceFXCamera.log").c_str(), "w");
@@ -2520,13 +2537,28 @@ public:
     }
 
     // The stage is starting: forget the old head pose and the last stage's events.
-    void stageStarted(int iMap) {
+    void stageStarted(int iMap, const char* player, bool) {
         if (!g_ready) return;
         const WsGameWeather gw = wsReadGameWeather();
         Logf("StageStarted: map id=%d | game conditions: sky=%d (%s) surfaceWetness=%d cloud=%d timeOfDay=%d valid=%d", iMap, gw.sky, wsSkyName(gw.sky), gw.wet, gw.cloud, gw.tod, gw.ok ? 1 : 0);
         g_wsGW = gw; g_wsStageId = iMap; wsApplyStage();
-        g_stageStartTick = GetTickCount(); g_wsReset = true; g_evCrashSurge = 0; g_evCrashSway = 0; g_evLand = 0;
+        g_stageStartTick = GetTickCount();
+        {   // Mud and dirt carry on from the last stage of the same rally; a new rally, a new driver or a stage that was not finished starts clean (new car: see wsStep)
+            const std::string who = player ? player : "";
+            g_wsHist.secondsSinceFinish = g_wsHist.finished ? (float)(GetTickCount() - g_wsFinishTick) / 1000.f : 0.f;
+            const char* why = wsl::cleanReason(g_cfg.wsCarryOver != 0, g_wsHist, iMap, who, g_cfg.wsCarryMinutes);
+            if (why) { g_wsReset = true; Logf("windscreen: glass cleaned for this stage: %s", why); }
+            else { g_wsResetWater = true; Logf("windscreen: mud and dirt carried over from the last stage, water cleared"); }
+            g_wsHist.have = true; g_wsHist.finished = false; g_wsHist.map = iMap; g_wsHist.player = who; g_wsCarCheckUntil = GetTickCount() + 12000;
+        }
+        g_evCrashSurge = 0; g_evCrashSway = 0; g_evLand = 0;
         resetHead(); g_haveBase = false; g_haveLast = false;
+    }
+
+    // The player finished the stage (finishTime > 0) or failed it (0). Only a finished stage lets the mud carry on to the next one.
+    void stageFinished(float finishTime) {
+        if (!g_ready || finishTime <= 0.f) return;
+        g_wsHist.finished = true; g_wsFinishTick = GetTickCount();
     }
 
     // One line for the diagnostics page.

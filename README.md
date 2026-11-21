@@ -86,7 +86,7 @@ Camera builds only. Enable it in the menu with **Windscreen effects** or set `En
 - Rain and snow follow the stage's weather, read from the game. Mud is thrown on rough, wet ground, on landings and on impacts.
 - Wipers clear the glass. The plugin finds the car's real wipers after about 12 seconds of rain and follows them; until then it uses emulated blades.
 - Drops, mud, haze, wipers and the game's own wet-windscreen effect have their own settings in the `[Windscreen]` section of `ForceFX.ini`. Hold Ctrl and press F8 to switch it on and off while driving.
-- With `Ground=1` (default) the dirt follows the surface scan: pale dust on dry gravel, dark mud on wet dirt, grey road spray on wet tarmac, slush on snow, nothing on clean tarmac. `GrimeLife` makes dirt in places the wipers cannot reach dry off instead of building up. The wipers sweep the area between the blade's real positions on the glass; `WiperMeasure=1` reads the blade's length and direction from its mesh.
+- With `Ground=1` (default) the dirt follows the surface scan: pale dust on dry gravel, dark mud on wet dirt, grey road spray on wet tarmac, slush on snow, nothing on clean tarmac. `CarryOver` keeps mud on the glass between the stages of one rally (cleaned for a new car, driver, retired stage or after `CarryMinutes`). `GrimeLife` makes dirt in places the wipers cannot reach dry off instead of building up. The wipers sweep the area between the blade's real positions on the glass; `WiperMeasure=1` reads the blade's length and direction from its mesh.
 - It costs some frame rate. If that is a problem, lower `Micro`, `Drops` and `Mud`, or set `Refraction=0`.
 
 ## Troubleshooting
