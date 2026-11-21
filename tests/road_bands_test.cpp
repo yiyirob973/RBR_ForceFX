@@ -8,6 +8,7 @@
 #include "../materials.hpp"
 #include "../surface_feel.hpp"
 #include "../road_feel.hpp"
+#include "../road_guard.hpp"
 #include "../road_bands.hpp"
 
 static int g_fail = 0, g_checks = 0;

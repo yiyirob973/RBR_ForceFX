@@ -33,7 +33,7 @@
     Your RBR folder, the one that contains the Audio folder.
 
 .PARAMETER SoundsDir
-    Where to put the sounds. Default: the "sounds" folder next to this script. Only needed if you set SoundsFolder in ForceFXAudio.ini.
+    Where to put the sounds. Default: the "sounds" folder next to this script. Only needed if you set SoundsFolder in the [Audio] section of ForceFX.ini.
 
 .PARAMETER OnlyMissing
     Leave any sound that is already in the sounds folder alone (keeps sounds you replaced with your own).

@@ -1,7 +1,7 @@
 # ForceFX dynamic audio: copying the RBR sounds
 
-This folder comes with the **audio** build of ForceFX (`ForceFX-<version>.zip`). The no-audio build
-(`ForceFX-<version>-NoAudio.zip`) does not need it.
+This folder comes with the audio builds of ForceFX (`ForceFX-<version>-Full.zip` and `ForceFX-<version>-Audio.zip`). The
+builds without audio (`-Camera` and `-Basic`) do not need it.
 
 ForceFX plays its sounds from WAV files in `Plugins\ForceFXAudio\sounds`, found by name.
 `Copy-RbrSounds.bat` fills that folder from your RBR installation. It only reads RBR's `Audio` folder and never changes it.
@@ -40,7 +40,7 @@ Options go after the folder in a command prompt:
 - `-OnlyMissing` leaves sounds that are already in the sounds folder alone. Without it, sounds with the same name are
   overwritten, so use this if you have replaced some with your own.
 - `-DryRun` shows what would be copied without copying anything.
-- `-SoundsDir "D:\MySounds"` copies somewhere else. Only needed if you set `SoundsFolder` in `ForceFXAudio.ini`.
+- `-SoundsDir "D:\MySounds"` copies somewhere else. Only needed if you set `SoundsFolder` in the `[Audio]` section of `ForceFX.ini`.
 
 Example: `Copy-RbrSounds.bat "C:\Games\RichardBurnsRally" -OnlyMissing`
 
@@ -51,4 +51,4 @@ ForceFX only reads WAV.
 ## Then turn the audio on
 
 Start RBR, open **Plugins > ForceFX** and switch **Dynamic audio** on. It is off by default. Sound names, mix levels and
-the output device are explained in `ForceFXAudio.ini` and in `audio/surfaces.md` in the repository.
+the output device are explained in the `[Audio]` section of `ForceFX.ini` and in `audio/surfaces.md` in the repository.

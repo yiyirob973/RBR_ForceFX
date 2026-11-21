@@ -3,7 +3,7 @@ name: Build and release ForceFX
 on:
   push:
     branches:
-      - audio
+      - camera
     tags:
       - 'v*'       # runs when you push a tag like v1.0.0
   workflow_dispatch: # lets you run it by hand from the Actions tab
@@ -12,7 +12,7 @@ jobs:
   build-and-release:
     runs-on: windows-latest
     permissions:
-      contents: write # needed to create the release and upload the zip
+      contents: write # needed to create the release and upload the zips
 
     steps:
       - name: Checkout Repository
@@ -23,15 +23,18 @@ jobs:
         with:
           arch: x86
 
-      - name: Compile 32-bit DLL (with audio module)
+      - name: Set the version shown in the game
+        # A tag build shows the tag (for example v0.6.0). Any other build leaves FORCEFX_VERSION unset, so the plugin says
+        # "Dev build" and the date it was compiled.
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
         run: |
-          mkdir build_audio
-          cl /std:c++17 /O2 /MT /EHsc /LD /DFORCEFX_AUDIO /Fo:build_audio\ RBR_ForceFX.cpp /link /DEF:RBR_ForceFX.def dinput8.lib dxguid.lib user32.lib ws2_32.lib winmm.lib /OUT:build_audio\RBR_ForceFX.dll
+          $v = $env:GITHUB_REF_NAME -replace '[^A-Za-z0-9._-]', '-'
+          "FORCEFX_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Compile 32-bit DLL (without audio module)
-        run: |
-          mkdir build_noaudio
-          cl /std:c++17 /O2 /MT /EHsc /LD /Fo:build_noaudio\ RBR_ForceFX.cpp /link /DEF:RBR_ForceFX.def dinput8.lib dxguid.lib user32.lib ws2_32.lib /OUT:build_noaudio\RBR_ForceFX.dll
+      - name: Compile the four 32-bit DLLs (build.bat)
+        shell: cmd
+        run: build.bat
 
       - name: Prepare Release Packages
         shell: pwsh
@@ -41,43 +44,38 @@ jobs:
           if (-not $tag) { $tag = "v0.0.0-dev" }
           $tag = $tag -replace '[\\/]', '-'
 
-          $audioZip   = "ForceFX-$tag.zip"
-          $noAudioZip = "ForceFX-$tag-NoAudio.zip"
+          function Pack($variant, $suffix, $audio, $camera) {
+            $stage = "stage_$variant"
+            New-Item -ItemType Directory -Path $stage | Out-Null
+            Copy-Item "out\$variant\RBR_ForceFX.dll" $stage
+            Copy-Item ForceFX.ini, ForceFXCars.ini $stage
+            if ($audio) {
+              New-Item -ItemType Directory -Path "$stage\ForceFXAudio" | Out-Null
+              Copy-Item audio\tools\* "$stage\ForceFXAudio"
+            }
+            $zip = "ForceFX-$tag-$suffix.zip"
+            Compress-Archive -Path "$stage\*" -DestinationPath $zip
+            return $zip
+          }
 
-          # With audio: DLL, settings files, and the sound-copy script in Plugins\ForceFXAudio
-          mkdir stage_audio
-          copy build_audio\RBR_ForceFX.dll stage_audio\
-          copy ForceFX.ini stage_audio\
-          copy ForceFXCars.ini stage_audio\
-          copy ForceFXAudio.ini stage_audio\
-          mkdir stage_audio\ForceFXAudio
-          copy audio\tools\* stage_audio\ForceFXAudio\
-          Compress-Archive -Path stage_audio\* -DestinationPath $audioZip
-
-          # Without audio: DLL and the force-feedback settings only
-          mkdir stage_noaudio
-          copy build_noaudio\RBR_ForceFX.dll stage_noaudio\
-          copy ForceFX.ini stage_noaudio\
-          copy ForceFXCars.ini stage_noaudio\
-          Compress-Archive -Path stage_noaudio\* -DestinationPath $noAudioZip
-
-          echo "ZIP_AUDIO=$audioZip" >> $env:GITHUB_ENV
-          echo "ZIP_NOAUDIO=$noAudioZip" >> $env:GITHUB_ENV
+          $zips = @(
+            (Pack "full"   "Full"   $true  $true),    # dynamic audio and camera
+            (Pack "audio"  "Audio"  $true  $false),   # dynamic audio only
+            (Pack "camera" "Camera" $false $true),    # camera only
+            (Pack "basic"  "Basic"  $false $false)    # force feedback only
+          )
+          "ZIPS<<EOF`n" + ($zips -join "`n") + "`nEOF" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Upload build artifact (branch builds)
         uses: actions/upload-artifact@v4
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           name: ForceFX-builds
-          path: |
-            ${{ env.ZIP_AUDIO }}
-            ${{ env.ZIP_NOAUDIO }}
+          path: ${{ env.ZIPS }}
 
-      - name: Create GitHub Release and Upload Zip
+      - name: Create GitHub Release and Upload Zips
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: |
-            ${{ env.ZIP_AUDIO }}
-            ${{ env.ZIP_NOAUDIO }}
+          files: ${{ env.ZIPS }}
           generate_release_notes: true

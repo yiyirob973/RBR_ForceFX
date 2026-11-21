@@ -1,17 +1,43 @@
 @echo off
-rem Builds both ForceFX variants. Run it from an "x86 Native Tools Command Prompt for VS" (32-bit).
-rem   out\audio\RBR_ForceFX.dll     with the dynamic audio module
-rem   out\noaudio\RBR_ForceFX.dll   without it
+rem Builds the four ForceFX variants. Run it from an "x86 Native Tools Command Prompt for VS" (32-bit).
+rem   out\full\RBR_ForceFX.dll     dynamic audio + camera
+rem   out\audio\RBR_ForceFX.dll    dynamic audio only
+rem   out\camera\RBR_ForceFX.dll   camera only
+rem   out\basic\RBR_ForceFX.dll    force feedback only
+rem The camera uses MinHook, which is built for the dynamic C runtime, so the variants with the camera are built with /MD and
+rem need the Microsoft Visual C++ 2015-2022 x86 Redistributable. The others are built with /MT and need nothing.
+rem The version shown in the game is taken from the FORCEFX_VERSION environment variable (the release workflow sets it to the
+rem git tag, for example v0.6.0). Without it the build calls itself "Dev build" and shows the date it was compiled.
 setlocal
 cd /d "%~dp0"
-if not exist out\audio mkdir out\audio
-if not exist out\noaudio mkdir out\noaudio
-
-cl /std:c++17 /O2 /MT /EHsc /LD /DFORCEFX_AUDIO /Fo:out\audio\ RBR_ForceFX.cpp /link /DEF:RBR_ForceFX.def dinput8.lib dxguid.lib user32.lib ws2_32.lib winmm.lib /OUT:out\audio\RBR_ForceFX.dll || goto :fail
-cl /std:c++17 /O2 /MT /EHsc /LD /Fo:out\noaudio\ RBR_ForceFX.cpp /link /DEF:RBR_ForceFX.def dinput8.lib dxguid.lib user32.lib ws2_32.lib /OUT:out\noaudio\RBR_ForceFX.dll || goto :fail
+call :build full 1 1 || goto :fail
+call :build audio 1 0 || goto :fail
+call :build camera 0 1 || goto :fail
+call :build basic 0 0 || goto :fail
 echo.
-echo Built out\audio\RBR_ForceFX.dll and out\noaudio\RBR_ForceFX.dll
+echo Built out\full, out\audio, out\camera and out\basic
 exit /b 0
+
+:build
+set "NAME=%~1"
+set "DEFS="
+set "CRT=/MT"
+set "LIBS=dinput8.lib dxguid.lib user32.lib ws2_32.lib"
+set "EXTRA="
+if defined FORCEFX_VERSION set "DEFS=%DEFS% /DFORCEFX_VERSION=\"%FORCEFX_VERSION%\""
+if "%~2"=="1" (
+    set "DEFS=%DEFS% /DFORCEFX_AUDIO"
+    set "LIBS=%LIBS% winmm.lib"
+)
+if "%~3"=="1" (
+    set "DEFS=%DEFS% /DFORCEFX_CAMERA"
+    set "CRT=/MD"
+    set "EXTRA=thirdparty\lib\libminhook.x86.lib"
+)
+if not exist out\%NAME% mkdir out\%NAME%
+cl /std:c++17 /O2 %CRT% /EHsc /LD %DEFS% /Fo:out\%NAME%\ RBR_ForceFX.cpp %EXTRA% /link /DEF:RBR_ForceFX.def %LIBS% /OUT:out\%NAME%\RBR_ForceFX.dll
+exit /b %errorlevel%
+
 :fail
 echo Build failed.
 exit /b 1
