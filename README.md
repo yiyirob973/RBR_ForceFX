@@ -43,6 +43,7 @@ Extra force feedback for Richard Burns Rally. ForceFX reads NGP telemetry and ad
 Settings live in `ForceFX.ini`, which describes every option. The most useful ones are also in the in-game menu.
 
 - **Road gain** (`RoadMaxMagnitude`) is the one setting for how strong the road feel is. The surface and what the car is doing decide what it feels like.
+- **Road feel delivery** (`RoadViaRbr`, also in the menu): by default the road vibration is added to RBR's own steering force, so the wheel gets no extra road effect. Set it to 0 to play the road as one sine effect of its own: less detailed, but easy on the wheel. It does this by itself when RBR's force updates aren't available. Use the default if bumps make the wheel feel heavy or sticky to turn; the road may then need a higher road gain.
 - **Total output** (`TotalMaxMagnitude`) caps all effects together. If the wheel feels too strong or busy, lower this first.
 - **Live level** scales everything down while you drive: Numpad **+** and **-** change it, Numpad **\*** mutes the added effects (keys are configurable in `ForceFX.ini`). It can only turn effects down, never past your limits.
 - **Per-car profiles** are in `ForceFXCars.ini`. A profile can change a car's engine and road strength and set its `Drivetrain=RWD|FWD|AWD`. Cars without an entry are treated as RWD. The drivetrain decides which tyres can have wheelspin.

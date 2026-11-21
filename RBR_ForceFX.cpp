@@ -185,6 +185,7 @@ struct Config {
 
     // effect switches (menu): 1 = on, 0 = off
     int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandBoost = 1, fxSurface = 1;
+    int   roadViaRbr = 1;            // 1 = the road vibration is added to RBR's own force updates, so the wheel gets no extra road effect; 0 = one sine effect of its own
     int   probe = 0;                 // 1 = write ForceFX_probe.csv (ground ids and road signals ten times a second) for tuning surfaces; read at start only
 #ifdef FORCEFX_AUDIO
     int   fxAudio = 0;               // dynamic surface audio (settings in the [Audio] section of ForceFX.ini); off until switched on
@@ -277,7 +278,7 @@ void ClampConfig(Config& c) {
     c.drivetrain = std::max((int)Tyre::FWD, std::min(c.drivetrain, (int)Tyre::AWD));
     c.wheelbase = clampf(c.wheelbase, 1.5f, 4.0f); c.trackWidth = clampf(c.trackWidth, 1.0f, 2.2f); c.cgToFront = clampf(c.cgToFront, 0.4f * c.wheelbase, 0.6f * c.wheelbase);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
-    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0;
+    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0; c.roadViaRbr = c.roadViaRbr ? 1 : 0;
 #ifdef FORCEFX_AUDIO
     c.fxAudio = c.fxAudio ? 1 : 0;
     c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f);
@@ -326,7 +327,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
     F("ImpactGain", c.impactGain);
     F("BrakeHzScale", c.brakeHzScale); F("PriorityDuck", c.priorityDuck);
-    I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("EnableBrake", c.fxBrake);
+    I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("RoadViaRbr", c.roadViaRbr); I("EnableBrake", c.fxBrake);
     I("SurfaceProbe", c.probe);
 #ifdef FORCEFX_AUDIO
     I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp);
@@ -2849,6 +2850,7 @@ private:
             // effect switches (turn effects off to feel the others on their own)
             {"Effect: Engine",                   "EnableEngine",       &Config::fxEngine,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Road feel",                "EnableRoad",         &Config::fxRoad,       nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
+            {"Road feel delivery",               "RoadViaRbr",         &Config::roadViaRbr,   nullptr,  0.0f,   1.0f, 1.0f, 'r', false},
             {"Effect: Surface feel",             "EnableSurfaceFeel",  &Config::fxSurface,    nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Braking",                  "EnableBrake",        &Config::fxBrake,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Landing boost",            "EnableLandingBoost", &Config::fxLandBoost,  nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
@@ -2882,6 +2884,7 @@ private:
             case '%': snprintf(out, n, "%.0f%%", v * 100.0f); break;
             case 'H': snprintf(out, n, "%.0f Hz", v); break;
             case 'o': snprintf(out, n, "%s", v >= 0.5f ? "ON" : "OFF"); break;
+            case 'r': snprintf(out, n, "%s", v >= 0.5f ? "Through RBR's force" : "Own effect"); break;
             default:  snprintf(out, n, "x%.2f", v); break;
         }
     }
@@ -2958,6 +2961,7 @@ private:
 #endif
             {"EnableEngine",       "Turns the engine vibration on or off. Handy for feeling what each effect does on its own."},
             {"EnableRoad",         "Turns the road feel (texture, bumps and ground) on or off."},
+            {"RoadViaRbr",         "How the road vibration reaches the wheel. Through RBR's force: it is added to RBR's own steering force, so the wheel gets no extra road effect. Own effect: the road is one sine effect of its own, less detailed but easy on the wheel. If the road makes the wheel feel heavy or sticky to turn, use Through RBR's force; it may need a higher road gain. Without RBR's force updates it falls back to the own effect by itself."},
             {"EnableBrake",        "Turns the braking judder and front-wheel lock-up shake on or off."},
             {"EnableSurfaceFeel",  "Lets the ground under each tyre shape the road feel, together with how fast the car goes and how much the wheels slip: loose ground is grainy and throws stones, soft ground is dull, slippery hard ground is quiet with sharp cracks, cobbles hammer in time with your speed. Needs the road feel effect. Off, the road feels the same on every surface."},
             {"EnableLandingBoost", "Turns the landing boost on or off. With it off, landings feel exactly as RBR sends them."},
