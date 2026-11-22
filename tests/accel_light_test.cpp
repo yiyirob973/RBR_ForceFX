@@ -1,4 +1,4 @@
-// Tests for light steering under hard acceleration (accel_light.hpp). Self-contained:
+// Tests for light steering from the front load (accel_light.hpp). Self-contained:
 //   g++ -std=c++17 -O1 accel_light_test.cpp -o accel_light_test && ./accel_light_test
 #include <cmath>
 #include <cstdio>
@@ -16,121 +16,169 @@ struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back(
 
 using AccelLight::In; using AccelLight::Out;
 
+static In standing(float share = 0.52f) { In in; in.frontShare = share; in.speed = 0.0f; in.throttle = 0.0f; return in; }
 static In cruise(float share = 0.52f) { In in; in.frontShare = share; in.throttle = 0.2f; in.speed = 25; in.accOk = true; in.accMag = 0.3f; return in; }
-static In launch(float share, float thr = 1.0f) { In in; in.frontShare = share; in.throttle = thr; in.speed = 20; in.accOk = true; in.accMag = 6.0f; return in; }
+static In moving(float share, float thr = 1.0f, float speed = 6.0f) { In in; in.frontShare = share; in.throttle = thr; in.speed = speed; in.accOk = true; in.accMag = 6.0f; return in; }
 static Out run(AccelLight::Tracker& t, In in, float secs) { Out o; for (int i = 0; i < (int)(secs * 100); ++i) o = t.Update(in, 0.01f); return o; }
 
-TEST(nothing_happens_until_the_normal_share_is_learned) {
+TEST(the_standing_share_is_known_from_the_start_line) {
     AccelLight::Tracker t;
-    const Out o = run(t, launch(0.40f), 3.0f);                          // hard acceleration from the first second: nothing to compare with
-    CHECK(!o.learned && o.effect == 0.0f && o.drop == 0.0f);
+    const Out o = run(t, standing(0.54f), 0.6f);
+    CHECK(o.learned && o.fromRest && std::fabs(o.base - 0.54f) < 0.01f);
+    CHECK(o.drop == 0.0f && o.rawDrop == 0.0f);                        // standing: nothing is lost
     AccelLight::Tracker t2;
-    CHECK(!run(t2, cruise(), 1.0f).learned);                            // 1 s of steady driving is not yet enough
-    CHECK(run(t2, cruise(), 1.0f).learned);
+    CHECK(!run(t2, standing(), 0.2f).learned);                          // a fifth of a second is not enough to trust it
 }
 
-TEST(the_normal_share_is_learned_from_steady_driving) {
+TEST(the_launch_is_lightened_at_once_with_no_wait) {
     AccelLight::Tracker t;
-    const Out o = run(t, cruise(0.55f), 5.0f);
-    CHECK(o.learned && std::fabs(o.base - 0.55f) < 0.01f);
-    CHECK(o.drop == 0.0f && o.rawDrop == 0.0f && o.effect == 0.0f);     // at normal: nothing
+    run(t, standing(0.52f), 3.0f);                                      // sitting on the start line
+    float first = 1.0f; int ms = -1;
+    for (int i = 0; i < 100; ++i) {
+        const Out o = t.Update(moving(0.40f, 1.0f, 0.2f + i * 0.2f), 0.01f);   // the launch: the front unloads as the car starts to move
+        if (ms < 0 && AccelLight::Mul(o, 1.0f) < 0.9f) { ms = i * 10; first = AccelLight::Mul(o, 1.0f); }
+    }
+    CHECK(ms >= 0 && ms <= 200);                                        // within the first fifth of a second of the launch
+    CHECK(first < 0.9f);
 }
 
-TEST(hard_acceleration_that_unloads_the_front_lightens_the_steering) {
+TEST(the_steering_loses_force_in_proportion_to_the_front_load_lost) {
     AccelLight::Tracker t;
-    run(t, cruise(0.52f), 4.0f);
-    const Out o = run(t, launch(0.42f), 1.5f);                          // front share down by about 19% of normal
-    CHECK(o.learned && o.drop > 0.12f && o.effect > 0.9f);
-    CHECK(o.rawDrop > 0.17f && o.rawDrop < 0.21f);                      // the measured drop, 0.42 against 0.52, is reported as it is
-    CHECK(std::fabs(AccelLight::Mul(o, 0.3f) - 0.7f) < 0.03f);
+    run(t, standing(0.50f), 2.0f);
+    const Out o = run(t, moving(0.40f), 2.0f);                          // the front carries 20% less than standing
+    CHECK(o.rawDrop > 0.19f && o.rawDrop < 0.21f);
+    CHECK(std::fabs(AccelLight::Mul(o, 1.0f) - (1.0f - (0.20f - AccelLight::kDeadband))) < 0.01f);   // proportional, past the small dead band
+    CHECK(AccelLight::Mul(o, 0.5f) > AccelLight::Mul(o, 1.0f) && AccelLight::Mul(o, 1.0f) > AccelLight::Mul(o, 2.0f));
     CHECK(AccelLight::Mul(o, 0.0f) == 1.0f);                            // off: exactly RBR's force
 }
 
-TEST(a_small_unloading_is_a_small_effect) {
+TEST(the_pedals_do_not_decide_the_load_does) {
     AccelLight::Tracker t;
-    run(t, cruise(0.52f), 4.0f);
-    const Out o = run(t, launch(0.49f), 1.5f);                          // 6% of normal
-    CHECK(o.effect > 0.2f && o.effect < 0.7f);
+    run(t, standing(0.50f), 2.0f);
+    const Out o = run(t, moving(0.40f, 0.0f, 20.0f), 2.0f);             // no throttle, front unloaded (a steep uphill, a crest): the steering is still light
+    CHECK(AccelLight::Mul(o, 1.0f) < 0.85f);
+    AccelLight::Tracker t2;
+    run(t2, standing(0.50f), 2.0f);
+    CHECK(AccelLight::Mul(run(t2, moving(0.50f, 1.0f, 20.0f), 2.0f), 1.0f) == 1.0f);   // flat out but the front keeps its load: nothing
 }
 
-TEST(loading_the_front_more_does_nothing_and_neither_does_braking) {
+TEST(more_weight_on_the_front_is_left_to_rbr) {
     AccelLight::Tracker t;
-    run(t, cruise(0.52f), 4.0f);
-    CHECK(run(t, launch(0.60f), 1.0f).effect == 0.0f);                  // weight forward
-    In brake = launch(0.40f, 0.0f); brake.brake = 0.8f;                 // front share down but on the brakes (a crest, say)
-    CHECK(run(t, brake, 1.0f).effect == 0.0f);
+    run(t, standing(0.50f), 2.0f);
+    const Out o = run(t, moving(0.62f, 0.0f, 20.0f), 2.0f);             // braking or downhill
+    CHECK(o.drop == 0.0f && o.rawDrop == 0.0f && AccelLight::Mul(o, 2.0f) == 1.0f);
 }
 
-TEST(a_crest_without_throttle_does_nothing) {
+TEST(never_more_than_the_limit_and_never_in_the_air) {
     AccelLight::Tracker t;
-    run(t, cruise(0.52f), 4.0f);
-    In crest = launch(0.38f, 0.1f); crest.accMag = 1.0f;
-    CHECK(run(t, crest, 1.0f).effect < 0.01f);
+    run(t, standing(0.50f), 2.0f);
+    const Out o = run(t, moving(0.10f), 2.0f);                          // almost no front load at all
+    CHECK(AccelLight::Mul(o, 2.0f) >= 1.0f - AccelLight::kMaxCut - 1e-4f);
+    In air = moving(0.10f); air.airborne = 1.0f;
+    CHECK(run(t, air, 1.0f).drop < 0.01f);
 }
 
-TEST(not_in_the_air_and_not_when_crawling) {
+TEST(a_bump_does_not_flicker_the_steering) {
     AccelLight::Tracker t;
-    run(t, cruise(0.52f), 4.0f);
-    In air = launch(0.40f); air.airborne = 1.0f;
-    CHECK(run(t, air, 1.0f).effect == 0.0f);
-    In slow = launch(0.40f); slow.speed = 1.0f;
-    CHECK(run(t, slow, 1.0f).effect == 0.0f);
+    run(t, standing(0.50f), 2.0f);
+    run(t, cruise(0.50f), 0.5f);
+    float worst = 1.0f;
+    for (int i = 0; i < 3; ++i) worst = std::min(worst, AccelLight::Mul(t.Update(moving(0.30f), 0.01f), 1.0f));   // 30 ms of the front unloading by 40%
+    for (int i = 0; i < 50; ++i) worst = std::min(worst, AccelLight::Mul(t.Update(cruise(0.50f), 0.01f), 1.0f));
+    CHECK(worst > 0.9f);
 }
 
 TEST(it_fades_in_and_out_and_never_snaps) {
     AccelLight::Tracker t;
-    run(t, cruise(0.52f), 4.0f);
-    float prev = 0, maxStep = 0, peak = 0;
-    for (int i = 0; i < 300; ++i) { const Out o = t.Update(launch(0.40f), 0.01f); maxStep = std::max(maxStep, std::fabs(o.effect - prev)); prev = o.effect; peak = std::max(peak, o.effect); }
-    for (int i = 0; i < 300; ++i) { const Out o = t.Update(cruise(0.52f), 0.01f); maxStep = std::max(maxStep, std::fabs(o.effect - prev)); prev = o.effect; }
-    CHECK(peak > 0.9f && maxStep < 0.1f && prev < 0.02f);
+    run(t, standing(0.50f), 2.0f);
+    float prev = 1.0f, maxStep = 0.0f, low = 1.0f;
+    for (int i = 0; i < 300; ++i) { const float m = AccelLight::Mul(t.Update(moving(0.38f), 0.01f), 1.0f); maxStep = std::max(maxStep, std::fabs(m - prev)); prev = m; low = std::min(low, m); }
+    for (int i = 0; i < 300; ++i) { const float m = AccelLight::Mul(t.Update(cruise(0.50f), 0.01f), 1.0f); maxStep = std::max(maxStep, std::fabs(m - prev)); prev = m; }
+    CHECK(low < 0.85f && maxStep < 0.03f && prev > 0.99f);
 }
 
-TEST(cornering_does_not_teach_it_a_wrong_normal) {
+TEST(revving_on_the_line_does_not_teach_it_the_squat) {
     AccelLight::Tracker t;
-    run(t, cruise(0.52f), 4.0f);
-    In corner = cruise(0.45f); corner.accMag = 7.0f;                    // a hard corner shifts the share, and is not steady driving
-    run(t, corner, 6.0f);
-    const Out o = run(t, cruise(0.52f), 0.5f);
+    run(t, standing(0.52f), 2.0f);
+    In rev = standing(0.45f); rev.throttle = 0.9f;                      // revving against the brake: the car squats, the front share falls
+    const Out o = run(t, rev, 3.0f);
     CHECK(std::fabs(o.base - 0.52f) < 0.01f);
+    CHECK(AccelLight::Mul(o, 1.0f) < 1.0f);                             // and the lightness is measured against the idle share
 }
 
-TEST(without_known_units_the_pedals_alone_decide_what_is_steady) {
+TEST(standing_again_refreshes_the_standing_share) {
     AccelLight::Tracker t;
-    In a = cruise(0.52f); a.accOk = false;
-    run(t, a, 4.0f);
-    In l = launch(0.42f); l.accOk = false;
-    CHECK(run(t, l, 1.5f).effect > 0.9f);
+    run(t, standing(0.50f), 2.0f);
+    run(t, moving(0.40f), 2.0f);
+    const Out o = run(t, standing(0.46f), 4.0f);                        // a restart, or another car: a different standing share
+    CHECK(std::fabs(o.base - 0.46f) < 0.01f && o.drop < 0.01f);
 }
 
-TEST(the_amount_is_limited) {
-    Out full; full.effect = 1.0f;
-    CHECK(AccelLight::Mul(full, 5.0f) >= 0.4f - 1e-4f);                 // never more than 60% off
-    CHECK(AccelLight::Mul(full, -1.0f) == 1.0f);
-    Out half; half.effect = 0.5f;
-    CHECK(std::fabs(AccelLight::Mul(half, 0.4f) - 0.8f) < 1e-4f);
-    Out none;
-    CHECK(AccelLight::Mul(none, 0.6f) == 1.0f);
+TEST(a_car_already_moving_learns_from_steady_driving_after_a_second) {
+    AccelLight::Tracker t;
+    CHECK(!run(t, cruise(0.52f), 0.8f).learned);
+    const Out o = run(t, cruise(0.52f), 0.5f);
+    CHECK(o.learned && !o.fromRest && std::fabs(o.base - 0.52f) < 0.01f);
+    CHECK(AccelLight::Mul(run(t, moving(0.42f), 1.0f), 1.0f) < 0.9f);
+}
+
+TEST(a_start_on_a_hill_is_corrected_once_the_car_rolls_on_the_flat) {
+    AccelLight::Tracker up;                                              // standing uphill: weight to the rear, the standing front share reads low
+    run(up, standing(0.49f), 3.0f);
+    run(up, cruise(0.52f), 25.0f);                                       // then driving steadily on the flat
+    CHECK(std::fabs(run(up, cruise(0.52f), 0.1f).base - 0.52f) < 0.01f);
+    AccelLight::Tracker down;                                            // standing downhill: reads high, so a flat road looks like an unloaded front at first
+    run(down, standing(0.55f), 3.0f);
+    const Out early = run(down, cruise(0.52f), 1.0f);
+    CHECK(AccelLight::Mul(early, 1.0f) > 0.95f);                         // a few percent at most, and only until it has caught up
+    const Out late = run(down, cruise(0.52f), 25.0f);
+    CHECK(std::fabs(late.base - 0.52f) < 0.01f && AccelLight::Mul(late, 1.0f) == 1.0f);
+}
+
+TEST(the_slope_error_is_small_next_to_a_launch) {
+    AccelLight::Tracker flat, hill;
+    run(flat, standing(0.52f), 3.0f);
+    run(hill, standing(0.50f), 3.0f);                                    // a steep start: the standing share two points lower
+    const float f = AccelLight::Mul(run(flat, moving(0.43f), 2.0f), 1.0f), h = AccelLight::Mul(run(hill, moving(0.43f), 2.0f), 1.0f);
+    CHECK(f < 0.85f && h < 0.90f && std::fabs(f - h) < 0.06f);           // the launch is still clearly light either way
+}
+
+TEST(a_long_hard_launch_does_not_teach_the_normal) {
+    AccelLight::Tracker t;
+    run(t, standing(0.52f), 3.0f);
+    run(t, moving(0.43f), 12.0f);                                        // twelve seconds of hard acceleration
+    const Out o = run(t, moving(0.43f), 0.1f);
+    CHECK(std::fabs(o.base - 0.52f) < 0.01f && AccelLight::Mul(o, 1.0f) < 0.85f);
+}
+
+TEST(cornering_does_not_teach_a_wrong_normal) {
+    AccelLight::Tracker t;
+    run(t, cruise(0.52f), 3.0f);
+    In corner = cruise(0.45f); corner.accMag = 7.0f;
+    run(t, corner, 6.0f);
+    CHECK(std::fabs(run(t, cruise(0.52f), 0.2f).base - 0.52f) < 0.01f);
+}
+
+TEST(nothing_before_anything_is_known_and_after_a_reset) {
+    AccelLight::Tracker t;
+    const Out o = t.Update(moving(0.30f), 0.01f);                       // the very first reading is a car in the middle of a launch: no normal to compare with
+    CHECK(!o.learned && AccelLight::Mul(o, 2.0f) == 1.0f);
+    AccelLight::Tracker t2;
+    run(t2, standing(0.50f), 2.0f);
+    t2.Reset();
+    CHECK(AccelLight::Mul(t2.Update(moving(0.30f), 0.01f), 2.0f) == 1.0f);
 }
 
 TEST(bad_input_never_makes_nan) {
     AccelLight::Tracker t;
     const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
-    run(t, cruise(), 3.0f);
+    run(t, standing(), 1.0f);
     In bad; bad.frontShare = nan; bad.throttle = inf; bad.brake = nan; bad.speed = -inf; bad.airborne = nan; bad.accMag = nan; bad.accOk = true;
     for (int i = 0; i < 50; ++i) {
         const Out o = t.Update(bad, i % 2 ? nan : -1.0f);
-        CHECK(std::isfinite(o.base) && std::isfinite(o.drop) && std::isfinite(o.effect) && o.effect >= 0.0f && o.effect <= 1.0f);
+        CHECK(std::isfinite(o.base) && std::isfinite(o.share) && std::isfinite(o.drop) && std::isfinite(o.rawDrop) && o.drop >= 0.0f);
     }
     CHECK(AccelLight::Mul(t.Update(bad, 0.01f), nan) == 1.0f);
-}
-
-TEST(reset_forgets_everything) {
-    AccelLight::Tracker t;
-    run(t, cruise(0.52f), 4.0f);
-    t.Reset();
-    const Out o = run(t, launch(0.40f), 1.0f);
-    CHECK(!o.learned && o.effect == 0.0f);
 }
 
 int main() {
