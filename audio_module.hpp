@@ -33,6 +33,7 @@ public:
     void telemetryLost() {}
     void newStage() {}
     void setLevels(float, float, float) {}
+    void splash(float, int) {}
     void setCar(int, double, double, double) {}
     void setSpeedUnits(bool) {}
     std::string status() { return std::string(); }

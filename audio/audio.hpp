@@ -149,6 +149,8 @@ public:
         auto it = map_.find(lower(key));
         return it == map_.end() ? nullptr : &it->second;
     }
+    // Adds a sound made in code (see water_sounds.hpp) under the key a file of that name would have.
+    void add(const std::string& key, std::vector<float> data) { map_[lower(key)].push_back(std::move(data)); }
     static std::string keyFor(const std::string& stem) {
         std::string s = lower(stem);
         size_t u = s.find_last_of('_');
@@ -463,6 +465,7 @@ public:
             case SoundEvent::Landing: v = bank_.get("debris_landing"); if (!v) v = bank_.get("debris_impact"); break;
             case SoundEvent::SuspSqueak: v = bank_.get("susp_squeak"); break;
             case SoundEvent::SuspBottom: v = bank_.get("susp_bottom"); break;
+            case SoundEvent::Splash: v = bank_.get("water_splash"); if (!v) v = bank_.get("debris_splash"); break;
         }
         if (!v || v->empty()) return;
         float g;

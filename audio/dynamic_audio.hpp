@@ -19,6 +19,7 @@
 #include <vector>
 #include "core.hpp"
 #include "audio.hpp"
+#include "water_sounds.hpp"
 #include "waveout.hpp"
 
 namespace rsa {
@@ -121,6 +122,18 @@ public:
         liveDebris_ = debris; liveImpacts_ = impacts; liveSusp_ = suspension;
         std::lock_guard<std::mutex> lk(mu_);
         if (s_) s_->sink->setLiveLevels(debris, impacts, suspension);
+    }
+
+    // A tyre hit (or left) standing water: plays the splash, panned to that tyre, louder and lower the harder it hit (0..1).
+    // Safe to call from any thread.
+    void splash(float strength, int tyre) {
+        if (state_.load() != Running) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!s_) return;
+        const float k = strength > 0.0f ? (strength < 1.0f ? strength : 1.0f) : 0.0f;
+        const int w = tyre >= 0 && tyre < 4 ? tyre : 0;
+        float l, r; panGains(kWheelPan[w], (0.30f + 0.70f * k) * kWheelScale[w], l, r);
+        s_->sink->trigger(SoundEvent::Splash, 0, l, r, 1.15f - 0.30f * k);
     }
 
     // Units of the telemetry speed field, from SpeedIsKph in [ForceFX]: one setting for the whole plugin.
@@ -245,6 +258,7 @@ private:
             s->bank->normalize = st.normalizeSounds;
             s->bank->load(sounds);
             log("Dynamic audio: " + std::to_string(s->bank->fileCount) + " sound files from " + sounds);
+            if (const int made = wsnd::addWaterFallbacks(*s->bank)) log("Dynamic audio: no water sounds in the folder, made " + std::to_string(made) + " of splash / water_loop / water_hit in code (add your own water_*.wav to replace them)");
             log("Audio devices: " + WaveOutPlayer::describeDevices());
             for (const std::string& e : s->bank->errors) log("  sound problem: " + e);
 

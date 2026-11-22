@@ -322,6 +322,7 @@ struct Inputs {                                                       // written
 std::atomic<float>    g_pkSurge{0}, g_pkSway{0}, g_pkHeave{0}, g_pkYaw{0}, g_pkSteer{0}, g_pkCarRoll{0};
 char                  g_pktLast[1500]; std::atomic<int> g_pktLen{0};      // last telemetry packet (only kept when [Windscreen] Probe=1)
 std::atomic<float>    g_wsSplash{0};                                       // landing / impact strength handed to WindscreenFX (mud splatter)
+std::atomic<float>    g_wsWaterHit{0};                                     // a tyre hit standing water, 0..1: WindscreenFX throws a wash of water at the glass
 std::atomic<float>    g_evCrashSurge{0}, g_evCrashSway{0}, g_evLand{0};   // impact events (signed excess g / landing strength), consumed by the render thread
 std::atomic<bool>     g_airborne{false};
 std::atomic<float>    g_loadFrac{1.f};
@@ -1331,12 +1332,26 @@ void wsMudThrow(float power, int tint, bool spray) {                   // a burs
         g_wsFly.push_back(f);
     }
 }
+void wsWaterSplash(float power) {                                     // a tyre hit standing water: a wash of clear water is thrown up at the glass, blurs it and runs until the wipers clear it
+    power = std::max(0.f, std::min(1.f, power));
+    const int n = 10 + (int)(power * 34.f);
+    for (int i = 0; i < n; ++i) {
+        const float side = wsRnd() < 0.5f ? 0.27f : 0.73f;
+        WsFly f{}; f.kind = 0; f.mode = 1; f.shade = 1.f; f.variant = 1;                                         // variant 1: lands with a wide wash of film, not a single bead
+        f.r = (wsRnd() < 0.7f ? wsRange(0.003f, 0.009f) : wsRange(0.009f, 0.020f)) * (0.7f + 0.5f * power) * g_cfg.wsDropSize;
+        f.x1 = std::max(0.03f, std::min(0.97f, side + (wsRange(-1.f, 1.f) + wsRange(-1.f, 1.f)) * 0.30f / g_wsAspect * 1.6f));
+        f.y1 = 0.12f + 0.72f * std::pow(wsRnd(), 0.8f);
+        f.x0 = side + wsRange(-0.05f, 0.05f); f.y0 = 1.03f; f.arc = wsRange(-0.06f, 0.06f);
+        f.dur = wsRange(0.22f, 0.40f); f.t = -wsRange(0.f, 0.25f);
+        g_wsFly.push_back(f);
+    }
+}
 void wsFlyUpdate(float dt) {                                           // advance everything in flight, land what has arrived
     for (WsFly& f : g_wsFly) {
         f.t += dt / std::max(0.05f, f.dur);
         if (f.t < 1.f) continue;
         switch (f.kind) {
-            case 0: wsAddWater(f.x1, f.y1, f.r, 0.f, g_cfg.wsDrops); wsGridAdd(g_wsFilm, f.x1, f.y1, 3.5f, (f.r < 0.0055f ? 0.30f : 0.55f) * (0.25f + 0.75f * g_wsRainEff * g_wsRainEff)); break;
+            case 0: wsAddWater(f.x1, f.y1, f.r, 0.f, g_cfg.wsDrops); if (f.variant == 1) wsGridAdd(g_wsFilm, f.x1, f.y1, 6.f, 0.55f); else wsGridAdd(g_wsFilm, f.x1, f.y1, 3.5f, (f.r < 0.0055f ? 0.30f : 0.55f) * (0.25f + 0.75f * g_wsRainEff * g_wsRainEff)); break;   // a splash lands as a wash, rain as a bead
             case 2: wsAddFlake(f.x1, f.y1, f.r, g_cfg.wsSnowMax); wsGridAdd(g_wsFilm, f.x1, f.y1, 4.f, 1.0f); break;
             default: wsMudLand(f); break;
         }
@@ -1452,7 +1467,9 @@ void wsWipe(float W, float H) {
             float tx, ty; if (!swept(((float)i + 0.5f) * cw, ((float)j + 0.5f) * ch, cr, tx, ty)) continue;
             float& f = g_wsFilm[j * kGX + i]; float& dt = g_wsDirt[j * kGX + i];
             const float wetNow = std::max(f, g_wsRainEff > 0.02f ? 0.6f : 0.f);
-            mass += f * 0.05f; f *= 0.03f; dt *= 0.62f - 0.30f * clamp01(wetNow);      // a wet blade lifts dirt, a dry one mostly smears it
+            const float resid = g_wsRainEff > 0.02f ? 0.10f + 0.16f * g_wsRainEff : 0.f;   // a real blade never leaves it bone dry in the rain: a thin film stays, and fine droplets are left along the stroke
+            mass += f * 0.05f; f = std::max(f * 0.03f, std::min(f, resid)); dt *= 0.62f - 0.30f * clamp01(wetNow);      // a wet blade lifts dirt, a dry one mostly smears it
+            if (g_cfg.wsMicro > 0 && g_wsRainEff > 0.05f && wsRnd() < 0.35f * g_wsRainEff) wsAddMicro(((float)i + wsRange(0.f, 1.f)) / (float)kGX, ((float)j + wsRange(0.f, 1.f)) / (float)kGY, wsRange(0.0008f, 0.0022f) * g_cfg.wsDropSize, g_cfg.wsMicro);
         }
         if (g_cfg.wsWiperBow) g_wsBow[bi] = std::min(1.5f, g_wsBow[bi] + mass * 0.045f);
     }
@@ -1557,6 +1574,8 @@ void wsStep(float dt, float W, float H) {
         }
     }
     const float splash = g_wsSplash.exchange(0.f);
+    const float waterHit = g_wsWaterHit.exchange(0.f);
+    if (g_cfg.wsMode != 0 && waterHit > 0.05f) wsWaterSplash(waterHit);
     if (g_cfg.wsMode & 2) {
         const float lg = gnd ? g_wsGround.loose * (0.75f + 0.25f * loose) : loose;   // what the tyres can throw; bumps shake a little more loose
         const float mudRate = g_cfg.wsMudRate * g_wsMudMul * (gnd ? g_wsGround.mudMul : wetMul) / 60.f * spdN * std::pow(lg, 1.5f) * (1.f + 0.5f * std::min(1.f, std::fabs(g_in.sway.load())));   // speed on loose, wet ground, more when cornering
@@ -2530,6 +2549,12 @@ public:
 
     void setActive(bool on) { g_enabled = on; }
     void setWindscreen(bool on) { g_wsOn = on; }
+
+    // A tyre hit standing water at this strength (0..1): the windscreen throws a splash of water, the same way a landing throws mud.
+    // Ignored while the windscreen effects are off, so a stale splash can not appear when they are switched on later.
+    void splash(float strength) {
+        if (g_ready && g_wsOn.load() && strength > 0.0f) storeMax(g_wsWaterHit, strength < 1.0f ? strength : 1.0f);
+    }
 
     // One NGP telemetry packet. Safe to call from any thread, one packet at a time.
     void feed(const uint8_t* data, int len) {

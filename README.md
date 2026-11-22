@@ -12,6 +12,7 @@ Extra force feedback for Richard Burns Rally. ForceFX reads NGP telemetry and ad
 - **Road:** vibration that follows the surface under each tyre (gravel, snow, ice, grass, tarmac, cobbles) together with speed, wheel slip and how rough the tyres measure.
 - **Braking:** front-end judder that gets harsh on lock-up.
 - **Landings:** jumps make RBR's own steering force pull harder for a moment. Bumps and rough ground never do.
+- **Water:** a thump and a tug on the wheel when a tyre hits standing water (harder the faster you go), a churning rumble while you wade, and a smaller kick on the way out. With dynamic audio on you also hear the splash, and with the windscreen effects on the glass takes a splash too. The steering gets heavy while the front tyres push through water (adjustable, `WaterHeaviness`).
 - **Optional dynamic surface audio:** tyre and ground sounds that follow each wheel (off by default).
 - **Optional camera movement:** your head moves with the car in the cockpit view: leaning into braking and corners, nodding, bouncing over bumps, shaking on crashes and landings.
 - **Alpha feature — optional windscreen effects:** rain, snow and mud on the glass, with wipers (disabled by default).
@@ -64,7 +65,7 @@ Audio build only. It is off by default: switch on **Dynamic audio** in the menu,
 1. Run `ForceFXAudio\Copy-RbrSounds.bat` to copy matching sounds from your RBR `Audio` folder. See the short readme beside it. You can also put your own WAV files in `ForceFXAudio\sounds`.
 2. Mix levels and the output device are in the `[Audio]` section of `ForceFX.ini`.
 
-`audio/surfaces.md` lists the sound names ForceFX looks for.
+`audio/surfaces.md` lists the sound names ForceFX looks for. For water it uses `water_splash` (a tyre hits standing water), `water_loop` (rolling through it) and `water_hit` (flung stones). Any of these your sounds folder lacks, ForceFX makes itself, so a ford never sounds like gravel; your own `water_*.wav` files replace them.
 
 ## Camera movement
 

@@ -641,7 +641,7 @@ private:
 };
 
 // ------------------------------------------------------------------ audio sink
-enum class SoundEvent { StoneHit, Impact, Landing, SuspSqueak, SuspBottom };
+enum class SoundEvent { StoneHit, Impact, Landing, SuspSqueak, SuspBottom, Splash };
 
 constexpr int kMaxSets = 64;
 

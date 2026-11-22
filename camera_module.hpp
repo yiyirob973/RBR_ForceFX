@@ -30,6 +30,7 @@ public:
     void feed(const uint8_t*, int) {}
     void stageStarted(int, const char*, bool) {}
     void stageFinished(float) {}
+    void splash(float) {}
     std::string status() { return std::string(); }
     void shutdown() {}
 };
