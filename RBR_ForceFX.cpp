@@ -97,7 +97,8 @@
 #include "camera_module.hpp"  // head movement and windscreen effects: only built in when FORCEFX_CAMERA is defined
 #include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
 #include "tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slides (shared with the audio module)
-#include "water_fx.hpp"     // splash, wading and aquaplaning feel when the tyres are in standing water
+#include "water_fx.hpp"     // splash, wading and heavy steering when the tyres are in standing water
+#include "accel_light.hpp"  // lighter steering while hard acceleration unloads the front axle
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dinput8.lib")
@@ -188,6 +189,8 @@ struct Config {
     int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandBoost = 1, fxSurface = 1;
     int   fxWater = 1;               // splash, wading and (optionally) aquaplaning when the tyres are in standing water
     float waterGain = 1.0f;          // 0..2: strength of the splash thump, the wading rumble and the kick on entry
+    int   fxAccelLight = 1;          // lighter steering while hard acceleration unloads the front axle
+    float accelLight = 0.2f;         // 0..0.6: the most of RBR's steering force it takes away (0 = off)
     float waterHeavy = 0.6f;         // 0..2: how much heavier the steering gets while the front tyres push through water (0 = off, 1 = double RBR's force)
     int   roadViaRbr = 1;            // 1 = the road vibration is added to RBR's own force updates, so the wheel gets no extra road effect; 0 = one sine effect of its own
     int   probe = 0;                 // 1 = write ForceFX_probe.csv (ground ids and road signals ten times a second) for tuning surfaces; read at start only
@@ -291,6 +294,7 @@ void ClampConfig(Config& c) {
     c.fxCamera = c.fxCamera ? 1 : 0; c.fxWindscreen = c.fxWindscreen ? 1 : 0;
 #endif
     c.fxWater = c.fxWater ? 1 : 0; c.waterGain = clampf(c.waterGain, 0.0f, 2.0f); c.waterHeavy = clampf(c.waterHeavy, 0.0f, 2.0f);
+    c.fxAccelLight = c.fxAccelLight ? 1 : 0; c.accelLight = clampf(c.accelLight, 0.0f, 0.6f);
     c.landingBoost = clampf(c.landingBoost, 0.0f, 4.0f);
     c.landingAdd = clampf(c.landingAdd, 0.0f, 1.0f);
     c.airLevel = clampf(c.airLevel, 0.2f, 0.8f);
@@ -335,6 +339,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("RoadViaRbr", c.roadViaRbr); I("EnableBrake", c.fxBrake);
     I("SurfaceProbe", c.probe);
     I("EnableWater", c.fxWater); F("WaterGain", c.waterGain); F("WaterHeaviness", c.waterHeavy);
+    I("EnableAccelLight", c.fxAccelLight); F("AccelLightness", c.accelLight);
 #ifdef FORCEFX_AUDIO
     I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp);
 #endif
@@ -1739,6 +1744,8 @@ struct Synth {
     Water::Out wout;                                       // its result for the current step
     unsigned waterSeenEvt = 0;                             // last landing event the water tracker has seen
     float waterJit[2][Water::kBands] = {{1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}};   // random strength per side and band for the wading: slaps, not a hum
+    AccelLight::Tracker accel; AccelLight::Out aout;       // front load under acceleration: how light the steering should go
+    double accLogT = -10.0; int accLogN = 0;               // when the last light-steering line was logged, and how many were
     unsigned waterEvents = 0; float waterEntry = 0.0f; int waterEntryTyre = -1; bool waterEntryIn = false;   // goes up for every splash; strength, tyre and whether it was going in (not out) for the last one (for sound and glass)
 
     void Run(const Config& c, const Signals& s, double t, float dt, float userGain, int mag[S_COUNT], float hz[S_COUNT]) {
@@ -1797,6 +1804,19 @@ struct Synth {
             if (!c.fxWater) { water.Reset(); wout = Water::Out(); }   // off: forget everything, so switching it on in the middle of a ford is not a splash
             else wout = water.Update(wi, dt);
             if (wout.entry > 0.0f) { waterEntry = wout.entry; waterEntryTyre = wout.entryTyre; waterEntryIn = wout.entryTyre >= 0 && wi.depth[wout.entryTyre] >= 0.5f; ++waterEvents; }
+        }
+
+        // ---------------- LIGHT STEERING UNDER ACCELERATION: the front axle unloads as the weight goes to the rear. Scales RBR's own force down (see boost below).
+        {
+            AccelLight::In ai;
+            ai.frontShare = s.wload[0] + s.wload[1]; ai.throttle = s.throttle; ai.brake = s.brake; ai.speed = s.ground > 0.0f ? s.ground : s.speed;
+            ai.airborne = s.airborne; ai.accMag = s.accMag; ai.accOk = s.accOk;
+            if (!c.fxAccelLight) { accel.Reset(); aout = AccelLight::Out(); }
+            else aout = accel.Update(ai, dt);
+            if (c.fxAccelLight && aout.rawDrop > 0.04f && aout.effect > 0.2f && t - accLogT > 1.5 && accLogN < 60) {   // how much the front really unloads, to tune AccelLightness by
+                accLogT = t; ++accLogN;
+                Logf("Accel light: front load %.0f%% below normal (normal %.2f, now %.2f), throttle %.0f%%, %.0f km/h -> steering force x%.2f", (double)(100.0f * aout.rawDrop), (double)aout.base, (double)ai.frontShare, (double)(100.0f * ai.throttle), (double)(ai.speed * 3.6f), (double)AccelLight::Mul(aout, c.accelLight));
+            }
         }
 
         // ---------------- TYRE MOTION: wheelspin and slides, each tyre judged against the grip limit of the ground under it.
@@ -1921,6 +1941,7 @@ struct Synth {
             const float ugw = clampf(userGain, 0.0f, 1.0f);
             boostMul *= Water::KickMul(wout, c.waterGain * ugw) * Water::HeavyMul(wout, c.waterHeavy * ugw);
         }
+        if (c.fxAccelLight) boostMul *= AccelLight::Mul(aout, c.accelLight * clampf(userGain, 0.0f, 1.0f));   // and lighter while hard acceleration unloads the front
 
         // attack and release: road is deliberately quick (for sharpness), engine is rounder
         auto follow = [&](int i, float target, float up, float down) {
@@ -2913,12 +2934,14 @@ private:
             {"Effect: Braking",                  "EnableBrake",        &Config::fxBrake,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Landing boost",            "EnableLandingBoost", &Config::fxLandBoost,  nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Water",                    "EnableWater",        &Config::fxWater,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
+            {"Effect: Light steering (accel)",   "EnableAccelLight",   &Config::fxAccelLight, nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             // gains
             {"Live level (Numpad +/- in game)", "UserGain",           nullptr, &Config::userGain,      0.0f,  1.0f, 0.05f, '%', true },
             {"Total ceiling",                    "TotalMaxMagnitude",  &Config::totalMaxMag, nullptr,   500.0f, M,    100.0f, 'g', false},
             {"Engine gain",                      "EngineMaxMagnitude", &Config::engineMaxMag, nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Road gain",                        "RoadMaxMagnitude",   &Config::roadMaxMag,   nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Brake gain",                       "BrakeMaxMagnitude",  &Config::brakeMaxMag,  nullptr,  0.0f,   M,    100.0f, 'g', false},
+            {"Light steering amount",            "AccelLightness",     nullptr, &Config::accelLight,    0.0f,  0.6f, 0.05f, '%', false},
             {"Water gain",                       "WaterGain",          nullptr, &Config::waterGain,     0.0f,  2.0f, 0.1f,  'x', false},
             {"Water: heavy steering",            "WaterHeaviness",     nullptr, &Config::waterHeavy,    0.0f,  2.0f, 0.05f, '%', false},
             {"Landing boost (x RBR force)",      "LandingBoost",       nullptr, &Config::landingBoost,  0.0f,  4.0f, 0.1f,  '%', false},
@@ -3026,6 +3049,8 @@ private:
             {"EnableBrake",        "Turns the braking judder and front-wheel lock-up shake on or off."},
             {"EnableSurfaceFeel",  "Lets the ground under each tyre shape the road feel, together with how fast the car goes and how much the wheels slip: loose ground is grainy and throws stones, soft ground is dull, slippery hard ground is quiet with sharp cracks, cobbles hammer in time with your speed. Needs the road feel effect. Off, the road feels the same on every surface."},
             {"EnableLandingBoost", "Turns the landing boost on or off. With it off, landings feel exactly as RBR sends them."},
+            {"EnableAccelLight",   "Turns light steering under hard acceleration on or off. With it off, the steering feels exactly as RBR sends it."},
+            {"AccelLightness",     "How much lighter the steering gets when hard acceleration takes weight off the front tyres. It scales RBR's own force down by how far the front load has dropped below normal (never more than this setting). RBR may already go light by itself, so raise it slowly; ForceFX.log shows how much the front unloads."},
             {"EnableWater",        "Turns the water feel on or off: a heavy thump and a tug on the wheel when a tyre hits standing water (harder the faster you go), a churning rumble while the tyres are in it, and a smaller kick when they come out. Only standing water counts; wet tarmac is left to the road feel."},
             {"WaterGain",          "How strong the splash, the wading rumble and the tug on entry are. At x1.00 a full-speed splash is about as hard as a heavy kerb strike; the rumble stays well below that."},
             {"WaterHeaviness",     "How much heavier the steering gets while the front tyres push through standing water: the water drags on the turned tyres and wants to keep them straight. It scales RBR's own force up (100% = double, 0 = off), so it never pushes the wheel on its own and never more than triples it."},
