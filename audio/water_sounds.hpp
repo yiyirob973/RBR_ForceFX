@@ -1,7 +1,9 @@
 // Water sounds made in code, for when the sound folder has none of its own.
 //
-// RBR's sound files have a lot of gravel and tarmac but little water, so without these a ford sounded like gravel and nothing
-// happened when a tyre hit the water. Each sound is only made when the bank has no file of that name, so dropping your own
+// RBR's sound files have a rolling-through-water sound (Surfaces\\Normal\\water.wav, copied as water_loop) but no splash and no
+// stone-in-water sound, so without these nothing happened when a tyre hit the water. When the bank has RBR's water_loop, the splash is made
+// from that recording (a slice of it with a hit-and-fade envelope, under a low thump), so it sounds like the game's own water; with no
+// water_loop it is made from noise. Each sound is only made when the bank has no file of that name, so dropping your own
 // water_splash.wav / water_loop.wav / water_hit.wav (or the debris_splash.wav / water_surface_* names) into the sounds folder
 // replaces it. They are plain filtered noise, a short low thump and a few small droplets, the same every run.
 //
@@ -114,11 +116,46 @@ inline std::vector<float> makeWaterLoop() {
     return d;
 }
 
+// A splash made from RBR's own water recording: a different slice of it for each variant, hit hard and fading over about a second, with the same
+// low thump under it as the noise splash. About 1 second.
+inline std::vector<float> makeSplashFromLoop(const std::vector<float>& loop, int variant) {
+    const size_t n = (size_t)(0.95 * kSampleRate);
+    if (loop.size() < 64) return makeSplash(variant);
+    const size_t off = (size_t)((0.10 + 0.37 * (double)variant) * kSampleRate) % loop.size();
+    double e = 0.0;                                                               // the slice's loudness, so every recording ends up at the same level
+    for (size_t i = 0; i < n; ++i) { const double x = loop[(off + i) % loop.size()]; e += x * x; }
+    const double rms = std::sqrt(e / (double)n);
+    const double g = rms > 1e-5 ? 0.30 / rms : 0.0;
+    std::vector<float> d(n, 0.0f);
+    double ph = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double t = (double)i / kSampleRate;
+        const double env = t < 0.005 ? t / 0.005 : std::exp(-(t - 0.005) / 0.30);
+        ph += kTwoPi * (45.0 + 40.0 * std::exp(-t / 0.08)) / kSampleRate;
+        const double thump = std::sin(ph) * std::exp(-t / 0.10) * std::min(1.0, t / 0.003);
+        const double x = std::isfinite((double)loop[(off + i) % loop.size()]) ? loop[(off + i) % loop.size()] : 0.0;
+        d[i] = (float)(3.0 * g * x * env + 0.55 * thump);
+    }
+    peak(d, 0.8f);
+    return d;
+}
+
 // Adds whichever of the three the bank does not have already. Returns how many were added (0 = the bank has its own water sounds).
-inline int addWaterFallbacks(SoundBank& bank) {
+// `splashFromRbr` (optional) says whether the splash was made from the bank's own water_loop rather than from noise.
+inline int addWaterFallbacks(SoundBank& bank, bool* splashFromRbr = nullptr) {
     int added = 0;
+    if (splashFromRbr) *splashFromRbr = false;
     auto has = [&](std::initializer_list<const char*> keys) { for (const char* k : keys) if (bank.get(k)) return true; return false; };
-    if (!has({"water_splash", "debris_splash"})) { for (int v = 0; v < 3; ++v) bank.add("water_splash", makeSplash(v)); ++added; }
+    const SoundBank::Variants* realLoop = bank.get("water_loop");
+    if (!realLoop) realLoop = bank.get("water_surface_loop");
+    if (!has({"water_splash", "debris_splash"})) {
+        if (realLoop && !realLoop->empty() && (*realLoop)[0].size() >= 64) {
+            const std::vector<float> src = (*realLoop)[0];                           // a copy: adding to the bank may move what realLoop points at
+            for (int v = 0; v < 3; ++v) bank.add("water_splash", makeSplashFromLoop(src, v));
+            if (splashFromRbr) *splashFromRbr = true;
+        } else for (int v = 0; v < 3; ++v) bank.add("water_splash", makeSplash(v));
+        ++added;
+    }
     if (!has({"water_loop", "water_surface_loop"})) { bank.add("water_loop", makeWaterLoop()); ++added; }
     if (!has({"water_hit", "water_surface_hit"})) { for (int v = 0; v < 4; ++v) bank.add("water_hit", makeWaterHit(v)); ++added; }
     return added;

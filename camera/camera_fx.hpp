@@ -1420,6 +1420,27 @@ void wsWiperGhost(float dt) {                                          // laggin
 }
 void wsSyncWipers() { g_wsWipeT0 = GetTickCount(); g_wsBladeInit = false; Logf("wiper cycle synced to now (Ctrl+F7): the real wipers should be starting their upward stroke"); }
 
+// A thick film does not sit still: where the water is deep it sags and runs down the glass in streams, each column wandering a cell either way for a
+// moment, and what reaches the bottom edge drains off. Ticks eight times a second, so a sheet takes a few seconds to run down the screen.
+float g_wsFlowAcc = 0.f, g_wsFlowT = 0.f;
+void wsFilmFlow(float dt, float rain) {
+    g_wsFlowAcc += dt * 8.f; g_wsFlowT += dt;
+    for (int guard = 0; g_wsFlowAcc >= 1.f && guard < 4; ++guard) {
+        g_wsFlowAcc -= 1.f;
+        const float share = std::min(0.5f, 0.25f + 0.25f * rain);     // of what is above the threshold, per tick
+        for (int j = kGY - 1; j >= 0; --j) for (int i = 0; i < kGX; ++i) {
+            float& f = g_wsFilm[j * kGX + i];
+            if (f < 0.40f) continue;
+            const float give = (f - 0.40f) * share;
+            f -= give;
+            if (j + 1 >= kGY) continue;                                // the bottom edge: it drains away
+            const unsigned h = (unsigned)i * 73856093u ^ (unsigned)((int)(g_wsFlowT * 0.6f)) * 19349663u;
+            const int ti = std::max(0, std::min(kGX - 1, i + (int)(h % 3u) - 1));
+            float& below = g_wsFilm[(j + 1) * kGX + ti]; below = std::min(1.f, below + give);
+        }
+    }
+}
+
 void wsWipe(float W, float H) {
     if (!g_cfg.wsWipers) return;
     WsBlade bl[2]; wsBlades(bl);
@@ -1443,13 +1464,37 @@ void wsWipe(float W, float H) {
         const float half = 3.f + 0.004f * H;                           // blade half thickness in pixels
         float mass = 0.f;                                              // water gathered by the blade this frame (feeds the ridge in front of it)
         auto swept = [&](float X, float Y, float R, float& tx, float& ty) -> bool { return wsl::sweptBy(prev, cur, X, Y, R, half, tx, ty); };   // (tx, ty): the way the blade moved there
-        for (WsDrop& d : g_wsDrops) {
+        // A wiper does not erase water, it moves it. A bead in the blade's path is pushed along in front of the rubber (a few slip under it and stay), the
+        // beads it meets on the way run together into bigger ones, and a little is always left behind as a smear and a few small beads. What is
+        // pushed off the edge of the glass is gone. Micro droplets and flakes are too small to hold together and are simply smeared away.
+        const float asp = H / W;                                       // viewport height per viewport width: radii are in heights, positions in widths
+        std::vector<size_t> pushed;
+        for (size_t di = 0; di < g_wsDrops.size(); ++di) {
+            WsDrop& d = g_wsDrops[di];
             if (d.dead) continue;
             float tx, ty; if (!swept(d.x * W, d.y * H, d.r * H, tx, ty)) continue;
-            d.dead = true; g_wsWiped++; mass += (d.kind == 2 ? 0.12f : 1.f) * std::min(1.f, d.r * 90.f);
-            if (d.kind == 0 && d.r > 0.005f && wsRnd() < 0.35f) {      // a few tiny beads are left behind
-                WsDrop n{}; n.kind = 0; n.x = d.x; n.y = d.y; n.r = wsRange(0.0016f, 0.0028f) * g_cfg.wsDropSize; n.age = 2.f; n.tx = n.x; n.ty = n.y; n.tr = n.r; n.thr = 0.55f;
-                spawn.push_back(n);
+            g_wsWiped++; mass += (d.kind == 2 ? 0.12f : 1.f) * std::min(1.f, d.r * 90.f);
+            if (d.kind != 0) { d.dead = true; continue; }
+            if (wsRnd() < 0.06f) continue;                             // slipped under the blade: the bead stays where it is
+            const float ox = d.x, oy = d.y;
+            d.x += tx * 1.15f / W; d.y += ty * 1.15f / H;              // rides a little ahead of the rubber
+            d.tx = d.x; d.ty = d.y; d.tr = d.r; d.vx = d.vy = 0.f; d.sliding = false;   // pushed, not running: no trail from the push
+            if (d.r > 0.004f) {
+                wsGridAdd(g_wsFilm, ox, oy, 2.f, 0.10f);                // the smear the rubber leaves
+                d.r *= 0.985f;
+                if (wsRnd() < 0.04f) {                                 // and now and then a small bead left behind (the bead is pushed every frame of the stroke, so this is per frame)
+                    WsDrop n{}; n.kind = 0; n.x = ox; n.y = oy; n.r = wsRange(0.0016f, 0.0028f) * g_cfg.wsDropSize; n.age = 2.f; n.tx = n.x; n.ty = n.y; n.tr = n.r; n.thr = 0.55f;
+                    spawn.push_back(n);
+                }
+            }
+            pushed.push_back(di);
+        }
+        for (size_t a = 0; a < pushed.size(); ++a) {                    // beads pushed together run into one
+            WsDrop& pa = g_wsDrops[pushed[a]]; if (pa.dead) continue;
+            for (size_t b = a + 1; b < pushed.size(); ++b) {
+                WsDrop& pb = g_wsDrops[pushed[b]]; if (pb.dead) continue;
+                const float ex = (pb.x - pa.x) / asp, ey = pb.y - pa.y;
+                if (std::sqrt(ex * ex + ey * ey) < (pa.r + pb.r) * 0.9f) { pa.r = std::sqrt(pa.r * pa.r + pb.r * pb.r); pb.dead = true; }
             }
         }
         for (WsTrail& t : g_wsTrails) { float tx, ty; if (swept((t.x0 + t.x1) * 0.5f * W, (t.y0 + t.y1) * 0.5f * H, t.w0 * H, tx, ty)) { t.age = life + 1.f; g_wsWiped++; } }
@@ -1462,15 +1507,26 @@ void wsWipe(float W, float H) {
                 s.rot = std::atan2(-tx, ty); smears.push_back(s);
             }
         }
-        const float cw = W / (float)kGX, ch = H / (float)kGY, cr = 0.75f * std::max(cw, ch);   // the haze grids: water is squeegeed away, dirt is mostly smeared (some stays)
+        const float cw = W / (float)kGX, ch = H / (float)kGY, cr = 0.75f * std::max(cw, ch);   // the haze grids: water is pushed along by the blade, dirt is mostly smeared (some stays)
+        std::vector<float> filmAdd((size_t)kGX * kGY, 0.f);            // where the pushed water lands: added after the pass, so it is not pushed twice in one frame
         for (int j = 0; j < kGY; ++j) for (int i = 0; i < kGX; ++i) {
             float tx, ty; if (!swept(((float)i + 0.5f) * cw, ((float)j + 0.5f) * ch, cr, tx, ty)) continue;
             float& f = g_wsFilm[j * kGX + i]; float& dt = g_wsDirt[j * kGX + i];
             const float wetNow = std::max(f, g_wsRainEff > 0.02f ? 0.6f : 0.f);
             const float resid = g_wsRainEff > 0.02f ? 0.10f + 0.16f * g_wsRainEff : 0.f;   // a real blade never leaves it bone dry in the rain: a thin film stays, and fine droplets are left along the stroke
-            mass += f * 0.05f; f = std::max(f * 0.03f, std::min(f, resid)); dt *= 0.62f - 0.30f * clamp01(wetNow);      // a wet blade lifts dirt, a dry one mostly smears it
-            if (g_cfg.wsMicro > 0 && g_wsRainEff > 0.05f && wsRnd() < 0.35f * g_wsRainEff) wsAddMicro(((float)i + wsRange(0.f, 1.f)) / (float)kGX, ((float)j + wsRange(0.f, 1.f)) / (float)kGY, wsRange(0.0008f, 0.0022f) * g_cfg.wsDropSize, g_cfg.wsMicro);
+            const float len = std::sqrt(tx * tx + ty * ty);
+            if (f > 0.01f && len > 0.01f) {                            // most of the water moves the way the blade moves, not all of it and not evenly
+                const float step = std::max(1.f, std::min(3.f, len / std::max(cw, ch) + 0.8f));
+                const int ti = i + (int)std::lround(tx / len * step), tj = j + (int)std::lround(ty / len * step);
+                const float carry = f * (0.70f + 0.25f * wsRnd());
+                if (ti >= 0 && ti < kGX && tj >= 0 && tj < kGY) filmAdd[(size_t)tj * kGX + ti] += carry;   // past the edge of the glass it is gone
+                mass += carry * 0.05f;
+                f = std::max(f - carry, std::min(f, resid));
+            }
+            dt *= 0.62f - 0.30f * clamp01(wetNow);                      // a wet blade lifts dirt, a dry one mostly smears it
+            if (g_cfg.wsMicro > 0 && g_wsRainEff > 0.05f && wsRnd() < 0.06f * g_wsRainEff) wsAddMicro(((float)i + wsRange(0.f, 1.f)) / (float)kGX, ((float)j + wsRange(0.f, 1.f)) / (float)kGY, wsRange(0.0008f, 0.0022f) * g_cfg.wsDropSize, g_cfg.wsMicro);
         }
+        for (int k = 0; k < kGX * kGY; ++k) if (filmAdd[(size_t)k] > 0.f) g_wsFilm[k] = std::min(1.f, g_wsFilm[k] + filmAdd[(size_t)k]);
         if (g_cfg.wsWiperBow) g_wsBow[bi] = std::min(1.5f, g_wsBow[bi] + mass * 0.045f);
     }
     for (const WsDrop& n : spawn) wsInsert(n, g_cfg.wsDrops);
@@ -1652,6 +1708,7 @@ void wsStep(float dt, float W, float H) {
     for (int i = 0; i < 2; ++i) g_wsBow[i] *= std::exp(-dt * 1.6f);
     // Dirt dries and flakes off, faster at speed (airflow), so the corners the wipers never reach do not fill up for ever. GrimeLife = seconds at full speed.
     const float shed = g_cfg.wsGrimeLife > 1.f ? (0.25f + 0.75f * spdN) / g_cfg.wsGrimeLife : 0.f;
+    wsFilmFlow(dt, g_wsRainEff);
     {   // haze: water film runs off / evaporates slowly, rain washes dirt away a little, and a clean stretch of glass stays clean
         const float fk = std::exp(-dt * g_cfg.wsFilmDecay * (snowy ? 0.4f : 1.f)), dk = std::exp(-dt * (0.004f + 0.03f * g_wsRainEff + shed));
         for (int i = 0; i < kGX * kGY; ++i) { g_wsFilm[i] *= fk; g_wsDirt[i] *= dk; }

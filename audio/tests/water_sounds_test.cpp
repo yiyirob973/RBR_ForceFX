@@ -92,6 +92,43 @@ TEST(fallbacks_fill_only_what_is_missing) {
     CHECK(!surface.get("water_loop") && !surface.get("water_hit"));
 }
 
+TEST(splash_is_made_from_rbrs_own_water_sound_when_the_bank_has_it) {
+    SoundBank bank;
+    std::vector<float> rbr((size_t)(2.0 * kSampleRate));
+    wsnd::Noise n(5);
+    for (float& x : rbr) x = 0.05f * n.next();                         // RBR's recording: quiet noise
+    bank.add("water_loop", rbr);
+    bool fromRbr = false;
+    CHECK(wsnd::addWaterFallbacks(bank, &fromRbr) == 2);               // the splash and the stone sound; the loop is RBR's own
+    CHECK(fromRbr);
+    CHECK(bank.get("water_splash") && bank.get("water_splash")->size() == 3);
+    CHECK(bank.get("water_loop")->size() == 1);                        // untouched
+    for (const std::vector<float>& d : *bank.get("water_splash")) {
+        CHECK(allFinite(d) && std::fabs(peakOf(d) - 0.8f) < 1e-3f);
+        const size_t ms = kSampleRate / 1000;
+        CHECK(rmsOf(d, 10 * ms, 110 * ms) > 3.0 * rmsOf(d, 700 * ms, 950 * ms));   // hits hard, fades
+        CHECK(std::fabs(d[0]) < 0.05f);
+    }
+    CHECK((*bank.get("water_splash"))[0] != (*bank.get("water_splash"))[1]);         // different slices
+    SoundBank plain;
+    bool fromRbr2 = true;
+    wsnd::addWaterFallbacks(plain, &fromRbr2);
+    CHECK(!fromRbr2);                                                  // no RBR water sound: made from noise
+    CHECK((*plain.get("water_splash"))[0] != (*bank.get("water_splash"))[0]);
+}
+
+TEST(a_silent_or_tiny_recording_does_not_break_the_splash) {
+    SoundBank silent;
+    silent.add("water_loop", std::vector<float>(100000, 0.0f));
+    wsnd::addWaterFallbacks(silent);
+    for (const std::vector<float>& d : *silent.get("water_splash")) CHECK(allFinite(d) && peakOf(d) > 0.1f);   // the thump alone
+    SoundBank tiny;
+    tiny.add("water_loop", std::vector<float>(10, 0.3f));
+    bool fromRbr = true;
+    wsnd::addWaterFallbacks(tiny, &fromRbr);
+    CHECK(!fromRbr && tiny.get("water_splash") && tiny.get("water_splash")->size() == 3);
+}
+
 TEST(water_surface_material_finds_the_water_sounds) {
     SoundBank bank;
     CHECK(wsnd::addWaterFallbacks(bank) == 3);

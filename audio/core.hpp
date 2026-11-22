@@ -13,6 +13,7 @@
 #include "../materials.hpp"
 #include "../wheel_slip.hpp"   // wheel slip from the segment counter (shared with the road feel)
 #include "../tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slide (shared with the road feel)
+#include "crash.hpp"             // crashes (trees, rocks, walls) from the body acceleration
 
 namespace rsa {
 
@@ -115,6 +116,8 @@ struct Settings {
     bool enableWheelLoops = true, enableSlide = true, enableSqueal = true, enableStones = true,
          enableImpacts = true, enableLandings = true, enableRumble = true, enableSuspension = true;
     double impactMinVelocity = 0.35;
+    bool enableCrashes = true;         // crash sounds: a tree, a big rock or a wall (see crash.hpp)
+    double crashMinG = 3.0, crashLevel = 1.0;   // body acceleration (g) that can be a crash; loudness (0-6)
     bool debugLog = false;
     bool memCrossCheck = true;         // distrust the game surface when it says tarmac but the suspension is hammered. For a blind memory scanner; ForceFX turns it off because its reader is exact (cobbles are tarmac to the game)
     bool startupBeep = true;           // short test tone when the plugin starts: proves the audio output path
@@ -188,6 +191,9 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "SqueakLevel") s.squeakLevel = clampd(d(), 0.0, 6.0);
     else if (key == "BottomOutLevel") s.bottomLevel = clampd(d(), 0.0, 6.0);
     else if (key == "ImpactMinVelocity") s.impactMinVelocity = d();
+    else if (key == "EnableCrashes") s.enableCrashes = toBool(v);
+    else if (key == "CrashMinG") s.crashMinG = clampd(d(), 1.0, 12.0);
+    else if (key == "CrashLevel") s.crashLevel = clampd(d(), 0.0, 6.0);
     else if (key == "DebugLog") s.debugLog = toBool(v);
     else if (key == "StartupBeep") s.startupBeep = toBool(v);
     else if (key == "SurfaceMode") s.surfaceMode = (v == "telemetry" || v == "1") ? 1 : 0;
@@ -641,7 +647,7 @@ private:
 };
 
 // ------------------------------------------------------------------ audio sink
-enum class SoundEvent { StoneHit, Impact, Landing, SuspSqueak, SuspBottom, Splash };
+enum class SoundEvent { StoneHit, Impact, Landing, SuspSqueak, SuspBottom, Splash, CrashLight, CrashMedium, CrashHeavy, CrashMetal, CrashCrumple, CrashBranch, CrashGlass };
 
 constexpr int kMaxSets = 64;
 
@@ -714,11 +720,13 @@ class DebrisTriggers {
 public:
     explicit DebrisTriggers(Rng& rng) : rng_(rng) {}
     double rumbleGain = 0;
+    int crashCount = 0; double crashLastG = 0, crashLastSeverity = 0;   // how many crashes were heard, and the last one's strength (for the log)
 
     void update(const TelemetryFrame& f, SurfaceAnalyzer& a, const Settings& s, double dt, IAudioSink& sink, const SetView& sv) {
         for (double& c : cooldown_) if (c > 0) c -= dt;
         if (stoneCooldown_ > 0) stoneCooldown_ -= dt;
         if (s.enableSuspension && !a.airborne) suspension(a, s, dt, sink, sv);     // before impacts: a bottom-out replaces the plain impact sound
+        if (s.enableCrashes) crashes(f, a, s, dt, sink, sv);
         if (s.enableImpacts && !a.airborne) impacts(a, s, sink, sv);
         if (s.enableLandings && a.justLanded && a.landingAirTime > 0.15) landing(a, sink, sv);
         if (s.enableStones && !a.airborne) stones(f, a, s, dt, sink, sv);
@@ -730,6 +738,7 @@ private:
     Rng& rng_;
     double cooldown_[4] = {0, 0, 0, 0};
     double stoneCooldown_ = 0;
+    crash::Detector crash_; double sinceLanding_ = 10.0;
     double travel_[4] = {0, 0, 0, 0}, squeakCool_[4] = {0, 0, 0, 0}, bottomCool_[4] = {0, 0, 0, 0}, prevRatio_[4] = {0, 0, 0, 0};
     double squeakGap_ = 0, bottomGap_ = 0;     // the whole car: creaks and thumps are separate events, never a stream
 
@@ -746,6 +755,25 @@ private:
                 cooldown_[w] = 0.12;
             }
         }
+    }
+
+    // A crash: a tree, a big rock, a wall. One heavy thump chosen by how hard it was, with crumpling metal, twigs (nose first, not the biggest)
+    // and glass on top as it gets worse. What was hit is not in the telemetry, so the sound follows how hard and from where, not what.
+    void crashes(const TelemetryFrame& f, SurfaceAnalyzer& a, const Settings& s, double dt, IAudioSink& sink, const SetView& sv) {
+        sinceLanding_ = a.justLanded ? 0.0 : sinceLanding_ + dt;
+        const double sc = a.dynamics.accelScale(s);
+        crash::Params p; p.minG = s.crashMinG; p.strongG = std::max(p.minG + 2.0, 2.3 * s.crashMinG);
+        const crash::Result r = crash_.update(dt, (double)f.accSurge * sc, (double)f.accSway * sc, a.speedMs, a.airborne || sinceLanding_ < 0.35, p);
+        if (!r.hit) return;
+        crashCount++; crashLastG = r.peakG; crashLastSeverity = r.severity;
+        const crash::Layers l = crash::PlanLayers(r.severity, r.frontal, rng_.next(), rng_.next());
+        const float gain = (float)(0.55 + 0.45 * r.severity);
+        const int set = sv.dominant(0);
+        sink.trigger(l.thump == 0 ? SoundEvent::CrashLight : l.thump == 1 ? SoundEvent::CrashMedium : SoundEvent::CrashHeavy, set, gain, gain, rate(0.06));
+        if (l.metal) sink.trigger(SoundEvent::CrashMetal, set, 0.8f * gain, 0.8f * gain, rate(0.10));
+        if (l.crumple) sink.trigger(SoundEvent::CrashCrumple, set, 0.7f * gain, 0.7f * gain, rate(0.08));
+        if (l.branch) sink.trigger(SoundEvent::CrashBranch, set, 0.8f * gain, 0.8f * gain, rate(0.10));
+        if (l.glass) sink.trigger(SoundEvent::CrashGlass, set, 0.7f * gain, 0.7f * gain, rate(0.06));
     }
 
     void landing(SurfaceAnalyzer& a, IAudioSink& sink, const SetView& sv) {

@@ -91,6 +91,10 @@ public:
         TelemetryFrame f;
         if (!parsePacket(d, (size_t)n, t, f, s_->settings.packet)) return;
         s_->controller->onFrame(f);
+        if (s_->controller->debris.crashCount != crashesLogged_) {      // one line per crash, so the threshold can be tuned from the log
+            crashesLogged_ = s_->controller->debris.crashCount;
+            if (crashesLogged_ <= 100) log("Dynamic audio: crash, peak " + std::to_string(s_->controller->debris.crashLastG).substr(0, 5) + " g, strength " + std::to_string(s_->controller->debris.crashLastSeverity).substr(0, 4) + " at " + std::to_string((int)(s_->controller->analyzer.speedMs * 3.6)) + " km/h (CrashMinG=" + std::to_string(s_->settings.crashMinG).substr(0, 4) + ")");
+        }
         ++frames_;
         lastFrameNs_ = nowNs();
         if (s_->settings.debugLog && lastFrameNs_ >= nextDebugNs_) { nextDebugNs_ = lastFrameNs_ + 1000000000LL; debugLine(); }
@@ -184,6 +188,7 @@ private:
     Hooks hooks_;
     ForceFXSurfaceMemory mem_;
     std::mutex mu_;                             // guards s_ between the telemetry thread and the loader / menu
+    int crashesLogged_ = 0;                     // crashes already written to the log
     std::unique_ptr<Session> s_;
     std::thread loader_;
     std::atomic<bool> wantOn_{false}, loading_{false};
@@ -258,7 +263,8 @@ private:
             s->bank->normalize = st.normalizeSounds;
             s->bank->load(sounds);
             log("Dynamic audio: " + std::to_string(s->bank->fileCount) + " sound files from " + sounds);
-            if (const int made = wsnd::addWaterFallbacks(*s->bank)) log("Dynamic audio: no water sounds in the folder, made " + std::to_string(made) + " of splash / water_loop / water_hit in code (add your own water_*.wav to replace them)");
+            bool fromRbr = false;
+            if (const int made = wsnd::addWaterFallbacks(*s->bank, &fromRbr)) log("Dynamic audio: made " + std::to_string(made) + " of splash / water_loop / water_hit that the sounds folder does not have" + (fromRbr ? " (the splash is built from RBR's own water sound)" : " in code") + " (add your own water_*.wav to replace them)");
             log("Audio devices: " + WaveOutPlayer::describeDevices());
             for (const std::string& e : s->bank->errors) log("  sound problem: " + e);
 
@@ -299,6 +305,7 @@ private:
                 setsText_ = std::to_string(s->sets->count()) + " sound sets from " + std::to_string(s->bank->fileCount) + " files";
                 s->sink->setLiveLevels(liveDebris_.load(), liveImpacts_.load(), liveSusp_.load());
                 s_ = std::move(s);
+                crashesLogged_ = 0;
             }
             if (!wantOn_.load()) { teardown(); state_ = Off; loading_ = false; return; }
             state_ = Running;

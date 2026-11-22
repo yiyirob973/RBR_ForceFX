@@ -66,6 +66,7 @@ Audio build only. It is off by default: switch on **Dynamic audio** in the menu,
 2. Mix levels and the output device are in the `[Audio]` section of `ForceFX.ini`.
 
 `audio/surfaces.md` lists the sound names ForceFX looks for. For water it uses `water_splash` (a tyre hits standing water), `water_loop` (rolling through it) and `water_hit` (flung stones). Any of these your sounds folder lacks, ForceFX makes itself, so a ford never sounds like gravel; your own `water_*.wav` files replace them.
+Crashes (a tree, a big rock, a wall) get their own sounds too: one thump by how hard the hit was, with crumpling metal, twigs on nose-first hits and glass on the worst, from RBR's `Impact` folders (the copy script handles them). `CrashMinG` in the `[Audio]` section sets how sensitive it is, and each crash is written to `ForceFX.log` with its peak g.
 
 ## Camera movement
 
@@ -85,7 +86,7 @@ Camera builds only. It is on by default. Switch it with **Camera movement** in t
 Camera builds only. Enable it in the menu with **Windscreen effects** or set `EnableWindscreen=1` in `ForceFX.ini`, then restart RBR. Its Direct3D hooks are only installed at startup while it is enabled.
 
 - Rain and snow follow the stage's weather, read from the game. Mud is thrown on rough, wet ground, on landings and on impacts.
-- Wipers clear the glass. The plugin finds the car's real wipers after about 12 seconds of rain and follows them; until then it uses emulated blades.
+- Wipers move the water, they do not erase it: each blade pushes the beads and the film in front of it (the beads it meets run together into bigger ones), leaves a thin wet film and a few small beads behind, and what it pushes past the edge of the glass is gone. In heavy rain a thick film also sags and runs down the glass in streams. The plugin finds the car's real wipers after about 12 seconds of rain and follows them; until then it uses emulated blades.
 - Drops, mud, haze, wipers and the game's own wet-windscreen effect have their own settings in the `[Windscreen]` section of `ForceFX.ini`. Hold Ctrl and press F8 to switch it on and off while driving.
 - With `Ground=1` (default) the dirt follows the surface scan: pale dust on dry gravel, dark mud on wet dirt, grey road spray on wet tarmac, slush on snow, nothing on clean tarmac. `CarryOver` keeps mud on the glass between the stages of one rally (cleaned for a new car, driver, retired stage or after `CarryMinutes`). `GrimeLife` makes dirt in places the wipers cannot reach dry off instead of building up. The wipers sweep the area between the blade's real positions on the glass; `WiperMeasure=1` reads the blade's length and direction from its mesh.
 - It costs some frame rate. If that is a problem, lower `Micro`, `Drops` and `Mud`, or set `Refraction=0`.

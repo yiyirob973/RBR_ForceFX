@@ -14,6 +14,7 @@
         Impact\Grus\*                                debris_stone_1, _2 ...
         Impact\Medium\*                              debris_impact_1, _2 ...
         Impact\Heavy\*                               debris_landing_1, _2 ...
+        Impact\Soft, SoftMet, Addon, Branch, Shatter  crash_light, crash_metal, crash_crumple, crash_branch, crash_glass (crashes)
         Cars\Effects\rumble.wav                      debris_rumble
         Cars\Effects\SuspSqee\*                      susp_squeak_1, _2 ...
         Cars\Effects\Suspen\*                        susp_bottom_1, _2 ...
@@ -72,6 +73,11 @@ $variantSets = @(
     @{ Name = 'debris_stone';   Folder = 'Impact\Grus' },
     @{ Name = 'debris_impact';  Folder = 'Impact\Medium' },
     @{ Name = 'debris_landing'; Folder = 'Impact\Heavy' },
+    @{ Name = 'crash_light';    Folder = 'Impact\Soft' },
+    @{ Name = 'crash_metal';    Folder = 'Impact\SoftMet' },
+    @{ Name = 'crash_crumple';  Folder = 'Impact\Addon' },
+    @{ Name = 'crash_branch';   Folder = 'Impact\Branch' },
+    @{ Name = 'crash_glass';    Folder = 'Impact\Shatter' },
     @{ Name = 'susp_squeak';    Folder = 'Cars\Effects\SuspSqee' },
     @{ Name = 'susp_bottom';    Folder = 'Cars\Effects\Suspen' }
 )
