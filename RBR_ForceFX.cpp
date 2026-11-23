@@ -98,7 +98,7 @@
 #include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
 #include "tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slides (shared with the audio module)
 #include "water_fx.hpp"     // splash, wading and heavy steering when the tyres are in standing water
-#include "accel_light.hpp"  // lighter steering while the front axle is unloaded (hard acceleration, uphill)
+#include "accel_light.hpp"  // lighter steering under hard acceleration, from the measured front load
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dinput8.lib")
@@ -189,7 +189,7 @@ struct Config {
     int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandBoost = 1, fxSurface = 1;
     int   fxWater = 1;               // splash, wading and (optionally) aquaplaning when the tyres are in standing water
     float waterGain = 1.0f;          // 0..2: strength of the splash thump, the wading rumble and the kick on entry
-    int   fxAccelLight = 1;          // lighter steering while the front axle is unloaded (hard acceleration, uphill), from the measured front load
+    int   fxAccelLight = 1;          // lighter steering under hard acceleration, from the measured front load and the measured acceleration
     float accelLight = 1.0f;         // 0..2: 1 = the steering loses force in proportion to the front load lost (never more than 60%); 0 = off
     float waterHeavy = 0.6f;         // 0..2: how much heavier the steering gets while the front tyres push through water (0 = off, 1 = double RBR's force)
     int   roadViaRbr = 1;            // 1 = the road vibration is added to RBR's own force updates, so the wheel gets no extra road effect; 0 = one sine effect of its own
@@ -1822,7 +1822,7 @@ struct Synth {
             accWasRest = aout.fromRest;
             if (c.fxAccelLight && aout.rawDrop > 0.04f && aout.drop > 0.02f && t - accLogT > 1.5 && accLogN < 60) {   // how much the front really unloads, to tune AccelLightness by
                 accLogT = t; ++accLogN;
-                Logf("Light steering: front load %.0f%% below standing (standing %.2f, now %.2f), throttle %.0f%%, %.0f km/h -> steering force x%.2f", (double)(100.0f * aout.rawDrop), (double)aout.base, (double)ai.frontShare, (double)(100.0f * ai.throttle), (double)(ai.speed * 3.6f), (double)AccelLight::Mul(aout, c.accelLight));
+                Logf("Light steering: front load %.0f%% below standing (standing %.2f, now %.2f), accelerating %.2f g, %.0f km/h -> steering force x%.2f", (double)(100.0f * aout.rawDrop), (double)aout.base, (double)ai.frontShare, (double)aout.accelG, (double)(ai.speed * 3.6f), (double)AccelLight::Mul(aout, c.accelLight));
             }
         }
 
@@ -3056,8 +3056,8 @@ private:
             {"EnableBrake",        "Turns the braking judder and front-wheel lock-up shake on or off."},
             {"EnableSurfaceFeel",  "Lets the ground under each tyre shape the road feel, together with how fast the car goes and how much the wheels slip: loose ground is grainy and throws stones, soft ground is dull, slippery hard ground is quiet with sharp cracks, cobbles hammer in time with your speed. Needs the road feel effect. Off, the road feels the same on every surface."},
             {"EnableLandingBoost", "Turns the landing boost on or off. With it off, landings feel exactly as RBR sends them."},
-            {"EnableAccelLight",   "Turns light steering on or off: when the front tyres carry less weight than they do standing still (hard acceleration, uphill), the steering loses force in proportion. With it off, the steering feels exactly as RBR sends it."},
-            {"AccelLightness",     "How much of the front load that is lost shows up as lighter steering. At x1.00 the steering loses force in proportion to the front weight lost, measured from the strut forces against the car standing still on the start line (never more than 60% of RBR's force); x2 doubles it, 0 turns it off. ForceFX.log shows how far the front unloads."},
+            {"EnableAccelLight",   "Turns light steering on or off: while the car accelerates forward and the front tyres carry less weight than they do standing still, the steering loses force in proportion. With it off, the steering feels exactly as RBR sends it."},
+            {"AccelLightness",     "How much of the front load that is lost shows up as lighter steering. At x1.00 the steering loses force in proportion to the front weight lost under acceleration, measured from the strut forces against the car standing still on the start line (never more than 60% of RBR's force); x2 doubles it, 0 turns it off. ForceFX.log shows how far the front unloads."},
             {"EnableWater",        "Turns the water feel on or off: a heavy thump and a tug on the wheel when a tyre hits standing water (harder the faster you go), a churning rumble while the tyres are in it, and a smaller kick when they come out. Only standing water counts; wet tarmac is left to the road feel."},
             {"WaterGain",          "How strong the splash, the wading rumble and the tug on entry are. At x1.00 a full-speed splash is about as hard as a heavy kerb strike; the rumble stays well below that."},
             {"WaterHeaviness",     "How much heavier the steering gets while the front tyres push through standing water: the water drags on the turned tyres and wants to keep them straight. It scales RBR's own force up (100% = double, 0 = off), so it never pushes the wheel on its own and never more than triples it."},
