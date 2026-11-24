@@ -1,6 +1,4 @@
 // Camera module: head movement for the cockpit camera, and optional rain, snow and mud on the windscreen.
-// Built in when FORCEFX_CAMERA is defined (see camera_module.hpp). Without the define none of this code, MinHook or Direct3D
-// is pulled in.
 //
 // HOW IT FITS TOGETHER
 //   Telemetry   ForceFX hands every NGP packet to feed(); the packet is turned into filtered inputs (accelerations, yaw,

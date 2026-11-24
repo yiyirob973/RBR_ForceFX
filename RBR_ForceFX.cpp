@@ -34,8 +34,7 @@
 //   Engine, lump, road and brake are all zero-mean vibrations, so they never pull the wheel to one side (road_guard.hpp
 //   keeps the road that way). The landing boost is the only thing that changes RBR's own steering force.
 //
-// Building: RBR is 32-bit, so this is an x86 build. Run build.bat from an x86 Visual Studio prompt. It makes the four variants
-//   (basic, audio, camera, full) by defining FORCEFX_AUDIO and FORCEFX_CAMERA.
+// Building: RBR is 32-bit, so this is an x86 build. Run build.bat from an x86 Visual Studio prompt.
 //
 // Telemetry: NGP needs UDP telemetry switched on, but the destination doesn't matter. ForceFX picks the packets up as
 //   NGP sends them, by watching the Winsock send calls inside the RBR process (see PacketTap), so it needs no UDP port
@@ -93,8 +92,8 @@
 #include "IRBRGame.h"
 #include "IPlugin.h"
 #include "materials.hpp"      // ground material table, shared by the road feel, the audio and the windscreen
-#include "audio_module.hpp"   // dynamic audio: only built in when FORCEFX_AUDIO is defined (off until the menu switch is turned on)
-#include "camera_module.hpp"  // head movement and windscreen effects: only built in when FORCEFX_CAMERA is defined
+#include "audio_module.hpp"   // dynamic audio (off until the menu switch is turned on)
+#include "camera_module.hpp"  // head movement and windscreen effects (off until switched on)
 #include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
 #include "tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slides (shared with the audio module)
 #include "water_fx.hpp"     // splash, wading and heavy steering when the tyres are in standing water
@@ -194,16 +193,12 @@ struct Config {
     float waterHeavy = 0.6f;         // 0..2: how much heavier the steering gets while the front tyres push through water (0 = off, 1 = double RBR's force)
     int   roadViaRbr = 1;            // 1 = the road vibration is added to RBR's own force updates, so the wheel gets no extra road effect; 0 = one sine effect of its own
     int   probe = 0;                 // 1 = write ForceFX_probe.csv (ground ids and road signals ten times a second) for tuning surfaces; read at start only
-#ifdef FORCEFX_AUDIO
     int   fxAudio = 0;               // dynamic audio (settings in the [Audio] section of ForceFX.ini); off until switched on
     float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in [Audio] of ForceFX.ini)
     float audioImpact = 1.0f;        // 0..4 live multiplier on impacts and landings (on top of EventLevel)
     float audioSusp = 1.0f;          // 0..4 live multiplier on suspension creaks and bottoming out (on top of SqueakLevel / BottomOutLevel)
-#endif
-#ifdef FORCEFX_CAMERA
-    int   fxCamera = 1;              // head movement in the cockpit camera (settings in the [Camera...] sections of ForceFX.ini)
+    int   fxCamera = 0;              // head movement in the cockpit camera (settings in the [Camera...] sections of ForceFX.ini)
     int   fxWindscreen = 0;          // rain, snow and mud on the windscreen; off by default. Its hooks are installed at startup, so switching it on needs a restart
-#endif
 
     // per-layer ceilings (DirectInput units 0..10000), a combined ceiling, and one live level (userGain)
     int   engineMaxMag = 1200, roadMaxMag = 500, brakeMaxMag = 2000;
@@ -286,13 +281,9 @@ void ClampConfig(Config& c) {
     c.wheelbase = clampf(c.wheelbase, 1.5f, 4.0f); c.trackWidth = clampf(c.trackWidth, 1.0f, 2.2f); c.cgToFront = clampf(c.cgToFront, 0.4f * c.wheelbase, 0.6f * c.wheelbase);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
     c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0; c.roadViaRbr = c.roadViaRbr ? 1 : 0;
-#ifdef FORCEFX_AUDIO
     c.fxAudio = c.fxAudio ? 1 : 0;
     c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f);
-#endif
-#ifdef FORCEFX_CAMERA
     c.fxCamera = c.fxCamera ? 1 : 0; c.fxWindscreen = c.fxWindscreen ? 1 : 0;
-#endif
     c.fxWater = c.fxWater ? 1 : 0; c.waterGain = clampf(c.waterGain, 0.0f, 2.0f); c.waterHeavy = clampf(c.waterHeavy, 0.0f, 2.0f);
     c.fxAccelLight = c.fxAccelLight ? 1 : 0; c.accelLight = clampf(c.accelLight, 0.0f, 2.0f);
     c.landingBoost = clampf(c.landingBoost, 0.0f, 4.0f);
@@ -340,12 +331,8 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     I("SurfaceProbe", c.probe);
     I("EnableWater", c.fxWater); F("WaterGain", c.waterGain); F("WaterHeaviness", c.waterHeavy);
     I("EnableAccelLight", c.fxAccelLight); F("AccelLightness", c.accelLight);
-#ifdef FORCEFX_AUDIO
     I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp);
-#endif
-#ifdef FORCEFX_CAMERA
     I("EnableCamera", c.fxCamera); I("EnableWindscreen", c.fxWindscreen);
-#endif
     I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
     F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
@@ -2427,8 +2414,8 @@ private:
     std::atomic<float> m_cobScore{0.0f}, m_cobLevel{0.0f};   // telemetry cobble detection, for the Diagnostics page, the log and the probe file
     FILE*              m_probe = nullptr;   // ForceFX_probe.csv, only while SurfaceProbe=1
     std::chrono::steady_clock::time_point m_probeT{};
-    ffx::Audio         m_audio;            // sounds for the ground under each tyre; off until the menu switch is on (empty stand-in without FORCEFX_AUDIO)
-    ffx::Camera        m_camera;           // head movement and windscreen effects (empty stand-in without FORCEFX_CAMERA)
+    ffx::Audio         m_audio;            // sounds for the ground under each tyre; off until the menu switch is on
+    ffx::Camera        m_camera;           // head movement and windscreen effects
     static ffx::Camera*& CameraSlot() { static ffx::Camera* p = nullptr; return p; }
     static void CameraSink(const uint8_t* d, int n) { if (ffx::Camera* c = CameraSlot()) c->feed(d, n); }   // called from NGP's send, so it works without a wheel connected
     std::atomic<bool>  m_carRescan{false};
@@ -2661,9 +2648,7 @@ private:
             if (base.carProfiles)
                 if (const CarProfile* m = carDb.Match(id.name, id.rsfId, score)) prof = *m;
             ApplyProfile(base, prof, eff);
-#ifdef FORCEFX_AUDIO
             m_audio.setCar(eff.drivetrain, eff.wheelbase, eff.cgToFront, eff.trackWidth);
-#endif
             if (!sameCar) { dsp = Dsp(); synth.rpmPeak = 0; synth.grip = Tyre::GripLearner(); }           // a different car, so forget what the last one taught us
             char lab[200];
             if (prof.found) snprintf(lab, sizeof(lab), "-> %s%s%s (match %.2f)", prof.name.empty() ? prof.section.c_str() : prof.name.c_str(),
@@ -2703,10 +2688,8 @@ private:
             if (!dumped) { DumpPacket(data, n); dumped = true; }
         };
 
-#ifdef FORCEFX_AUDIO
         m_audio.setActive(base.fxAudio != 0);
         m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
-#endif
         while (m_run) {
             // Wait for a packet from either source (or 20 ms), then handle everything that has arrived.
             if (nWait) {
@@ -2740,11 +2723,9 @@ private:
                 seenRev = m_cfgRev.load();
                 { std::lock_guard<std::mutex> lk(m_mtx); base = m_cfg; }
                 ApplyProfile(base, prof, eff);
-#ifdef FORCEFX_AUDIO
                 m_audio.setCar(eff.drivetrain, eff.wheelbase, eff.cgToFront, eff.trackWidth);
                 m_audio.setActive(base.fxAudio != 0);
                 m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
-#endif
             }
             {   // telemetry cobble detection: copy its state for the Diagnostics page and log when it switches on and off
                 m_cobScore = synth.cob.score; m_cobLevel = synth.cob.ema;
@@ -2787,12 +2768,8 @@ private:
             {   // the ground class is only read while telemetry is flowing (a stage is running)
                 const bool telemLive = !m_test && std::chrono::duration<double>(now - lastRx).count() < 0.4;
                 if (telemLive) Surf::Feed(base.fxSurface != 0 || base.fxWater != 0
-#ifdef FORCEFX_AUDIO
                                        || base.fxAudio != 0
-#endif
-#ifdef FORCEFX_CAMERA
                                        || base.fxWindscreen != 0
-#endif
                                       );
                 for (int w = 0; w < 4; ++w) { sig.surf[w] = telemLive ? Surf::Current(w) : 0; sig.mat[w] = telemLive ? Surf::CurrentId(w) : -1; }
             }
@@ -2922,16 +2899,12 @@ private:
     void BuildRows() {
         const float M = (float)kHardTotalMax;
         m_rows = {
-#ifdef FORCEFX_AUDIO
             {"Dynamic audio",                    "EnableDynamicAudio", &Config::fxAudio,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Audio: debris level",              "AudioDebrisLevel",   nullptr, &Config::audioDebris, 0.0f,   4.0f, 0.1f,  'x', false},
             {"Audio: impact / landing level",    "AudioImpactLevel",   nullptr, &Config::audioImpact, 0.0f,   4.0f, 0.1f,  'x', false},
             {"Audio: suspension level",          "AudioSuspensionLevel", nullptr, &Config::audioSusp, 0.0f,   4.0f, 0.1f,  'x', false},
-#endif
-#ifdef FORCEFX_CAMERA
             {"Camera movement",                  "EnableCamera",       &Config::fxCamera,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Windscreen effects (restart)",     "EnableWindscreen",   &Config::fxWindscreen, nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
-#endif
             // effect switches (turn effects off to feel the others on their own)
             {"Effect: Engine",                   "EnableEngine",       &Config::fxEngine,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Road feel",                "EnableRoad",         &Config::fxRoad,       nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
@@ -2981,10 +2954,8 @@ private:
 
     // The camera works with or without a wheel connected, so its switches are applied here and not in the telemetry loop.
     void ApplyCameraSwitches() {
-#ifdef FORCEFX_CAMERA
         m_camera.setActive(m_cfg.fxCamera != 0);
         m_camera.setWindscreen(m_cfg.fxWindscreen != 0);
-#endif
     }
 
     void SaveRow(const MenuRow& r) {
@@ -3039,16 +3010,12 @@ private:
     static const char* TipFor(const char* key) {
         struct T { const char* k; const char* t; };
         static const T tips[] = {
-#ifdef FORCEFX_AUDIO
             {"EnableDynamicAudio", "Plays tyre and ground sounds that follow each wheel: rolling noise, squeal, sliding, flying stones, bumps and landings, with the sound of each surface. Needs sound files in ForceFXAudio\\sounds; the mix levels are in the [Audio] section of ForceFX.ini. Off by default; loading takes a moment when you switch it on."},
             {"AudioDebrisLevel",   "How loud the stones and debris thrown at the car are, on top of StoneLevel in [Audio] of ForceFX.ini. Changes apply while you drive."},
             {"AudioImpactLevel",   "How loud bump impacts and landings are, on top of EventLevel in [Audio] of ForceFX.ini."},
             {"AudioSuspensionLevel", "How loud suspension creaks and bottoming-out thumps are, on top of SqueakLevel and BottomOutLevel in [Audio] of ForceFX.ini."},
-#endif
-#ifdef FORCEFX_CAMERA
             {"EnableCamera",       "Moves your head in the cockpit view with the car: leaning into braking and corners, nodding, bouncing over bumps and shaking on crashes and landings. Strength and everything else is in the [Camera] sections of ForceFX.ini (Intensity is the main one). Changes apply at once."},
             {"EnableWindscreen",   "Rain, snow and mud on the windscreen of the cockpit view, with wipers. It is off by default and is read at startup, so after switching it on restart RBR. Settings are in the [Windscreen] section of ForceFX.ini."},
-#endif
             {"EnableEngine",       "Turns the engine vibration on or off. Handy for feeling what each effect does on its own."},
             {"EnableRoad",         "Turns the road feel (texture, bumps and ground) on or off."},
             {"RoadViaRbr",         "How the road vibration reaches the wheel. Through RBR's force: it is added to RBR's own steering force, so the wheel gets no extra road effect. Own effect: the road is one sine effect of its own, less detailed but easy on the wheel. If the road makes the wheel feel heavy or sticky to turn, use Through RBR's force; it may need a higher road gain. Without RBR's force updates it falls back to the own effect by itself."},
@@ -3117,12 +3084,8 @@ private:
                  m_dStat.load(), m_dLoadL.load(), m_dLoadR.load(), m_dAir.load(), m_dHeat.load());
         line(buf);
         line(Surf::Status().c_str());
-#ifdef FORCEFX_AUDIO
         line(m_audio.status().c_str());
-#endif
-#ifdef FORCEFX_CAMERA
         line(m_camera.status().c_str());
-#endif
         { char cb[160]; snprintf(cb, sizeof(cb), "Cobble detection: %s, roughness per speed %.2f (blend starts %.1f, full at %.1f), cobble feel %d%%",
                                  Surf::g_cobbleDetect ? "on" : "off", (double)m_cobLevel.load(), (double)Surf::g_cobbleLo, (double)Surf::g_cobbleHi, (int)(m_cobScore.load() * 100.0f + 0.5f));
           line(cb); }
@@ -3169,11 +3132,7 @@ public:
         m_userGain = m_cfg.userGain;
         Surf::Start(m_iniPath);               // reads which ground is under the tyres
         Logf("Version: %s", VersionText().c_str());
-#ifdef FORCEFX_AUDIO
         Logf("Build: with dynamic audio module");
-#else
-        Logf("Build: without dynamic audio module");
-#endif
         {
             ffx::Audio::Hooks h;
             h.readIds = [](int ids[4]) { return Surf::Ids(ids); };
@@ -3188,21 +3147,15 @@ public:
             h.log = [](const std::string& s) { Logf("%s", s.c_str()); };
             h.carKey = [this]() { std::lock_guard<std::mutex> lk(m_mtx); return m_carKey; };       // a new car starts with a clean windscreen
             h.readIds = [](int ids[4]) { return Surf::Ids(ids); };      // the windscreen colours and amounts follow the ground under the tyres
-#ifdef FORCEFX_CAMERA
             Logf("Build: with camera module");
             m_camera.configure(g_dir, h, m_cfg.fxCamera != 0, m_cfg.fxWindscreen != 0);
-#else
-            Logf("Build: without camera module");
-#endif
         }
 
         if (m_cfg.telemetrySource != 2) {
             const bool ok = PacketTap::Install(m_cfg.minPacket);
             Logf("Telemetry hook: %s (%s)", ok ? "installed" : "not available", PacketTap::Describe().c_str());
-#ifdef FORCEFX_CAMERA
             CameraSlot() = &m_camera;
             PacketTap::SetSink(&ForceFXPlugin::CameraSink);
-#endif
         }
 
         BuildRows();
