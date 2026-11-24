@@ -14,7 +14,7 @@
 #include <cmath>
 #include <deque>
 
-namespace rsa {
+namespace ffx {
 namespace crash {
 
 constexpr double kG = 9.80665;
@@ -43,7 +43,6 @@ struct Result {
 class Detector {
 public:
     void reset() { *this = Detector(); }
-    double lastPeakG() const { return lastPeakG_; }
 
     // accSurge / accSway in m/s^2 (already scaled), speedMs = true ground speed, suppress = in the air or just landed.
     Result update(double dt, double accSurge, double accSway, double speedMs, bool suppress, const Params& p = Params()) {
@@ -90,7 +89,7 @@ public:
 private:
     struct Sample { double t, v; };
     bool init_ = false, pending_ = false, peakFrontal_ = true;
-    double baseA_ = 0.0, baseB_ = 0.0, t_ = 0.0, pendT_ = 0.0, peak_ = 0.0, cool_ = 0.0, lastPeakG_ = 0.0;
+    double baseA_ = 0.0, baseB_ = 0.0, t_ = 0.0, pendT_ = 0.0, peak_ = 0.0, cool_ = 0.0;
     std::deque<Sample> hist_;
 
     Result fire(const Params& p, double dv) {
@@ -98,7 +97,7 @@ private:
         r.hit = true; r.peakG = peak_; r.dv = dv; r.frontal = peakFrontal_;
         const double fromG = (peak_ - p.minG) / std::max(1.0, p.fullG - p.minG), fromV = dv / std::max(1.0, p.fullDv);
         r.severity = std::min(1.0, std::max(0.0, std::max(fromG, fromV)));
-        pending_ = false; cool_ = p.cooldown; lastPeakG_ = peak_;
+        pending_ = false; cool_ = p.cooldown;
         return r;
     }
 };
@@ -123,4 +122,4 @@ inline Layers PlanLayers(double severity, bool frontal, double roll1, double rol
 }
 
 }  // namespace crash
-}  // namespace rsa
+}  // namespace ffx

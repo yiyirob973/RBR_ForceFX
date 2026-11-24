@@ -1,10 +1,10 @@
 # Surfaces and sound file names
 
-RBR/NGP has 107 ground materials. With the game's own surface available (see README), every tyre plays the sound set of the
+RBR/NGP has 107 ground materials. Every tyre plays the sound set of the
 exact material under it. For each material the plugin looks for sample files in the order shown below and uses the **first that
 exists**, separately for each kind: `<name>_loop`, `<name>_squeal`, `<name>_slide`, `<name>_hit` (any number of variants: `_1`, `_2`...).
 The last entry is the plain class name from the ini (default tarmac / gravel / grass / snow), so a four-surface pack works as-is and
-each extra file you add makes just those surfaces more specific. Without game memory (telemetry only) only the four class names are used.
+each extra file you add makes just those surfaces more specific. If the plugin can't read the ground (the Diagnostics page says so), only the four class names are used.
 
 Handy shortcuts: `tarmac_wet_loop` covers every wet tarmac, `gravel_wet_loop` every wet gravel, `dirt_loop`, `ice_loop` (snow on ice),
 `water_loop`, `rough_loop`. Material names are not case sensitive.

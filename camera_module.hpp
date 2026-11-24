@@ -10,7 +10,7 @@
 #ifdef FORCEFX_CAMERA
 
 #include "camera/camera_fx.hpp"
-namespace ffx { using Camera = cam::CameraFx; }
+namespace ffx { using Camera = cam::Camera; }
 
 #else
 

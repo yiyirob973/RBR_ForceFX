@@ -1,8 +1,8 @@
-// Dynamic surface audio for ForceFX.
+// Dynamic audio for ForceFX: the sounds of the ground under each tyre, squeal, slides, stones, bumps, landings and crashes.
 //
-// ForceFX already receives NGP's telemetry packets and already knows which material is under each tyre, so this engine
-// has no UDP listener and no memory scanner of its own. The plugin hands it the packets and a way to read the four
-// material ids; everything else (per-tyre analysis, sound sets, mixer, waveOut) comes from the surface audio code.
+// ForceFX already receives NGP's telemetry packets and already knows which material is under each tyre, so the audio has
+// no UDP listener or memory scanner of its own. The plugin hands it the packets and a way to read the four material ids.
+// Everything else (per-tyre analysis, sound sets, mixer, waveOut) lives in core.hpp, audio.hpp and waveout.hpp.
 //
 // It is off until the menu switch turns it on. Switching on loads the sounds on a background thread, so the force
 // feedback loop never waits for the disk. Switching off tears everything down again.
@@ -22,9 +22,9 @@
 #include "water_sounds.hpp"
 #include "waveout.hpp"
 
-namespace rsa {
+namespace ffx {
 
-// Answers the audio code's "what is under each tyre" question from ForceFX's own surface reader.
+// Answers the audio code's "what is under each tyre" question from ForceFX's surface reader.
 // Wheel order is LF, RF, LB, RB on both sides, so the ids pass straight through.
 class ForceFXSurfaceMemory : public ISurfaceMemory {
 public:
@@ -179,7 +179,7 @@ private:
         MaterialTable matTable;
         std::unique_ptr<SoundSetMap> sets;
         std::unique_ptr<MixerSink> sink;
-        std::unique_ptr<SurfaceAudioController> controller;
+        std::unique_ptr<AudioController> controller;
         std::vector<float> beep;
         WaveOutPlayer player;
     };
@@ -230,7 +230,7 @@ private:
 
     void remakeController() {                   // caller holds mu_
         Session& s = *s_;
-        s.controller.reset(new SurfaceAudioController(s.settings, *s.sink));
+        s.controller.reset(new AudioController(s.settings, *s.sink));
         s.controller->setSurfaceMemory(&mem_);
         s.controller->materials().loadOverrides(dir_ + "ForceFXAudio\\materials.csv");
         s.sink->silence();
@@ -250,10 +250,7 @@ private:
             Settings& st = s->settings;
             const std::string ini = dir_ + "ForceFX.ini";
             if (!loadSettings(ini, st, "Audio")) log("Dynamic audio: no ForceFX.ini found, using defaults");
-            st.enabled = true;
             applyCar(st);
-            st.surfaceMode = 0;                  // surface comes from ForceFX's reader; telemetry inference is the fallback
-            st.memCrossCheck = false;            // the reader is exact: a rough road the game calls tarmac (cobbles, a bridge) is still tarmac to it, so never throw the surface away because the suspension is busy
 
             const std::string dataDir = dir_ + "ForceFXAudio\\";
             CreateDirectoryA(dataDir.c_str(), nullptr);
@@ -276,7 +273,7 @@ private:
             s->sets.reset(new SoundSetMap(*s->bank, s->matTable, st));
             s->sink.reset(new MixerSink(*s->mixer, *s->bank, st, s->sets.get()));
             s->sink->setLiveLevels(liveDebris_.load(), liveImpacts_.load(), liveSusp_.load());
-            s->controller.reset(new SurfaceAudioController(st, *s->sink));
+            s->controller.reset(new AudioController(st, *s->sink));
             s->controller->setSurfaceMemory(&mem_);
             s->controller->materials().loadOverrides(dataDir + "materials.csv");
 
@@ -321,4 +318,4 @@ private:
     }
 };
 
-}  // namespace rsa
+}  // namespace ffx

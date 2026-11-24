@@ -8,7 +8,7 @@
 #include "core.hpp"
 #include "audio.hpp"
 
-using namespace rsa;
+using namespace ffx;
 static int g_fail = 0, g_checks = 0;
 struct Reg { const char* name; std::function<void()> fn; };
 static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
@@ -176,7 +176,7 @@ static TelemetryFrame fr(double t, double speedMs, double surgeMs2) {
     return f;
 }
 static int driveCrash(Settings s, double spikeMs2, CrashSink& sink) {
-    SurfaceAudioController c(s, sink, 1);
+    AudioController c(s, sink, 1);
     double t = 0, v = 25;
     for (int i = 0; i < 120; ++i) { t += dt; c.onFrame(fr(t, v, 0)); }
     t += dt; v = 14; c.onFrame(fr(t, v, spikeMs2));
@@ -193,7 +193,7 @@ TEST(a_crash_plays_a_thump_and_layers_through_the_controller) {
 
 TEST(the_controller_counts_crashes_for_the_log) {
     CrashSink sink; Settings s;
-    SurfaceAudioController c(s, sink, 1);
+    AudioController c(s, sink, 1);
     double t = 0;
     for (int i = 0; i < 120; ++i) { t += dt; c.onFrame(fr(t, 25, 0)); }
     CHECK(c.debris.crashCount == 0);

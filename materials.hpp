@@ -8,7 +8,7 @@
 #include <sstream>
 #include <string>
 
-namespace rsa {
+namespace ffx {
 
 struct MaterialInfo { int id; int cls; int wet; const char* name; };
 
@@ -148,7 +148,6 @@ static const MaterialInfo kMaterials[] = {
     {255, -1, 0, "Spectator"},
 };
 
-constexpr int kNumMaterials = (int)(sizeof(kMaterials) / sizeof(kMaterials[0]));
 
 // id -> class lookup with optional runtime overrides. Unknown ids report cls = -2 (not in the table).
 class MaterialTable {
@@ -202,4 +201,4 @@ private:
     int cls_[256]; int wet_[256]; const char* name_[256];
 };
 
-}  // namespace rsa
+}  // namespace ffx

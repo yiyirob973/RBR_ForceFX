@@ -1,4 +1,4 @@
-// RBR Surface Audio - WAV loading, sound bank, mixer and the sink that connects the controller to it.
+// Dynamic audio: WAV loading, sound bank, mixer and the sink that connects the controller to it.
 // Portable (no Windows APIs); the waveOut device lives in win_platform.hpp.
 #pragma once
 #include <atomic>
@@ -17,7 +17,7 @@
 #include <vector>
 #include "core.hpp"
 
-namespace rsa {
+namespace ffx {
 
 constexpr int kSampleRate = 44100;
 
@@ -509,4 +509,4 @@ private:
     std::mt19937 rng_{4242};
 };
 
-}  // namespace rsa
+}  // namespace ffx

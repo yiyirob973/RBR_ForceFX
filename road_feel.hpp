@@ -7,7 +7,7 @@
 // those properties together with what the telemetry says the car is doing: how fast it goes, how much the wheels slip, and
 // how rough the tyres measure. So the same gravel feels calm when you roll over it gently and violent when you slide on it.
 //
-// Include after surface_feel.hpp (Surf::Feel, Surf::Cls) and materials.hpp (rsa::kMaterials). In RBR_ForceFX.cpp it is
+// Include after surface_feel.hpp (Surf::Feel, Surf::Cls) and materials.hpp (ffx::kMaterials). In RBR_ForceFX.cpp it is
 // included inside the anonymous namespace, right after surface_feel.hpp. How the result reaches the wheel (three sine bands) is in
 // road_bands.hpp.
 #pragma once
@@ -94,7 +94,7 @@ inline Entry* Table() {
     static bool built = false;
     if (!built) {
         built = true;
-        for (const rsa::MaterialInfo& m : rsa::kMaterials)
+        for (const ffx::MaterialInfo& m : ffx::kMaterials)
             if (m.id >= 0 && m.id < 256 && m.cls >= 0) t[m.id].known = FromName(m.name, m.wet, t[m.id].g);
     }
     return t;

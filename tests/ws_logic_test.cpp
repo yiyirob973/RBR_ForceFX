@@ -1,4 +1,4 @@
-// Tests for the WindscreenFX logic that needs no Windows or Direct3D (camera/ws_logic.hpp): what the tyres throw at the glass,
+// Tests for the Windscreen logic that needs no Windows or Direct3D (camera/ws_logic.hpp): what the tyres throw at the glass,
 // the colours of the dirt, the area a wiper blade sweeps and the measuring of a wiper mesh. Build it with any C++17 compiler:
 //   g++ -std=c++17 -O1 ws_logic_test.cpp -o ws_logic_test && ./ws_logic_test
 //   cl /std:c++17 /EHsc ws_logic_test.cpp && ws_logic_test.exe
@@ -19,7 +19,7 @@ struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back(
 #define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
 static bool near(float a, float b, float e = 0.01f) { return std::fabs(a - b) <= e; }
 
-static const rsa::MaterialTable& tab() { static rsa::MaterialTable t; return t; }
+static const ffx::MaterialTable& tab() { static ffx::MaterialTable t; return t; }
 static Ground ground(int fl, int fr, int rl, int rr) { const int ids[4] = {fl, fr, rl, rr}; return groundFromIds(ids, tab(), GroundCfg()); }
 static float shareSum(const float* s) { float t = 0; for (int i = 0; i < kTints; ++i) t += s[i]; return t; }
 

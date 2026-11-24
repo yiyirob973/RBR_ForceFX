@@ -108,7 +108,7 @@ struct Cfg {
 
 std::atomic<bool> g_enabled{true};        // head movement live switch (ForceFX menu, Ctrl+F10)
 std::atomic<bool> g_ready{false};         // the hooks are installed and packets are being processed
-std::atomic<bool> g_wsOn{false};         // WindscreenFX live switch (ForceFX menu, Ctrl+F8). wsEnable only says whether its hooks were installed at startup
+std::atomic<bool> g_wsOn{false};         // Windscreen live switch (ForceFX menu, Ctrl+F8). wsEnable only says whether its hooks were installed at startup
 std::string g_dir;
 FILE* g_log = nullptr;                                 // ForceFXCamera.log, only when Log=1
 std::function<void(const std::string&)> g_hostLog;
@@ -232,7 +232,7 @@ std::vector<Opt> optTable(Cfg& c) {
     };
 }
 
-// ---- per-stage rain / mud for WindscreenFX. RBR has no weather system: whether a stage is wet is a fixed property of the stage, and the
+// ---- per-stage rain / mud for Windscreen. RBR has no weather system: whether a stage is wet is a fixed property of the stage, and the
 // telemetry does not say. The plugin is told the map id when a stage starts (not its name), so [WindscreenStages] maps id -> rain[,mud].
 struct WsStageRule { int id; float rain, mud; };
 std::vector<WsStageRule> g_wsStageRules;
@@ -312,7 +312,7 @@ bool sane3(const float* v) {
 }
 
 // ================================================================================================ telemetry
-constexpr int kOffCarRoll = 76, kOffSteer = 24, kOffThrottle = 28, kOffBrake = 32, kOffGear = 44, kOffSpeed = 60, kOffYawRate = 108;
+constexpr int kOffCarRoll = 76, kOffSteer = 24, kOffBrake = 32, kOffGear = 44, kOffSpeed = 60, kOffYawRate = 108;
 constexpr int kOffSusp = 152, kSuspStride = 128, kOffStrut = 16, kMinSuspPacket = 560;
 constexpr int kOffSurge = 112, kOffSway = 116, kOffHeave = 120, kMinPacket = 136;
 
@@ -321,8 +321,8 @@ struct Inputs {                                                       // written
 } g_in;
 std::atomic<float>    g_pkSurge{0}, g_pkSway{0}, g_pkHeave{0}, g_pkYaw{0}, g_pkSteer{0}, g_pkCarRoll{0};
 char                  g_pktLast[1500]; std::atomic<int> g_pktLen{0};      // last telemetry packet (only kept when [Windscreen] Probe=1)
-std::atomic<float>    g_wsSplash{0};                                       // landing / impact strength handed to WindscreenFX (mud splatter)
-std::atomic<float>    g_wsWaterHit{0};                                     // a tyre hit standing water, 0..1: WindscreenFX throws a wash of water at the glass
+std::atomic<float>    g_wsSplash{0};                                       // landing / impact strength handed to Windscreen (mud splatter)
+std::atomic<float>    g_wsWaterHit{0};                                     // a tyre hit standing water, 0..1: Windscreen throws a wash of water at the glass
 std::atomic<float>    g_evCrashSurge{0}, g_evCrashSway{0}, g_evLand{0};   // impact events (signed excess g / landing strength), consumed by the render thread
 std::atomic<bool>     g_airborne{false};
 std::atomic<float>    g_loadFrac{1.f};
@@ -834,9 +834,9 @@ std::string g_d3dPath;
 M4 g_P = m4Ident(), g_Pinv = m4Ident(), g_Hinv = m4Ident(), g_Comb = m4Ident();
 bool g_pValid = false, g_combDirty = true; int g_zSign = 1;
 volatile bool g_in3D = false, g_inWindscreenFx = false, g_patchActive = false;
-M4 g_lastMvp = m4Ident(); bool g_lastMvpOk = false;                    // the game's own MVP of the draw about to happen (before the head patch), for the WindscreenFX wiper hunter
-M4 g_wsP = m4Ident(), g_wsPinv = m4Ident(); bool g_wsPok = false;      // full scene projection (+ inverse) captured during the 3D pass, for WindscreenFX
-float g_wsPzs = 0.f, g_wsPc33 = 0.f, g_wsPc43 = 0.f;                   // scene projection terms for the glass depth (WindscreenFX), captured during the 3D pass
+M4 g_lastMvp = m4Ident(); bool g_lastMvpOk = false;                    // the game's own MVP of the draw about to happen (before the head patch), for the Windscreen wiper hunter
+M4 g_wsP = m4Ident(), g_wsPinv = m4Ident(); bool g_wsPok = false;      // full scene projection (+ inverse) captured during the 3D pass, for Windscreen
+float g_wsPzs = 0.f, g_wsPc33 = 0.f, g_wsPc43 = 0.f;                   // scene projection terms for the glass depth (Windscreen), captured during the 3D pass
 std::atomic<long> g_patched{0};
 
 HRESULT __stdcall hkSetTransform(void* dev, DWORD state, const float* m) {
@@ -868,7 +868,7 @@ HRESULT __stdcall hkSetVSConst(void* dev, UINT start, const float* data, UINT co
     return g_origSetVSConst(dev, start, data, count);
 }
 
-// ================================================================================================ WindscreenFX (v3)
+// ================================================================================================ Windscreen effects
 // Rain, snow and mud on the glass of the cockpit view, drawn through the D3D9 device (pre-transformed vertices, procedural textures).
 //  - Drops are refractive: a copy of the frame is sampled upside down and magnified inside each drop, like a real bead of water. Moving drops
 //    become teardrops, leave a streak and swallow the drops they hit. Rain falls at a rate set by the game's own sky type and your speed.
@@ -997,7 +997,7 @@ WsGameWeather wsReadGameWeather() {
 WsGameWeather g_wsGW;                                              // refreshed a few times a second from wsStep
 
 // ---- what the tyres are on (from the surface scan), and what that means for the glass ----
-rsa::MaterialTable g_wsMat;                                        // material id -> class / wetness / looseness
+ffx::MaterialTable g_wsMat;                                        // material id -> class / wetness / looseness
 wsl::Ground g_wsGround;                                            // smoothed over about half a second so one tyre touching a verge does not flip the glass
 wsl::Rgb    g_wsDirtCol{0.52f, 0.40f, 0.28f};                      // colour of the haze on the glass: drifts towards whatever is landing on it
 int         g_wsGroundIds[4] = {-1, -1, -1, -1}; DWORD g_wsGroundTick = 0, g_wsGroundGood = 0; bool g_wsGroundSeen = false;
@@ -1026,7 +1026,6 @@ template <class F> bool wsMakeTex(IDirect3DDevice9* d, IDirect3DTexture9** t, in
 }
 
 // Water bead artwork lives in ws_art.hpp (it can be rendered offline, see tests/ws_art_preview.cpp). Cell 0 is a standing drop, cell 1 a running one.
-float wsBeadH(int cell, float u, float v) { return wsl::art::height(cell, u, v); }
 void wsFromArt(const wsl::art::Px& q, WsPx& p) { for (int i = 0; i < 3; ++i) p.c[i] = q.c[i]; p.a = q.a; }
 void wsBeadShade(int cell, float u, float v, WsPx& p) { wsl::art::Px q; wsl::art::shade(cell, u, v, q); wsFromArt(q, p); }
 // Mud / slush atlas: 4 x 2 cells of 128 px (luminance in rgb, tinted by the vertex colour). Cells 0-3 are thrown-mud splats like the ones on a rally car's
@@ -1195,7 +1194,7 @@ void wsReleaseScene() {
     g_wsSceneW = g_wsSceneH = 0;
 }
 bool wsEnsureResources(IDirect3DDevice9* d) {
-    if (!g_wsSpriteTex && !wsMakeTextures(d)) { g_wsTexFailed = true; Note("WindscreenFX: texture creation failed, effect disabled"); return false; }
+    if (!g_wsSpriteTex && !wsMakeTextures(d)) { g_wsTexFailed = true; Note("Windscreen: texture creation failed, effect disabled"); return false; }
     if (!g_wsSB && FAILED(d->CreateStateBlock(D3DSBT_ALL, &g_wsSB))) { g_wsSB = nullptr; return false; }
     return true;
 }
@@ -1222,14 +1221,14 @@ bool wsCopyScene(IDirect3DDevice9* d, const D3DVIEWPORT9& vp, bool needBlur) {
         wsReleaseScene();
         if (FAILED(d->CreateTexture(tw, th, 1, D3DUSAGE_RENDERTARGET, desc.Format, D3DPOOL_DEFAULT, &g_wsSceneTex, nullptr)) || !g_wsSceneTex ||
             FAILED(g_wsSceneTex->GetSurfaceLevel(0, &g_wsSceneSurf)) || !g_wsSceneSurf) {
-            wsReleaseScene(); rt->Release(); g_wsRefrFailed = true; Note("WindscreenFX: refraction disabled (cannot create the scene copy, format %d)", (int)desc.Format); return false;
+            wsReleaseScene(); rt->Release(); g_wsRefrFailed = true; Note("Windscreen: refraction disabled (cannot create the scene copy, format %d)", (int)desc.Format); return false;
         }
         g_wsSceneW = tw; g_wsSceneH = th; g_wsSceneFmt = (int)desc.Format;
     }
     RECT src = { (LONG)vp.X, (LONG)vp.Y, (LONG)(vp.X + vp.Width), (LONG)(vp.Y + vp.Height) };
     const HRESULT hr = d->StretchRect(rt, &src, g_wsSceneSurf, nullptr, msaa ? D3DTEXF_NONE : D3DTEXF_LINEAR);
     rt->Release();
-    if (FAILED(hr)) { g_wsRefrFailed = true; Note("WindscreenFX: refraction disabled (StretchRect failed 0x%08X, multisampled=%d)", (unsigned)hr, msaa ? 1 : 0); return false; }
+    if (FAILED(hr)) { g_wsRefrFailed = true; Note("Windscreen: refraction disabled (StretchRect failed 0x%08X, multisampled=%d)", (unsigned)hr, msaa ? 1 : 0); return false; }
     if (needBlur && !g_wsVeilFailed) {                                 // two more halvings: the veil is a heavily blurred copy of the same frame
         if (!g_wsBlurTex[1]) {
             UINT bw = tw, bh = th; bool ok = true;
@@ -1239,10 +1238,10 @@ bool wsCopyScene(IDirect3DDevice9* d, const D3DVIEWPORT9& vp, bool needBlur) {
                      SUCCEEDED(g_wsBlurTex[i]->GetSurfaceLevel(0, &g_wsBlurSurf[i])) && g_wsBlurSurf[i];
             }
             if (!ok) { for (int i = 0; i < 2; ++i) { if (g_wsBlurSurf[i]) { g_wsBlurSurf[i]->Release(); g_wsBlurSurf[i] = nullptr; } if (g_wsBlurTex[i]) { g_wsBlurTex[i]->Release(); g_wsBlurTex[i] = nullptr; } }
-                       g_wsVeilFailed = true; Note("WindscreenFX: veil disabled (cannot create the blur copies)"); return true; }
+                       g_wsVeilFailed = true; Note("Windscreen: veil disabled (cannot create the blur copies)"); return true; }
         }
         if (FAILED(d->StretchRect(g_wsSceneSurf, nullptr, g_wsBlurSurf[0], nullptr, D3DTEXF_LINEAR)) || FAILED(d->StretchRect(g_wsBlurSurf[0], nullptr, g_wsBlurSurf[1], nullptr, D3DTEXF_LINEAR)))
-        { g_wsVeilFailed = true; Note("WindscreenFX: veil disabled (StretchRect for the blur failed)"); }
+        { g_wsVeilFailed = true; Note("Windscreen: veil disabled (StretchRect for the blur failed)"); }
     }
     return true;
 }
@@ -1754,7 +1753,7 @@ bool wsDraw(IDirect3DDevice9* d) {
     M4 C = m4Ident(); bool haveC = false;
     if (gz >= 0.f && g_wsPok) { C = m4Mul(g_wsP, m4Mul(g_patchActive ? g_Hinv : m4Ident(), g_wsPinv)); haveC = true; }
     static bool logged = false;
-    if (!logged) { logged = true; Logf("WindscreenFX: first draw, DrawAt=%d depthTest=%d glassZ=%.5f glassLock=%d refraction=%d hideGameFx=%d viewport=%ux%u", g_cfg.wsDrawAt, useZ ? 1 : 0, gz, haveC ? 1 : 0, g_cfg.wsRefraction, g_cfg.wsHideGameFx, vp.Width, vp.Height); }
+    if (!logged) { logged = true; Logf("Windscreen: first draw, DrawAt=%d depthTest=%d glassZ=%.5f glassLock=%d refraction=%d hideGameFx=%d viewport=%ux%u", g_cfg.wsDrawAt, useZ ? 1 : 0, gz, haveC ? 1 : 0, g_cfg.wsRefraction, g_cfg.wsHideGameFx, vp.Width, vp.Height); }
 
     // Glass space: every position is where that spot of the glass appears with the camera at its base pose. Each vertex goes through the same head
     // transform (P * Hinv * P^-1) the game's 3D scene gets, at the glass depth, so everything stays fixed on the car when the head moves.
@@ -2343,17 +2342,17 @@ HRESULT __stdcall hkCreateDevice(void* self, UINT adapter, UINT devType, HWND hw
         const bool b = MH_CreateHook(vt[94], (void*)&hkSetVSConst, (void**)&g_origSetVSConst) == MH_OK && MH_EnableHook(vt[94]) == MH_OK;
         g_devHooked = a && b;
         g_wsDev = (IDirect3DDevice9*)*ppDev;
-        if (g_cfg.wsEnable) {                                          // WindscreenFX: EndScene = 42, Reset = 16
+        if (g_cfg.wsEnable) {                                          // Windscreen: EndScene = 42, Reset = 16
             const bool c = MH_CreateHook(vt[42], (void*)&hkEndScene, (void**)&g_origEndScene) == MH_OK && MH_EnableHook(vt[42]) == MH_OK;
             const bool r = MH_CreateHook(vt[16], (void*)&hkReset, (void**)&g_origReset) == MH_OK && MH_EnableHook(vt[16]) == MH_OK;
             g_wsHooked = c && r;
-            Note("WindscreenFX: EndScene hook %s, Reset hook %s", c ? "OK" : "FAILED", r ? "OK" : "FAILED");
+            Note("Windscreen: EndScene hook %s, Reset hook %s", c ? "OK" : "FAILED", r ? "OK" : "FAILED");
             if (g_cfg.wsHideGameFx == 1 || g_cfg.wsWiperSource || g_cfg.wsHideGameWipers || g_cfg.wsProbe) {   // DrawPrimitive = 81, DrawIndexedPrimitive = 82, DrawPrimitiveUP = 83, DrawIndexedPrimitiveUP = 84
                 const bool h1 = MH_CreateHook(vt[81], (void*)&hkDrawPrim, (void**)&g_origDrawPrim) == MH_OK && MH_EnableHook(vt[81]) == MH_OK;
                 const bool h2 = MH_CreateHook(vt[82], (void*)&hkDrawIdxPrim, (void**)&g_origDrawIdxPrim) == MH_OK && MH_EnableHook(vt[82]) == MH_OK;
                 const bool h3 = MH_CreateHook(vt[83], (void*)&hkDrawPrimUP, (void**)&g_origDrawPrimUP) == MH_OK && MH_EnableHook(vt[83]) == MH_OK;
                 const bool h4 = MH_CreateHook(vt[84], (void*)&hkDrawIdxPrimUP, (void**)&g_origDrawIdxPrimUP) == MH_OK && MH_EnableHook(vt[84]) == MH_OK;
-                Note("WindscreenFX: draw-call hooks for HideGameFx: %s %s %s %s", h1 ? "OK" : "FAILED", h2 ? "OK" : "FAILED", h3 ? "OK" : "FAILED", h4 ? "OK" : "FAILED");
+                Note("Windscreen: draw-call hooks for HideGameFx: %s %s %s %s", h1 ? "OK" : "FAILED", h2 ? "OK" : "FAILED", h3 ? "OK" : "FAILED", h4 ? "OK" : "FAILED");
             }
         }
         Note("D3D device created: SetTransform hook %s, SetVertexShaderConstantF hook %s", a ? "OK" : "FAILED", b ? "OK" : "FAILED");
@@ -2547,7 +2546,7 @@ void __fastcall hkRender(void* p) {
     } else if (g_dirty) {
         g_dirty = false; resetHead();
     }
-    g_wsArmed = g_wsOn.load() && g_wsHooked && g_cfg.wsEnable && isCockpit(type);   // WindscreenFX draws from the EndScene hook
+    g_wsArmed = g_wsOn.load() && g_wsHooked && g_cfg.wsEnable && isCockpit(type);   // Windscreen draws from the EndScene hook
     g_wsFrameNo++; g_wsStamp = now;
     g_in3D = true;
     g_origRender(p);
@@ -2557,7 +2556,7 @@ void __fastcall hkRender(void* p) {
 } // namespace
 
 // ================================================================================================ the module
-class CameraFx {
+class Camera {
 public:
     struct Hooks {
         std::function<void(const std::string&)> log;
@@ -2590,9 +2589,9 @@ public:
             m_render = t2; Logf("hook render installed @ %p", t2);
         } else Note("hook render FAILED @ %p", t2);
         if (g_cfg.method == 4 && g_cfg.autoFallback && openRBRVRLoaded()) fallbackToMethod2("openRBRVR.dll detected at startup");
-        const bool wantD3D = (g_cfg.method == 4) || (g_cfg.wsEnable && !openRBRVRLoaded());   // WindscreenFX also needs the device hooks
+        const bool wantD3D = (g_cfg.method == 4) || (g_cfg.wsEnable && !openRBRVRLoaded());   // Windscreen also needs the device hooks
         if (wantD3D && installD3DHooks()) Logf("D3D hooks requested (method %d, windscreen enable=%d)", g_cfg.method, g_cfg.wsEnable);
-        if (wantD3D) {                                                  // also needed by WindscreenFX: counts the game's own wet-overlay calls
+        if (wantD3D) {                                                  // also needed by Windscreen: counts the game's own wet-overlay calls
             void* t3 = (void*)absAddr(0x452020);
             if (MH_CreateHook(t3, (void*)&hkWindscreenFx, (void**)&g_origWindscreenFx) == MH_OK && MH_EnableHook(t3) == MH_OK) {
                 m_wind = t3; Logf("hook windscreen effects installed @ %p", t3);

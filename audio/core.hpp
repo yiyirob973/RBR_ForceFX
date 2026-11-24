@@ -1,4 +1,4 @@
-// RBR Surface Audio - portable core: telemetry decode, per-tyre analysis, debris triggers.
+// Dynamic audio core: telemetry decode, per-tyre analysis and the sound triggers.
 // No Windows or audio dependencies, so everything here is unit-tested off-platform.
 #pragma once
 #include <algorithm>
@@ -15,7 +15,7 @@
 #include "../tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slide (shared with the road feel)
 #include "crash.hpp"             // crashes (trees, rocks, walls) from the body acceleration
 
-namespace rsa {
+namespace ffx {
 
 // ------------------------------------------------------------------ math / dsp
 constexpr double kPi = 3.14159265358979323846;
@@ -50,10 +50,8 @@ private:
 };
 
 // -------------------------------------------------------------------- settings
-enum StageHint { HintAuto = 0, HintTarmac = 1, HintGravel = 2, HintSnow = 3 };
-
-// Byte offsets of the NGP UDP packet fields. Defaults follow rbr.telemetry.data.TelemetryData.h (NGP 7.4.778).
-// Override with "Packet.<Name> = <offset>" in the ini if a future NGP changes the layout.
+// Byte offsets of the NGP packet fields, as laid out in NGP 7.4.778 (rbr.telemetry.data.TelemetryData.h).
+// "Packet.<Name> = <offset>" in the [Audio] section of ForceFX.ini overrides one if a future NGP changes the layout.
 struct PacketLayout {
     int minLength = 664;
     int steps = 0;                                    // totalSteps_: NGP's own step counter, a clean clock for the wheel counters (-1 = not there)
@@ -74,8 +72,6 @@ struct PacketLayout {
 };
 
 struct Settings {
-    bool enabled = true;
-    int udpPort = 6777;   // second NGP endpoint, so SimHub keeps 6776
     std::string soundsFolder;          // blank = "<plugin folder>\ForceFXAudio\sounds"
     int outputDevice = -1;             // -1 = default waveOut device
     float masterVolume = 1.0f;
@@ -102,7 +98,6 @@ struct Settings {
     double speedFieldScale = 1.609;    // Speed field / true ground speed while rolling (learned while coasting, this is the starting value)
 
     double looseThreshold = 0.15, roughThreshold = 0.45, slipThreshold = 0.15, softness = 0.35;
-    int hint = HintAuto;
     double coastAccelLimit = 1.5;      // m/s^2
     double accelToMs2 = 1.0;           // 9.81 if accelerations are in g
     double yawRateScale = 1.0;         // 0.01745 if yaw rate is in deg/s
@@ -119,10 +114,8 @@ struct Settings {
     bool enableCrashes = true;         // crash sounds: a tree, a big rock or a wall (see crash.hpp)
     double crashMinG = 3.0, crashLevel = 1.0;   // body acceleration (g) that can be a crash; loudness (0-6)
     bool debugLog = false;
-    bool memCrossCheck = true;         // distrust the game surface when it says tarmac but the suspension is hammered. For a blind memory scanner; ForceFX turns it off because its reader is exact (cobbles are tarmac to the game)
     bool startupBeep = true;           // short test tone when the plugin starts: proves the audio output path
 
-    int surfaceMode = 0;                 // 0 auto: game memory when healthy, else telemetry inference; 1 telemetry only
     PacketLayout packet;
 };
 
@@ -144,9 +137,7 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     using namespace detail;
     auto d = [&]() { return std::atof(v.c_str()); };
     auto dl = [&](double* arr) { auto p = split(v, ','); for (size_t i = 0; i < p.size() && i < 4; ++i) arr[i] = std::atof(p[i].c_str()); };
-    if (key == "Enabled") s.enabled = toBool(v);
-    else if (key == "UdpPort") s.udpPort = std::atoi(v.c_str());
-    else if (key == "SoundsFolder") s.soundsFolder = v;
+    if (key == "SoundsFolder") s.soundsFolder = v;
     else if (key == "OutputDevice") s.outputDevice = std::atoi(v.c_str());
     else if (key == "MasterVolume") s.masterVolume = (float)d();
     else if (key == "TotalGain") s.totalGain = (float)clampd(d(), 0.0, 8.0);
@@ -172,7 +163,6 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "RoughThreshold") s.roughThreshold = d();
     else if (key == "SlipThreshold") s.slipThreshold = d();
     else if (key == "Softness") s.softness = d();
-    else if (key == "StageHint") s.hint = std::atoi(v.c_str());
     else if (key == "CoastAccelLimit") s.coastAccelLimit = d();
     else if (key == "AccelToMs2") s.accelToMs2 = d();
     else if (key == "YawRateScale") s.yawRateScale = d();
@@ -196,7 +186,6 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "CrashLevel") s.crashLevel = clampd(d(), 0.0, 6.0);
     else if (key == "DebugLog") s.debugLog = toBool(v);
     else if (key == "StartupBeep") s.startupBeep = toBool(v);
-    else if (key == "SurfaceMode") s.surfaceMode = (v == "telemetry" || v == "1") ? 1 : 0;
     else if (key.compare(0, 7, "Packet.") == 0) {
         PacketLayout& p = s.packet;
         std::string k = key.substr(7);
@@ -319,10 +308,8 @@ private:
 // -------------------------------------------------------------------- analysis
 enum SurfaceClass { Tarmac = 0, Loose = 1, Rough = 2, Slippery = 3 };
 
-// Soft classifier: roughness bands (smooth / loose / rough); smooth + slipping a lot = slippery.
+// Soft classifier from telemetry alone: roughness bands (smooth, loose, rough); smooth ground with a lot of slip is slippery.
 inline void classify(double roughness, double absSlip, bool slipValid, const Settings& s, double p[4]) {
-    static const double priors[4][4] = {
-        {1.0, 1.0, 1.0, 1.0}, {1.0, 0.3, 0.1, 0.1}, {0.1, 1.0, 0.6, 0.1}, {0.1, 0.6, 0.3, 1.0}};
     double lr = std::log(std::max(roughness, 1e-6));
     double soft = std::max(s.softness, 0.05);
     double sLoose = sigmoid((lr - std::log(s.looseThreshold)) / soft);
@@ -332,8 +319,7 @@ inline void classify(double roughness, double absSlip, bool slipValid, const Set
         slippery = tarmac * sigmoid((absSlip - s.slipThreshold) / 0.05);
         tarmac -= slippery;
     }
-    const double* pr = priors[std::min(std::max(s.hint, 0), 3)];
-    p[0] = tarmac * pr[0]; p[1] = loose * pr[1]; p[2] = rough * pr[2]; p[3] = slippery * pr[3];
+    p[0] = tarmac; p[1] = loose; p[2] = rough; p[3] = slippery;
     double sum = p[0] + p[1] + p[2] + p[3];
     if (sum < 1e-9) { p[0] = 1; p[1] = p[2] = p[3] = 0; return; }
     for (int i = 0; i < 4; ++i) p[i] /= sum;
@@ -578,43 +564,34 @@ private:
     double airTimer_ = 0, groundHold_ = 0, lastTotal_ = 0;
 };
 
-// Coarse surface labels derived from telemetry alone, used as weak ground truth by auto-discovery.
-// coarse: 0 tarmac, 1 loose or rough (gravel, dirt, grass), 3 slippery (snow/ice).
-struct Label { bool valid = false; int coarse = -1; };
-inline int coarseOfClass(int cls) { return cls == 0 ? 0 : (cls == 1 || cls == 2) ? 1 : cls == 3 ? 3 : -1; }
-
 // ---------------------------------------------------------------- game-memory surface
-// Source of the game's own material id for each tyre (LF, RF, LB, RB). Implemented by memory.hpp; faked in tests.
+// Source of the game's own material id for each tyre (LF, RF, LB, RB). ForceFX's surface reader fills it in the plugin; tests fake it.
 class ISurfaceMemory {
 public:
     virtual ~ISurfaceMemory() {}
     virtual bool readMaterials(int ids[4]) = 0;      // false = nothing usable this frame
-    virtual bool configured() const = 0;             // false while it is only the empty placeholder
+    virtual bool configured() const = 0;             // false until the reader has found the tyres
     virtual std::string statusText() const = 0;
 };
 
-// Decides whether the memory values can be trusted, and drops back to telemetry inference if not:
-//  - ids that are not in the material table mean the address is wrong or the layout changed (garbage),
-//  - reads that keep failing mean the pointer chain no longer resolves,
-//  - sustained extreme disagreement with the suspension data ("tarmac" while the tyre is bouncing on rough ground).
+// Decides whether the material ids can be trusted, and falls back to telemetry inference if not:
+//  - ids that are not in the material table mean the layout changed (garbage),
+//  - reads that keep failing mean the reader lost the tyres.
 class MemoryHealth {
 public:
-    enum State { Off, Healthy, Invalid, Unreadable, Disagrees };
+    enum State { Off, Healthy, Invalid, Unreadable };
 
-    State state() const { return state_; }
     bool usable() const { return state_ == Healthy; }
     const char* text() const {
         switch (state_) {
             case Healthy: return "healthy";
             case Invalid: return "values are not valid material ids";
             case Unreadable: return "reads failing";
-            case Disagrees: return "disagrees with telemetry";
             default: return "off";
         }
     }
 
-    void update(bool readOk, const int ids[4], const MaterialTable& table, const SurfaceAnalyzer& a,
-                const Settings& s, double dt) {
+    void update(bool readOk, const int ids[4], const MaterialTable& table) {
         bool recognised = false;
         if (readOk) {
             recognised = true;
@@ -623,18 +600,8 @@ public:
         } else ++failStreak_;
         ring_[pos_] = readOk && recognised; pos_ = (pos_ + 1) % kN; if (n_ < kN) ++n_;
 
-        // Cross-check against suspension data (only the clear-cut case: tarmac while the tyre is hammered).
-        for (int w = 0; s.memCrossCheck && w < 4; ++w) {
-            bool clash = readOk && table.cls(ids[w]) == Tarmac && a.speedMs > 8.0 &&
-                         a.wheels[w].roughness > 3.0 * s.roughThreshold;
-            mismatch_[w] = clash ? mismatch_[w] + dt : std::max(0.0, mismatch_[w] - 0.5 * dt);
-            if (mismatch_[w] > 2.0) { holdoff_ = 15.0; mismatch_[w] = 0; }
-        }
-        if (holdoff_ > 0) holdoff_ -= dt;
-
         int good = 0; for (int i = 0; i < n_; ++i) if (ring_[i]) ++good;
-        if (holdoff_ > 0) state_ = Disagrees;
-        else if (failStreak_ > 30) state_ = Unreadable;
+        if (failStreak_ > 30) state_ = Unreadable;
         else if (n_ >= 30 && good * 10 < n_ * 9) state_ = Invalid;
         else if (n_ >= 5 && readOk) state_ = Healthy;
     }
@@ -642,7 +609,6 @@ public:
 private:
     static constexpr int kN = 120;
     bool ring_[kN] = {}; int n_ = 0, pos_ = 0, failStreak_ = 0;
-    double mismatch_[4] = {0, 0, 0, 0}, holdoff_ = 0;
     State state_ = Off;
 };
 
@@ -910,8 +876,8 @@ private:
     }
 };
 
-// Telemetry frame in -> analysis -> gains / triggers on the sink.
-class SurfaceAudioController {
+// Telemetry frame in, analysis, then gains and triggers on the sink.
+class AudioController {
     const Settings& s_;
     IAudioSink& sink_;
     Rng rng_;
@@ -923,16 +889,14 @@ class SurfaceAudioController {
     const ISoundSets* sets_ = nullptr;
     std::vector<double> setW_[4], target_;
     TelemetryHealth telemetry_;
-    Label label_;
-    double labelStable_ = 0;
 
 public:
-    SurfaceAudioController(const Settings& s, IAudioSink& sink, uint32_t seed = 12345)
+    AudioController(const Settings& s, IAudioSink& sink, uint32_t seed = 12345)
         : s_(s), sink_(sink), rng_(seed), defaultSets_(s, table_), analyzer(s), debris(rng_) { setSoundSets(sink.soundSets()); }
     SurfaceAnalyzer analyzer;
     DebrisTriggers debris;
 
-    // Optional: the game-memory surface reader (null / unconfigured = telemetry inference only).
+    // Optional: the surface reader (null or not configured = telemetry inference only).
     void setSurfaceMemory(ISurfaceMemory* m) { mem_ = m; }
     // Normally taken from the sink; override only in tests. Null = one set per coarse class.
     void setSoundSets(const ISoundSets* sets) {
@@ -942,18 +906,16 @@ public:
         target_.assign(n, 0.0);
     }
     MaterialTable& materials() { return table_; }
-    bool usingMemory() const { return mem_ && s_.surfaceMode == 0 && mem_->configured() && health_.usable(); }
+    bool usingMemory() const { return mem_ && mem_->configured() && health_.usable(); }
 
     std::string surfaceSourceText() const {
-        if (!telemetry_.ok()) return "Telemetry: packet layout looks wrong (values out of range); silent. Check Packet.* in the ini.";
-        if (s_.surfaceMode != 0) return "Surface source: telemetry inference (memory disabled in ini)";
-        if (!mem_ || !mem_->configured()) return "Surface source: telemetry inference (memory: " + (mem_ ? mem_->statusText() : std::string("no reader")) + ")";
-        if (health_.usable()) return "Surface source: game memory (" + mem_->statusText() + ")";
-        return std::string("Surface source: telemetry inference (memory ") + health_.text() + "; " + mem_->statusText() + ")";
+        if (!telemetry_.ok()) return "Telemetry: packet layout looks wrong (values out of range), so the audio is silent. Check the Packet.* offsets in [Audio] of ForceFX.ini.";
+        if (!mem_ || !mem_->configured()) return "Surface source: telemetry inference (tyre reader: " + (mem_ ? mem_->statusText() : std::string("no reader")) + ")";
+        if (health_.usable()) return "Surface source: tyre reader (" + mem_->statusText() + ")";
+        return std::string("Surface source: telemetry inference (tyre reader ") + health_.text() + "; " + mem_->statusText() + ")";
     }
 
     void onFrame(const TelemetryFrame& f) {
-        if (!s_.enabled) { sink_.silence(); return; }
         telemetry_.add(frameLooksSane(f));
         if (!telemetry_.ok()) { sink_.silence(); return; }
         bool firstFrame = lastTime_ < 0;
@@ -963,7 +925,7 @@ public:
 
         int ids[4] = {0, 0, 0, 0};
         bool readOk = false;
-        bool useMem = mem_ && s_.surfaceMode == 0 && mem_->configured();
+        bool useMem = mem_ && mem_->configured();
         if (useMem) readOk = mem_->readMaterials(ids);
         for (int w = 0; w < 4; ++w) {
             int cls = readOk ? table_.cls(ids[w]) : -2;
@@ -974,8 +936,7 @@ public:
         }
 
         analyzer.update(f, dt);
-        updateLabel(dt);
-        if (useMem) health_.update(readOk, ids, table_, analyzer, s_, dt);
+        if (useMem) health_.update(readOk, ids, table_);
         updateSetWeights(ids, dt, firstFrame);
         wheelLoops();
         SetView sv; sv.count = (int)target_.size(); sv.w = setW_; sv.sets = sets_;
@@ -985,28 +946,7 @@ public:
     double insaneFraction() const { return telemetry_.insaneFraction(); }
 
 private:
-    // A label is only offered when all four tyres confidently and steadily show the same coarse class.
-    void updateLabel(double dt) {
-        int coarse = -2;
-        bool ok = analyzer.speedMs > 8.0 && !analyzer.airborne;
-        for (int w = 0; ok && w < 4; ++w) {
-            const WheelAnalyzer& wa = analyzer.wheels[w];
-            int best = 0; for (int c = 1; c < 4; ++c) if (wa.inferred[c] > wa.inferred[best]) best = c;
-            int cc = wa.inferred[best] > 0.8 ? coarseOfClass(best) : -1;
-            if (cc < 0 || (coarse != -2 && cc != coarse)) ok = false; else coarse = cc;
-        }
-        // A StageHint set by the user is ground truth: use it as the label (tarmac / loose / snow) while driving normally,
-        // so discovery no longer depends on the plugin's own, possibly wrong, guess.
-        if (s_.hint != HintAuto) {
-            ok = analyzer.speedMs > 5.0 && !analyzer.airborne;
-            coarse = s_.hint == HintTarmac ? 0 : s_.hint == HintGravel ? 1 : 3;
-        }
-        labelStable_ = ok ? labelStable_ + dt : 0.0;
-        label_.valid = ok && labelStable_ >= 1.0;
-        label_.coarse = label_.valid ? coarse : -1;
-    }
-
-    // Each tyre's weight over the sound sets: the exact material's set when game memory is valid for that tyre,
+    // Each tyre's weight over the sound sets: the exact material's set when the tyre reader is valid for that tyre,
     // otherwise the telemetry-inferred classes mapped onto their sets. Smoothed so sets crossfade.
     void updateSetWeights(const int ids[4], double dt, bool snap = false) {
         int n = (int)target_.size();
@@ -1065,4 +1005,4 @@ private:
     }
 };
 
-}  // namespace rsa
+}  // namespace ffx

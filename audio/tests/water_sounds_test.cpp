@@ -8,7 +8,7 @@
 #include "audio.hpp"
 #include "water_sounds.hpp"
 
-using namespace rsa;
+using namespace ffx;
 static int g_fail = 0, g_checks = 0;
 struct Reg { const char* name; std::function<void()> fn; };
 static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }

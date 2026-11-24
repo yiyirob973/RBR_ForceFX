@@ -6,7 +6,7 @@
 #include "core.hpp"
 #include "audio.hpp"
 
-using namespace rsa;
+using namespace ffx;
 
 static int g_fail = 0, g_checks = 0;
 struct Reg { const char* name; std::function<void()> fn; };
@@ -38,8 +38,8 @@ struct Drive {
 
 // The wheels turn at ground speed x (1 + slip); the segment counter steps every eighth of a turn; packets arrive with jitter.
 static void drive(const Drive& d, double seconds, GainSink& sink) {
-    Settings st; st.memCrossCheck = false; st.accelToMs2 = 9.81; st.drivetrain = d.drivetrain;
-    SurfaceAudioController c(st, sink, 1);
+    Settings st; st.accelToMs2 = 9.81; st.drivetrain = d.drivetrain;
+    AudioController c(st, sink, 1);
     std::mt19937 rng(5); std::normal_distribution<double> jit(0.0, d.jitterMs / 1000.0);
     double rev[4] = {0.11, 0.42, 0.67, 0.93}, lastArr = -1; const int n = (int)(seconds * d.rate);
     sink.from = d.from;

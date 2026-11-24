@@ -21,8 +21,7 @@
 //            the wheel gets no road effect of its own; only the wheel test, or a setup where RBR's force updates
 //            can't be seen, plays the road as one effect of its own. Their pitch follows the car's speed, and the tyre's contact patch
 //            takes the high bands away at low speed (road_bands.hpp). How strong the road is follows how rough the
-//            tyres feel (high-passed strut force relative to the average load, the same idea RbrSurfaceAudio uses)
-//            plus damper velocity. Smooth tarmac is silent and rough ground or kerbs turn violent and sharp. What
+//            tyres feel (high-passed strut force relative to the average load) plus damper velocity. Smooth tarmac is silent and rough ground or kerbs turn violent and sharp. What
 //            the road feels like comes from the ground under each tyre (how hard, loose, coarse and slippery it
 //            is, from the game's material names) together with speed and wheel slip, not from a list of surfaces;
 //            see road_feel.hpp. The road gain is the one setting for it.
@@ -35,8 +34,8 @@
 //   Engine, lump, road and brake are all zero-mean vibrations, so they never pull the wheel to one side (road_guard.hpp
 //   keeps the road that way). The landing boost is the only thing that changes RBR's own steering force.
 //
-// Building (RBR is 32-bit, so build x86 with the static runtime):
-//   cl /std:c++17 /EHsc /LD /MT /O2 RBR_ForceFX.cpp /Fe:RBR_ForceFX.dll /link /DEF:RBR_ForceFX.def
+// Building: RBR is 32-bit, so this is an x86 build. Run build.bat from an x86 Visual Studio prompt. It makes the four variants
+//   (basic, audio, camera, full) by defining FORCEFX_AUDIO and FORCEFX_CAMERA.
 //
 // Telemetry: NGP needs UDP telemetry switched on, but the destination doesn't matter. ForceFX picks the packets up as
 //   NGP sends them, by watching the Winsock send calls inside the RBR process (see PacketTap), so it needs no UDP port
@@ -63,6 +62,7 @@
 //
 // Files next to the DLL: ForceFX.ini (settings, written with defaults on first run), ForceFXCars.ini (car
 //   profiles), ForceFX.log, and ForceFX_packet.txt (a dump of the first telemetry packet, handy for checking offsets).
+//   With the audio or camera modules there are also the ForceFXAudio folder and ForceFXCamera.log.
 
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
@@ -92,8 +92,8 @@
 #define __SUPPORT_PLUGIN__ 1
 #include "IRBRGame.h"
 #include "IPlugin.h"
-#include "materials.hpp"      // ground material table, shared by the surface feel and the audio
-#include "audio_module.hpp"   // dynamic surface audio: only built in when FORCEFX_AUDIO is defined (off until the menu switch is turned on)
+#include "materials.hpp"      // ground material table, shared by the road feel, the audio and the windscreen
+#include "audio_module.hpp"   // dynamic audio: only built in when FORCEFX_AUDIO is defined (off until the menu switch is turned on)
 #include "camera_module.hpp"  // head movement and windscreen effects: only built in when FORCEFX_CAMERA is defined
 #include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
 #include "tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slides (shared with the audio module)
@@ -181,7 +181,7 @@ struct Config {
 
     // telemetry connection
     int   telemetrySource = 0;       // 0 = auto (NGP's send hook, UDP port as backup), 1 = send hook only, 2 = UDP port only
-    int   udpPort = 6778;            // backup listening port (0 = never open one). SimHub usually uses 6776 and RbrSurfaceAudio 6777: never share a port
+    int   udpPort = 6778;            // backup listening port (0 = never open one). SimHub usually uses 6776: never share a port
     int   minPacket = 664;
     int   cylinders = 4;             // engine pulses per rev = cylinders / 2
 
@@ -195,7 +195,7 @@ struct Config {
     int   roadViaRbr = 1;            // 1 = the road vibration is added to RBR's own force updates, so the wheel gets no extra road effect; 0 = one sine effect of its own
     int   probe = 0;                 // 1 = write ForceFX_probe.csv (ground ids and road signals ten times a second) for tuning surfaces; read at start only
 #ifdef FORCEFX_AUDIO
-    int   fxAudio = 0;               // dynamic surface audio (settings in the [Audio] section of ForceFX.ini); off until switched on
+    int   fxAudio = 0;               // dynamic audio (settings in the [Audio] section of ForceFX.ini); off until switched on
     float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in [Audio] of ForceFX.ini)
     float audioImpact = 1.0f;        // 0..4 live multiplier on impacts and landings (on top of EventLevel)
     float audioSusp = 1.0f;          // 0..4 live multiplier on suspension creaks and bottoming out (on top of SqueakLevel / BottomOutLevel)
@@ -1365,7 +1365,6 @@ public:
         return true;
     }
     HRESULT LastHr() const { return m_lastHr; }
-    bool Has(int slot) const { return slot >= 0 && slot < S_COUNT && m_fx[slot] != nullptr; }
 private:
     IDirectInputDevice8A* m_dev = nullptr;
     IDirectInputEffect* m_fx[S_COUNT] = {};
@@ -2201,8 +2200,8 @@ private:
     bool unmappedSeen_[256] = {};
     void NoteUnmapped(int id) {
         if (id < 0 || id > 255 || unmappedSeen_[id]) return;
-        const rsa::MaterialInfo* known = nullptr;
-        for (const rsa::MaterialInfo& m : rsa::kMaterials) if (m.id == id) { known = &m; break; }
+        const ffx::MaterialInfo* known = nullptr;
+        for (const ffx::MaterialInfo& m : ffx::kMaterials) if (m.id == id) { known = &m; break; }
         unmappedSeen_[id] = true;
         if (known && known->cls < 0) { Log("tyre contact id %d (%s) is an object or undefined, not ground; if this is a bridge or another special surface add Map=%d:wood (or cobble, gravel...) in [Surface]", id, known->name, id); return; }
         if (known) Log("ground material id %d (%s) has no surface class; add Map=%d:gravel (or tarmac, snow, ice, soft, cobble, wood) in [Surface] to give it one", id, known->name, id);
@@ -2215,8 +2214,8 @@ private:
     void NoteIdSeen(int id, int cls) {
         if (id < 0 || id > 255 || idSeen_[id]) return;
         idSeen_[id] = true;
-        const rsa::MaterialInfo* known = nullptr;
-        for (const rsa::MaterialInfo& m : rsa::kMaterials) if (m.id == id) { known = &m; break; }
+        const ffx::MaterialInfo* known = nullptr;
+        for (const ffx::MaterialInfo& m : ffx::kMaterials) if (m.id == id) { known = &m; break; }
         Log("ground id %d (%s) is read as %s", id, known ? known->name : "not in the game's table", ClsName(cls));
     }
 

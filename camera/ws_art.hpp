@@ -1,4 +1,4 @@
-// Artwork of the water drops in WindscreenFX, without Windows or Direct3D so it can be rendered and looked at offline (tests/ws_art_test.cpp).
+// Artwork of the water drops in Windscreen, without Windows or Direct3D so it can be rendered and looked at offline (tests/ws_art_test.cpp).
 //
 // What a real drop on a car windscreen looks like (and what the first version got wrong):
 //  * Standing drops are nearly round and small, a bit flatter at the bottom. Big flat grey pools and oval "pebbles" do not occur on a moving car.

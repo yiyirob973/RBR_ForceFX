@@ -19,7 +19,7 @@
 #include <vector>
 #include "audio.hpp"
 
-namespace rsa {
+namespace ffx {
 namespace wsnd {
 
 constexpr double kTwoPi = 6.28318530717958647692;
@@ -162,4 +162,4 @@ inline int addWaterFallbacks(SoundBank& bank, bool* splashFromRbr = nullptr) {
 }
 
 }  // namespace wsnd
-}  // namespace rsa
+}  // namespace ffx

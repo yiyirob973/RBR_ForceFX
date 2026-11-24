@@ -1,4 +1,4 @@
-// Optional dynamic surface audio module.
+// Optional dynamic audio module.
 //
 // Build with /DFORCEFX_AUDIO to include it. Without that define, ffx::Audio is an empty stand-in with the same
 // interface, so the rest of the plugin compiles unchanged and none of the audio code (or winmm) is pulled in.
@@ -10,7 +10,7 @@
 #ifdef FORCEFX_AUDIO
 
 #include "audio/dynamic_audio.hpp"
-namespace ffx { using Audio = rsa::DynamicAudio; }
+namespace ffx { using Audio = ffx::DynamicAudio; }
 
 #else
 

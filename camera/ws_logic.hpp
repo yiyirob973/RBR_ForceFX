@@ -1,4 +1,4 @@
-// WindscreenFX logic that needs neither Windows nor Direct3D, so it can be unit-tested anywhere (tests/ws_logic_test.cpp).
+// Windscreen logic that needs neither Windows nor Direct3D, so it can be unit-tested anywhere (tests/ws_logic_test.cpp).
 //
 //  * Ground      what the tyres are on (from the surface scan's material ids) -> how much is thrown at the glass, what it is
 //                (mud, dust, slush, road spray, grass) and how wet it is.
@@ -57,7 +57,7 @@ struct Ground {
 };
 
 // ids: the material id under FL, FR, RL, RR. Front tyres count a little more (they are closest to the glass line).
-inline Ground groundFromIds(const int ids[4], const rsa::MaterialTable& tab, const GroundCfg& cfg) {
+inline Ground groundFromIds(const int ids[4], const ffx::MaterialTable& tab, const GroundCfg& cfg) {
     static const float kW[4] = {0.30f, 0.30f, 0.20f, 0.20f};
     Ground g;
     float wSum = 0.f, looseSum = 0.f, mudSum = 0.f, spraySum = 0.f, dustSum = 0.f, snowSum = 0.f, clodW[kTints] = {0, 0, 0, 0, 0}, fineW[kTints] = {0, 0, 0, 0, 0};
