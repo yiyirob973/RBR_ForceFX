@@ -248,7 +248,7 @@ TEST(the_single_sine_stays_finite_for_bad_input) {
 // ---------------------------------------------------------------- with the game's real grounds
 TEST(every_ground_in_the_game_gives_a_finite_plan_with_sensible_bands) {
     int n = 0;
-    for (const rsa::MaterialInfo& m : rsa::kMaterials) {
+    for (const ffx::MaterialInfo& m : ffx::kMaterials) {
         Road::Ground g;
         if (!Road::GroundOfId(m.id, g)) continue;
         for (float act : {0.0f, 0.5f, 1.0f}) for (float v : {2.0f, 8.0f, 20.0f, 45.0f}) {
@@ -265,7 +265,7 @@ TEST(every_ground_in_the_game_gives_a_finite_plan_with_sensible_bands) {
     CHECK(n > 90);
 }
 TEST(gravel_is_flatter_than_snow_and_ice_is_brighter_than_both) {
-    auto gnd = [](const char* name) { for (const rsa::MaterialInfo& m : rsa::kMaterials) if (std::string(m.name) == name) { Road::Ground g; Road::GroundOfId(m.id, g); return g; } return Road::Ground(); };
+    auto gnd = [](const char* name) { for (const ffx::MaterialInfo& m : ffx::kMaterials) if (std::string(m.name) == name) { Road::Ground g; Road::GroundOfId(m.id, g); return g; } return Road::Ground(); };
     auto bands = [&](const char* name) {
         Road::Drive d; d.activity = 0.6f;
         Road::SideIn s[2]; s[0].fe = s[1].fe = Road::Derive(gnd(name), d); s[0].strength = s[1].strength = 500.0f;

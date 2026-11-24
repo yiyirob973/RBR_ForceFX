@@ -8,7 +8,7 @@
 #include "core.hpp"
 #include "audio.hpp"
 
-using namespace rsa;
+using namespace ffx;
 
 static int g_fail = 0, g_checks = 0;
 struct Reg { const char* name; std::function<void()> fn; };
@@ -38,7 +38,7 @@ static TelemetryFrame gframe(double t, double groundMs, double drivenMs, float s
 }
 
 // The settings ForceFX gives the audio: the game surface is trusted even when the suspension is busy on a road it calls tarmac.
-static Settings ff() { Settings s; s.memCrossCheck = false; return s; }
+static Settings ff() { return Settings(); }
 
 // The game's own material id under each tyre (LF, RF, LB, RB), as the plugin's surface reader would report it.
 struct FakeSurface : ISurfaceMemory {
@@ -52,7 +52,7 @@ struct FakeSurface : ISurfaceMemory {
 // mem = null: no game surface, the controller has only the telemetry to go on.
 static int run(double groundMs, double drivenMs, float throttle, float rough, double seconds, Settings st = Settings(), uint32_t seed = 1,
                ISurfaceMemory* mem = nullptr, FakeSink* out = nullptr) {
-    FakeSink own; FakeSink& sink = out ? *out : own; SurfaceAudioController c(st, sink, seed); if (mem) c.setSurfaceMemory(mem); double t = 0;
+    FakeSink own; FakeSink& sink = out ? *out : own; AudioController c(st, sink, seed); if (mem) c.setSurfaceMemory(mem); double t = 0;
     std::mt19937 g(9); std::normal_distribution<float> n(0, 1);
     for (int i = 0, N = (int)(seconds * 60); i < N; ++i) { t += 1.0 / 60; c.onFrame(gframe(t, groundMs, drivenMs, -3500.f * (1.f + rough * n(g)), throttle)); }
     return sink.stones;
@@ -72,7 +72,7 @@ TEST(stone_rate_grows_smoothly_with_speed) {
 }
 TEST(stones_are_quieter_at_low_surface_speed) {
     FakeSink slow, fast; Settings st;
-    SurfaceAudioController a(st, slow, 3), b(st, fast, 3); double t = 0;
+    AudioController a(st, slow, 3), b(st, fast, 3); double t = 0;
     std::mt19937 g(9); std::normal_distribution<float> n(0, 1);
     for (int i = 0; i < 1800; ++i) {
         t += 1.0 / 60; float strut = -3500.f * (1.f + 0.5f * n(g));
@@ -166,18 +166,13 @@ TEST(there_is_no_stone_rate_setting_any_more) {
     std::filesystem::remove(p);
 }
 TEST(rough_road_that_the_game_calls_tarmac_keeps_its_surface) {
-    // cobbles and bridges: the game says tarmac, the suspension is busy. The audio must not decide the game is wrong.
+    // cobbles and bridges: the game says tarmac, the suspension is busy. The audio keeps the surface the reader gave it.
     FakeSurface m; for (int& i : m.ids) i = 77;
-    FakeSink sink; Settings st = ff(); SurfaceAudioController c(st, sink, 1); c.setSurfaceMemory(&m);
+    FakeSink sink; Settings st = ff(); AudioController c(st, sink, 1); c.setSurfaceMemory(&m);
     std::mt19937 g(9); std::normal_distribution<float> n(0, 1); double t = 0;
     for (int i = 0; i < 60 * 25; ++i) { t += 1.0 / 60; c.onFrame(gframe(t, 25.0, 25.0, -3500.f * (1.f + 0.8f * n(g)), 0.5f)); }
     CHECK(c.usingMemory());                                                                                   // 25 s of heavy roughness later
     CHECK(c.analyzer.wheels[0].dominant() == Tarmac);
-    Settings scanner; scanner.memCrossCheck = true;                                                           // the blind-scanner default does what it always did
-    scanner.looseThreshold = 0.05; scanner.roughThreshold = 0.20;                                               // a sensitive scanner: it would call this road rough
-    FakeSink sink2; SurfaceAudioController c2(scanner, sink2, 1); c2.setSurfaceMemory(&m); t = 0;
-    for (int i = 0; i < 60 * 25; ++i) { t += 1.0 / 60; c2.onFrame(gframe(t, 25.0, 25.0, -3500.f * (1.f + 0.8f * n(g)), 0.5f)); }
-    CHECK(!c2.usingMemory() || c2.analyzer.wheels[0].dominant() != Tarmac);
 }
 
 // ---------------------------------------------------------------- stone loudness

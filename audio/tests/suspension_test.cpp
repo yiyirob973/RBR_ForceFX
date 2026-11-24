@@ -6,7 +6,7 @@
 #include <vector>
 #include "core.hpp"
 
-using namespace rsa;
+using namespace ffx;
 
 static int g_fail = 0, g_checks = 0;
 struct Reg { const char* name; std::function<void()> fn; };
@@ -30,7 +30,7 @@ struct FakeSink : IAudioSink {
 
 // A drive at a steady speed. load(w, t) is the strut force of each tyre and piston(w, t) its damper piston velocity.
 struct Drive {
-    Settings st; FakeSink sink; SurfaceAudioController c; double t = 0; double speed;
+    Settings st; FakeSink sink; AudioController c; double t = 0; double speed;
     explicit Drive(double speedMs = 25.0, Settings s = Settings()) : st(s), c(st, sink, 7), speed(speedMs) {}
     void run(double seconds, const std::function<float(int, double)>& load, const std::function<float(int, double)>& piston) {
         for (int i = 0, n = (int)(seconds * 60); i < n; ++i) {

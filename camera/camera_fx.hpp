@@ -57,6 +57,9 @@
 #include <functional>
 #include <algorithm>
 #include "../thirdparty/minhook/include/MinHook.h"
+#include "../materials.hpp"
+#include "ws_logic.hpp"
+#include "ws_art.hpp"
 
 namespace ffx {
 namespace cam {
@@ -89,12 +92,12 @@ struct Cfg {
     // [Limits]
     float maxPos = 0.025f, maxAng = 3.0f, maxRoll = 3.0f;
     // [Windscreen]  proof-of-concept overlay
-    int   wsRainSource = 1, wsProbe = 0, wsWetFromGame = 0, wsDrawAt = 1, wsDepthTest = 1, wsEnable = 0, wsMode = 3, wsDrops = 200, wsMud = 16, wsSignSway = 1, wsSignSurge = 1, wsToggleKey = 119,
-          wsWiperSource = 1, wsWiperAxis = 0, wsWiperAxisSign = 1, wsHideGameWipers = 0, wsWiperDraw = 0, wsMicro = 3500, wsPools = 1, wsHideGameFx = 1, wsRefraction = 1, wsSnowMax = 140, wsMudSmear = 1, wsWipers = 0, wsWiperAuto = 1, wsWiperDebug = 0, wsWiperSyncKey = 118, wsFly = 1, wsWiperBow = 1, wsWiperBlur = 1;
-    float wsRainLight = 0.45f, wsRainHeavy = 1.0f, wsMudDry = 0.15f, wsMudDamp = 0.7f, wsMudWet = 1.0f, wsSpeedRef = 120.f, wsRainLevel = 0.7f, wsRoughRef = 0.25f, wsRain = 20.f, wsMudRate = 6.f, wsTrail = 5.f, wsGlassDist = 0.9f, wsDropSize = 1.0f, wsMudSize = 1.0f, wsOpacity = 1.0f, wsWind = 1.0f, wsGravity = 1.0f,
-          wsWiperLenM = 0.5f, wsMicroRate = 200.f, wsVeil = 0.8f, wsPoolMinPx = 8.f, wsRefractK = 2.0f, wsRefractMinPx = 4.0f, wsSnowLight = 0.5f, wsSnowHeavy = 1.0f, wsSnowLevel = 0.f, wsSnowRate = 18.f, wsSnowMelt = 14.f, wsSnowSize = 1.0f, wsMudSnow = 0.6f,
-          wsWiperPeriod = 1.4f, wsWiperPause = 0.f,
-          wsDirt = 1.0f, wsGlow = 0.10f, wsFlyTime = 0.28f, wsMudR = 0.52f, wsMudG = 0.40f, wsMudB = 0.28f, wsWiperThick = 1.0f, wsFilmDecay = 0.15f, wsSpray = 1.0f,
+    int   wsRainSource = 1, wsProbe = 0, wsWetFromGame = 0, wsDrawAt = 1, wsDepthTest = 1, wsEnable = 0, wsMode = 3, wsDrops = 450, wsMud = 16, wsSignSway = 1, wsSignSurge = 1, wsToggleKey = 119,
+          wsWiperSource = 1, wsWiperAxis = 0, wsWiperAxisSign = 1, wsHideGameWipers = 0, wsWiperDraw = 0, wsMicro = 3500, wsPools = 0, wsHideGameFx = 1, wsRefraction = 1, wsSnowMax = 140, wsMudSmear = 1, wsWipers = 0, wsWiperAuto = 1, wsWiperDebug = 0, wsWiperSyncKey = 118, wsFly = 1, wsWiperBow = 1, wsWiperBlur = 1, wsGround = 1, wsWiperMeasure = 1, wsCarryOver = 1;
+    float wsRainLight = 0.45f, wsRainHeavy = 1.0f, wsMudDry = 0.15f, wsMudDamp = 0.7f, wsMudWet = 1.0f, wsSpeedRef = 120.f, wsRainLevel = 0.7f, wsRoughRef = 0.25f, wsRain = 100.f, wsMudRate = 6.f, wsTrail = 3.f, wsGlassDist = 0.9f, wsDropSize = 1.0f, wsMudSize = 1.0f, wsOpacity = 1.0f, wsWind = 1.0f, wsGravity = 1.0f,
+          wsWiperLenM = 0.5f, wsMicroRate = 380.f, wsVeil = 0.7f, wsPoolMinPx = 8.f, wsRefractK = 2.0f, wsRefractMinPx = 4.0f, wsSnowLight = 0.5f, wsSnowHeavy = 1.0f, wsSnowLevel = 0.f, wsSnowRate = 18.f, wsSnowMelt = 14.f, wsSnowSize = 1.0f, wsMudSnow = 0.6f,
+          wsWiperPeriod = 1.4f, wsWiperPause = 0.f, wsGrimeLife = 300.f, wsCarryMinutes = 10.f, wsWiperInner = 0.25f,
+          wsDirt = 1.0f, wsGlow = 0.05f, wsFlyTime = 0.28f, wsMudR = 0.52f, wsMudG = 0.40f, wsMudB = 0.28f, wsWiperThick = 1.0f, wsFilmDecay = 0.15f, wsSpray = 1.0f,
           wsW1X = 0.30f, wsW1Y = 1.0f, wsW1Len = 0.70f, wsW1A0 = 5.f, wsW1A1 = 100.f, wsW2X = 0.60f, wsW2Y = 1.0f, wsW2Len = 0.f, wsW2A0 = 5.f, wsW2A1 = 100.f;
     // [Axes]  camera frame (from your log: forward = -Z, up = +Y, right = +X)
     int   axRight = 0, axUp = 1, axFwd = 2;
@@ -105,10 +108,12 @@ struct Cfg {
 
 std::atomic<bool> g_enabled{true};        // head movement live switch (ForceFX menu, Ctrl+F10)
 std::atomic<bool> g_ready{false};         // the hooks are installed and packets are being processed
-std::atomic<bool> g_wsOn{false};         // WindscreenFX live switch (ForceFX menu, Ctrl+F8). wsEnable only says whether its hooks were installed at startup
+std::atomic<bool> g_wsOn{false};         // Windscreen live switch (ForceFX menu, Ctrl+F8). wsEnable only says whether its hooks were installed at startup
 std::string g_dir;
 FILE* g_log = nullptr;                                 // ForceFXCamera.log, only when Log=1
-std::function<void(const std::string&)> g_hostLog;     // ForceFX.log
+std::function<void(const std::string&)> g_hostLog;
+std::function<bool(int[4])> g_hostIds;
+std::function<std::string()> g_hostCarKey;                // the car in use, from the main plugin                  // material ids under the tyres, from the surface scan (may be empty)     // ForceFX.log
 
 // Logf: detail for tuning and bug reports, written to ForceFXCamera.log only when Log=1.
 // Note: what a user needs to know when something does not work (hooks, failures); also goes to ForceFX.log.
@@ -211,6 +216,8 @@ std::vector<Opt> optTable(Cfg& c) {
         {"Windscreen", "Wipers", nullptr, &c.wsWipers, 0, 1}, {"Windscreen", "WiperSource", nullptr, &c.wsWiperSource, 0, 1},
         {"Windscreen", "WiperAxis", nullptr, &c.wsWiperAxis, 0, 2}, {"Windscreen", "WiperAxisSign", nullptr, &c.wsWiperAxisSign, -1, 1}, {"Windscreen", "WiperLenM", &c.wsWiperLenM, nullptr, 0.1f, 2},
         {"Windscreen", "HideGameWipers", nullptr, &c.wsHideGameWipers, 0, 1}, {"Windscreen", "WiperDraw", nullptr, &c.wsWiperDraw, 0, 1}, {"Windscreen", "WiperAuto", nullptr, &c.wsWiperAuto, 0, 1}, {"Windscreen", "WiperDebug", nullptr, &c.wsWiperDebug, 0, 1},
+        {"Windscreen", "Ground", nullptr, &c.wsGround, 0, 1}, {"Windscreen", "CarryOver", nullptr, &c.wsCarryOver, 0, 1}, {"Windscreen", "CarryMinutes", &c.wsCarryMinutes, nullptr, 0, 600}, {"Windscreen", "GrimeLife", &c.wsGrimeLife, nullptr, 0, 3600},
+        {"Windscreen", "WiperMeasure", nullptr, &c.wsWiperMeasure, 0, 1}, {"Windscreen", "WiperInner", &c.wsWiperInner, nullptr, 0, 0.9f},
         {"Windscreen", "WiperSyncKey", nullptr, &c.wsWiperSyncKey, 0, 254}, {"Windscreen", "WiperPeriod", &c.wsWiperPeriod, nullptr, 0.3f, 10}, {"Windscreen", "WiperPause", &c.wsWiperPause, nullptr, 0, 20},
         {"Windscreen", "W1X", &c.wsW1X, nullptr, -0.5f, 1.5f}, {"Windscreen", "W1Y", &c.wsW1Y, nullptr, -0.5f, 1.5f}, {"Windscreen", "W1Len", &c.wsW1Len, nullptr, 0, 3},
         {"Windscreen", "W1A0", &c.wsW1A0, nullptr, -360, 360}, {"Windscreen", "W1A1", &c.wsW1A1, nullptr, -360, 360},
@@ -225,7 +232,7 @@ std::vector<Opt> optTable(Cfg& c) {
     };
 }
 
-// ---- per-stage rain / mud for WindscreenFX. RBR has no weather system: whether a stage is wet is a fixed property of the stage, and the
+// ---- per-stage rain / mud for Windscreen. RBR has no weather system: whether a stage is wet is a fixed property of the stage, and the
 // telemetry does not say. The plugin is told the map id when a stage starts (not its name), so [WindscreenStages] maps id -> rain[,mud].
 struct WsStageRule { int id; float rain, mud; };
 std::vector<WsStageRule> g_wsStageRules;
@@ -305,7 +312,7 @@ bool sane3(const float* v) {
 }
 
 // ================================================================================================ telemetry
-constexpr int kOffCarRoll = 76, kOffSteer = 24, kOffThrottle = 28, kOffBrake = 32, kOffGear = 44, kOffSpeed = 60, kOffYawRate = 108;
+constexpr int kOffCarRoll = 76, kOffSteer = 24, kOffBrake = 32, kOffGear = 44, kOffSpeed = 60, kOffYawRate = 108;
 constexpr int kOffSusp = 152, kSuspStride = 128, kOffStrut = 16, kMinSuspPacket = 560;
 constexpr int kOffSurge = 112, kOffSway = 116, kOffHeave = 120, kMinPacket = 136;
 
@@ -314,7 +321,8 @@ struct Inputs {                                                       // written
 } g_in;
 std::atomic<float>    g_pkSurge{0}, g_pkSway{0}, g_pkHeave{0}, g_pkYaw{0}, g_pkSteer{0}, g_pkCarRoll{0};
 char                  g_pktLast[1500]; std::atomic<int> g_pktLen{0};      // last telemetry packet (only kept when [Windscreen] Probe=1)
-std::atomic<float>    g_wsSplash{0};                                       // landing / impact strength handed to WindscreenFX (mud splatter)
+std::atomic<float>    g_wsSplash{0};                                       // landing / impact strength handed to Windscreen (mud splatter)
+std::atomic<float>    g_wsWaterHit{0};                                     // a tyre hit standing water, 0..1: Windscreen throws a wash of water at the glass
 std::atomic<float>    g_evCrashSurge{0}, g_evCrashSway{0}, g_evLand{0};   // impact events (signed excess g / landing strength), consumed by the render thread
 std::atomic<bool>     g_airborne{false};
 std::atomic<float>    g_loadFrac{1.f};
@@ -826,9 +834,9 @@ std::string g_d3dPath;
 M4 g_P = m4Ident(), g_Pinv = m4Ident(), g_Hinv = m4Ident(), g_Comb = m4Ident();
 bool g_pValid = false, g_combDirty = true; int g_zSign = 1;
 volatile bool g_in3D = false, g_inWindscreenFx = false, g_patchActive = false;
-M4 g_lastMvp = m4Ident(); bool g_lastMvpOk = false;                    // the game's own MVP of the draw about to happen (before the head patch), for the WindscreenFX wiper hunter
-M4 g_wsP = m4Ident(), g_wsPinv = m4Ident(); bool g_wsPok = false;      // full scene projection (+ inverse) captured during the 3D pass, for WindscreenFX
-float g_wsPzs = 0.f, g_wsPc33 = 0.f, g_wsPc43 = 0.f;                   // scene projection terms for the glass depth (WindscreenFX), captured during the 3D pass
+M4 g_lastMvp = m4Ident(); bool g_lastMvpOk = false;                    // the game's own MVP of the draw about to happen (before the head patch), for the Windscreen wiper hunter
+M4 g_wsP = m4Ident(), g_wsPinv = m4Ident(); bool g_wsPok = false;      // full scene projection (+ inverse) captured during the 3D pass, for Windscreen
+float g_wsPzs = 0.f, g_wsPc33 = 0.f, g_wsPc43 = 0.f;                   // scene projection terms for the glass depth (Windscreen), captured during the 3D pass
 std::atomic<long> g_patched{0};
 
 HRESULT __stdcall hkSetTransform(void* dev, DWORD state, const float* m) {
@@ -860,7 +868,7 @@ HRESULT __stdcall hkSetVSConst(void* dev, UINT start, const float* data, UINT co
     return g_origSetVSConst(dev, start, data, count);
 }
 
-// ================================================================================================ WindscreenFX (v3)
+// ================================================================================================ Windscreen effects
 // Rain, snow and mud on the glass of the cockpit view, drawn through the D3D9 device (pre-transformed vertices, procedural textures).
 //  - Drops are refractive: a copy of the frame is sampled upside down and magnified inside each drop, like a real bead of water. Moving drops
 //    become teardrops, leave a streak and swallow the drops they hit. Rain falls at a rate set by the game's own sky type and your speed.
@@ -906,7 +914,8 @@ std::vector<WsFly>    g_wsFly;
 std::vector<WsVert>   g_wsVSprite, g_wsVShade, g_wsVShadePool, g_wsVMud, g_wsVTrail, g_wsVFlake, g_wsVSplash, g_wsVDbg, g_wsVMicro, g_wsVVeil, g_wsVDirt, g_wsVGlow, g_wsVFlyMud, g_wsVFlyFlake, g_wsVStreak, g_wsVWBlur;
 std::vector<WsVert2>  g_wsVRefr, g_wsVRefrPool, g_wsVFrost;
 volatile bool g_wsArmed = false, g_wsHooked = false;
-bool          g_wsReset = true, g_wsTexFailed = false;
+bool          g_wsReset = true, g_wsResetWater = false, g_wsTexFailed = false;
+wsl::StageHistory g_wsHist; std::string g_wsLastCar; DWORD g_wsFinishTick = 0, g_wsCarCheckUntil = 0;   // for carrying mud from one stage to the next
 DWORD         g_wsStamp = 0;
 long          g_wsFrameNo = 0, g_wsLastDrawn = -1;
 std::atomic<long> g_wsDrawn{0}, g_wsSkipped{0};
@@ -919,8 +928,12 @@ float         g_wsRough = 0.f, g_wsLoose = 0.f, g_wsSpdN = 0.f, g_wsDbgRain = 0.
 uintptr_t     g_wsProbeA = 0;             // object passed to the game's wet-windscreen function (Probe=1 dumps / scans it)
 float         g_wsWet = 1.f;              // 0..1 rain rate scale; follows the game's wet-windscreen calls when [Windscreen] WetFromGame=1
 // the car's real wiper blades, found among the 3D draw calls by the hunter (see wsHuntReport) and turned into a pose every frame
-struct WsModelBlade { bool ok; float px, py, len, ang; };            // pivot (fraction of width / height), length (fraction of height), angle (rad, 0 = right, CCW with y up)
-WsModelBlade g_wsModelBlade[2] = {{false, 0, 0, 0, 0}, {false, 0, 0, 0, 0}};
+struct WsModelBlade { bool ok; float px, py, len, ang; wsl::Seg seg; };      // seg: the two ends of the rubber on the glass, in pixels            // pivot (fraction of width / height), length (fraction of height), angle (rad, 0 = right, CCW with y up)
+WsModelBlade g_wsModelBlade[2] = {{false, 0, 0, 0, 0, {0, 0, 0, 0}}, {false, 0, 0, 0, 0, {0, 0, 0, 0}}};
+wsl::Seg g_wsSegPrev[2] = {{0, 0, 0, 0}, {0, 0, 0, 0}}; bool g_wsSegHave[2] = {false, false};     // where each rubber was in the last frame, to know what it swept
+struct WsMeasure { bool tried = false; wsl::Extent ext; };                                        // the real length and direction of a locked blade mesh, read from its vertices once
+WsMeasure g_wsMeas[2];
+int g_wsDrawLock = -1;                                                // which locked blade the draw call being hooked is (-1 = none)
 bool g_wsHuntLocked = false;
 std::atomic<long> g_wsHiddenWipers{0};
 void wsHuntPose(float W, float H);                                   // defined with the hunter
@@ -983,6 +996,13 @@ WsGameWeather wsReadGameWeather() {
 }
 WsGameWeather g_wsGW;                                              // refreshed a few times a second from wsStep
 
+// ---- what the tyres are on (from the surface scan), and what that means for the glass ----
+ffx::MaterialTable g_wsMat;                                        // material id -> class / wetness / looseness
+wsl::Ground g_wsGround;                                            // smoothed over about half a second so one tyre touching a verge does not flip the glass
+wsl::Rgb    g_wsDirtCol{0.52f, 0.40f, 0.28f};                      // colour of the haze on the glass: drifts towards whatever is landing on it
+int         g_wsGroundIds[4] = {-1, -1, -1, -1}; DWORD g_wsGroundTick = 0, g_wsGroundGood = 0; bool g_wsGroundSeen = false;
+wsl::Rgb wsMudRgb() { return {g_cfg.wsMudR, g_cfg.wsMudG, g_cfg.wsMudB}; }
+
 // ---- procedural textures ----
 struct WsPx { float c[3] = {0, 0, 0}; float a = 0; };            // premultiplied accumulation
 void wsOver(WsPx& p, float r, float g, float b, float a) {
@@ -1005,34 +1025,9 @@ template <class F> bool wsMakeTex(IDirect3DDevice9* d, IDirect3DTexture9** t, in
     return true;
 }
 
-// Water bead height fields on a unit cell (v grows downwards). The comet has a round head at the bottom and a tail that tapers to the top;
-// moving drops are rotated so the head leads.
-float wsHRound(float u, float v) { const float dx = u - 0.5f, dy = v - 0.5f, d = std::sqrt(dx * dx + dy * dy) / 0.46f; return d < 1.f ? std::sqrt(1.f - d * d) : 0.f; }
-float wsHComet(float u, float v) {
-    const float cy = 0.62f, R = 0.34f;
-    if (v >= cy) { const float dx = u - 0.5f, dy = v - cy, d = std::sqrt(dx * dx + dy * dy) / R; return d < 1.f ? std::sqrt(1.f - d * d) : 0.f; }
-    const float t = clamp01((v - 0.03f) / (cy - 0.03f)), hw = R * std::pow(t, 0.5f);
-    if (hw < 1e-3f) return 0.f;
-    const float s = (u - 0.5f) / hw; if (std::fabs(s) >= 1.f) return 0.f;
-    return std::sqrt(1.f - s * s) * std::pow(t, 0.5f);
-}
-float wsBeadH(int cell, float u, float v) { return cell == 0 ? wsHRound(u, v) : wsHComet(u, v); }
-void wsBeadShade(int cell, float u, float v, WsPx& p) {            // rim, specular, caustic: no interior fill, the refraction provides that
-    const float h = wsBeadH(cell, u, v); if (h <= 0.f) return;
-    const float e = 1.f / 64.f, S = 0.30f / (2.f * e);
-    const float hx = wsBeadH(cell, u + e, v) - wsBeadH(cell, u - e, v), hy = wsBeadH(cell, u, v + e) - wsBeadH(cell, u, v - e);
-    float nx = -hx * S, ny = -hy * S, nz = 1.f; const float nl = std::sqrt(nx * nx + ny * ny + nz * nz); nx /= nl; ny /= nl; nz /= nl;
-    const float Lx = -0.45f, Ly = -0.55f, Lz = 0.70f;                // light from upper left, towards the viewer
-    const float diff = nx * Lx + ny * Ly + nz * Lz;
-    const float rim = 1.f - nz;
-    wsOver(p, 0.06f, 0.08f, 0.09f, 0.06f);                              // slightly darker than the glass around it
-    wsOver(p, 0.05f, 0.07f, 0.10f, std::pow(rim, 1.3f) * (0.25f + 0.55f * std::max(0.f, -diff)));
-    wsOver(p, 0.88f, 0.94f, 1.00f, std::max(0.f, -diff) * (1.f - rim) * (1.f - rim) * 0.32f);          // caustic on the side away from the light
-    wsOver(p, 1.f, 1.f, 1.f, std::pow(std::max(0.f, diff), 4.f) * 0.16f);
-    float hxv = Lx, hyv = Ly, hzv = Lz + 1.f; const float hl = std::sqrt(hxv * hxv + hyv * hyv + hzv * hzv); hxv /= hl; hyv /= hl; hzv /= hl;
-    wsOver(p, 1.f, 1.f, 1.f, std::pow(std::max(0.f, nx * hxv + ny * hyv + nz * hzv), 60.f) * 0.55f);   // specular (small: rain beads on a car windscreen are not glossy)
-    wsScale(p, wsSmooth(0.f, 0.10f, h));
-}
+// Water bead artwork lives in ws_art.hpp (it can be rendered offline, see tests/ws_art_preview.cpp). Cell 0 is a standing drop, cell 1 a running one.
+void wsFromArt(const wsl::art::Px& q, WsPx& p) { for (int i = 0; i < 3; ++i) p.c[i] = q.c[i]; p.a = q.a; }
+void wsBeadShade(int cell, float u, float v, WsPx& p) { wsl::art::Px q; wsl::art::shade(cell, u, v, q); wsFromArt(q, p); }
 // Mud / slush atlas: 4 x 2 cells of 128 px (luminance in rgb, tinted by the vertex colour). Cells 0-3 are thrown-mud splats like the ones on a rally car's
 // windscreen: ragged spiky outline, translucent lacy interior, darker rim, wet highlights, elongated satellite drops flung outwards. 4 smear (long, streaky),
 // 5 and 7 spray clumps, 6 fine speckle of dirty road water.
@@ -1132,31 +1127,16 @@ void wsPoolPx(int variant, float u, float v, bool shade, WsPx& p) {
     wsOver(p, 0.05f, 0.07f, 0.06f, std::exp(-kd * kd) * (0.25f + 0.60f * upSide));             // dark contact line
     wsOver(p, 0.93f, 0.96f, 0.95f, std::exp(-kb * kb) * (0.08f + 0.80f * lowSide) * 0.62f);    // bright arc inside the lower edge
 }
-void wsMicroPx(float u, float v, WsPx& p) {                                  // a tiny drop: dark body, bright speck low on one side
-    const float d = std::sqrt(u * u + v * v); if (d >= 1.f) return;
-    wsOver(p, 0.06f, 0.08f, 0.08f, wsSmooth(1.0f, 0.55f, d) * 0.42f);
-    const float kr = (d - 0.72f) / 0.16f;
-    wsOver(p, 0.93f, 0.96f, 0.96f, std::exp(-kr * kr) * std::max(0.f, -u * 0.3f + v * 0.95f) * 0.45f);
-    const float sx = u + 0.30f, sy = v - 0.35f;
-    wsOver(p, 1.f, 1.f, 1.f, std::exp(-(sx * sx + sy * sy) / 0.06f) * 0.95f);
-}
+void wsMicroPx(float u, float v, WsPx& p) { wsl::art::Px q; wsl::art::micro(u, v, q); wsFromArt(q, p); }   // a tiny drop: faint body, one bright point
 
 bool wsMakeTextures(IDirect3DDevice9* d) {
     const int N = 64;
     const bool a = wsMakeTex(d, &g_wsSpriteTex, N, N, [&](int x, int y, WsPx& p) {          // small drops: plain alpha sprite
-        const float u = (x + 0.5f) / N * 2.f - 1.f, v = (y + 0.5f) / N * 2.f - 1.f, dd = std::sqrt(u * u + v * v);
-        if (dd >= 1.f) return;
-        const float z = std::sqrt(std::max(0.f, 1.f - dd * dd)), diff = u * -0.45f + v * -0.55f + z * 0.70f;
-        wsOver(p, 0.80f, 0.86f, 0.94f, 0.07f);
-        wsOver(p, 0.08f, 0.10f, 0.14f, wsSmooth(0.55f, 0.98f, dd) * (0.20f + 0.40f * std::max(0.f, -diff)));
-        wsOver(p, 1.f, 1.f, 1.f, std::pow(std::max(0.f, diff), 30.f) * 0.9f);
-        const float hx = u + 0.38f, hy = v + 0.42f;
-        wsOver(p, 1.f, 1.f, 1.f, wsSmooth(0.22f, 0.04f, std::sqrt(hx * hx + hy * hy)) * 0.8f);
-        wsScale(p, wsSmooth(1.0f, 0.88f, dd));
+        wsl::art::Px q; wsl::art::sprite((x + 0.5f) / N * 2.f - 1.f, (y + 0.5f) / N * 2.f - 1.f, q); wsFromArt(q, p);
     });
     const bool b = wsMakeTex(d, &g_wsMaskTex, 2 * N, N, [&](int x, int y, WsPx& p) {         // refraction mask: cell 0 round, cell 1 comet
         const int cell = x / N; const float u = ((x % N) + 0.5f) / N, v = (y + 0.5f) / N;
-        wsOver(p, 1.f, 1.f, 1.f, wsSmooth(0.f, 0.20f, wsBeadH(cell, u, v)) * 0.96f);
+        wsOver(p, 1.f, 1.f, 1.f, wsl::art::mask(cell, u, v));
     });
     const bool c = wsMakeTex(d, &g_wsShadeTex, 2 * N, N, [&](int x, int y, WsPx& p) {        // rim / specular overlay for the same two cells
         const int cell = x / N; wsBeadShade(cell, ((x % N) + 0.5f) / N, (y + 0.5f) / N, p);
@@ -1170,9 +1150,9 @@ bool wsMakeTextures(IDirect3DDevice9* d) {
     });
     const bool f = wsMakeTex(d, &g_wsTrailTex, 16, 16, [&](int x, int, WsPx& p) {            // wet streak: u across, uniform along v
         const float u = (x + 0.5f) / 16.f, t = std::fabs(2.f * u - 1.f), k1 = (t - 0.80f) / 0.12f, k2 = (u - 0.30f) / 0.09f;
-        wsOver(p, 0.75f, 0.85f, 0.95f, 0.10f);
-        wsOver(p, 0.08f, 0.11f, 0.15f, 0.30f * std::exp(-k1 * k1));
-        wsOver(p, 1.f, 1.f, 1.f, 0.40f * std::exp(-k2 * k2));
+        wsOver(p, 0.80f, 0.88f, 0.96f, 0.05f);
+        wsOver(p, 0.08f, 0.11f, 0.15f, 0.16f * std::exp(-k1 * k1));
+        wsOver(p, 1.f, 1.f, 1.f, 0.20f * std::exp(-k2 * k2));
         wsScale(p, wsSmooth(1.0f, 0.82f, t));
     });
     const bool g = wsMakeTex(d, &g_wsSplashTex, N, N, [&](int x, int y, WsPx& p) {           // impact flash: thin ring with spikes
@@ -1214,7 +1194,7 @@ void wsReleaseScene() {
     g_wsSceneW = g_wsSceneH = 0;
 }
 bool wsEnsureResources(IDirect3DDevice9* d) {
-    if (!g_wsSpriteTex && !wsMakeTextures(d)) { g_wsTexFailed = true; Note("WindscreenFX: texture creation failed, effect disabled"); return false; }
+    if (!g_wsSpriteTex && !wsMakeTextures(d)) { g_wsTexFailed = true; Note("Windscreen: texture creation failed, effect disabled"); return false; }
     if (!g_wsSB && FAILED(d->CreateStateBlock(D3DSBT_ALL, &g_wsSB))) { g_wsSB = nullptr; return false; }
     return true;
 }
@@ -1241,14 +1221,14 @@ bool wsCopyScene(IDirect3DDevice9* d, const D3DVIEWPORT9& vp, bool needBlur) {
         wsReleaseScene();
         if (FAILED(d->CreateTexture(tw, th, 1, D3DUSAGE_RENDERTARGET, desc.Format, D3DPOOL_DEFAULT, &g_wsSceneTex, nullptr)) || !g_wsSceneTex ||
             FAILED(g_wsSceneTex->GetSurfaceLevel(0, &g_wsSceneSurf)) || !g_wsSceneSurf) {
-            wsReleaseScene(); rt->Release(); g_wsRefrFailed = true; Note("WindscreenFX: refraction disabled (cannot create the scene copy, format %d)", (int)desc.Format); return false;
+            wsReleaseScene(); rt->Release(); g_wsRefrFailed = true; Note("Windscreen: refraction disabled (cannot create the scene copy, format %d)", (int)desc.Format); return false;
         }
         g_wsSceneW = tw; g_wsSceneH = th; g_wsSceneFmt = (int)desc.Format;
     }
     RECT src = { (LONG)vp.X, (LONG)vp.Y, (LONG)(vp.X + vp.Width), (LONG)(vp.Y + vp.Height) };
     const HRESULT hr = d->StretchRect(rt, &src, g_wsSceneSurf, nullptr, msaa ? D3DTEXF_NONE : D3DTEXF_LINEAR);
     rt->Release();
-    if (FAILED(hr)) { g_wsRefrFailed = true; Note("WindscreenFX: refraction disabled (StretchRect failed 0x%08X, multisampled=%d)", (unsigned)hr, msaa ? 1 : 0); return false; }
+    if (FAILED(hr)) { g_wsRefrFailed = true; Note("Windscreen: refraction disabled (StretchRect failed 0x%08X, multisampled=%d)", (unsigned)hr, msaa ? 1 : 0); return false; }
     if (needBlur && !g_wsVeilFailed) {                                 // two more halvings: the veil is a heavily blurred copy of the same frame
         if (!g_wsBlurTex[1]) {
             UINT bw = tw, bh = th; bool ok = true;
@@ -1258,10 +1238,10 @@ bool wsCopyScene(IDirect3DDevice9* d, const D3DVIEWPORT9& vp, bool needBlur) {
                      SUCCEEDED(g_wsBlurTex[i]->GetSurfaceLevel(0, &g_wsBlurSurf[i])) && g_wsBlurSurf[i];
             }
             if (!ok) { for (int i = 0; i < 2; ++i) { if (g_wsBlurSurf[i]) { g_wsBlurSurf[i]->Release(); g_wsBlurSurf[i] = nullptr; } if (g_wsBlurTex[i]) { g_wsBlurTex[i]->Release(); g_wsBlurTex[i] = nullptr; } }
-                       g_wsVeilFailed = true; Note("WindscreenFX: veil disabled (cannot create the blur copies)"); return true; }
+                       g_wsVeilFailed = true; Note("Windscreen: veil disabled (cannot create the blur copies)"); return true; }
         }
         if (FAILED(d->StretchRect(g_wsSceneSurf, nullptr, g_wsBlurSurf[0], nullptr, D3DTEXF_LINEAR)) || FAILED(d->StretchRect(g_wsBlurSurf[0], nullptr, g_wsBlurSurf[1], nullptr, D3DTEXF_LINEAR)))
-        { g_wsVeilFailed = true; Note("WindscreenFX: veil disabled (StretchRect for the blur failed)"); }
+        { g_wsVeilFailed = true; Note("Windscreen: veil disabled (StretchRect for the blur failed)"); }
     }
     return true;
 }
@@ -1319,6 +1299,7 @@ void wsFlyPos(const WsFly& f, float p, float& x, float& y, float& sc) {
 void wsMudLand(const WsFly& f) {                                       // a clod (or spray droplet) hits the glass: it flattens into a splat, satellites fly out of it
     WsMud m{}; m.x = f.x1; m.y = f.y1; m.r = f.r; m.rot = wsRange(0.f, 6.2832f); m.fade = 1.f; m.stretch = 1.f; m.variant = f.variant; m.tint = f.tint; m.shade = f.shade; m.dur = 0.f;
     g_wsMud.push_back(m);
+    if (g_cfg.wsGround) g_wsDirtCol = wsl::mixRgb(g_wsDirtCol, wsl::tintColour(f.tint, wsMudRgb()), f.kind == 3 ? 0.04f : 0.12f);
     if (f.kind == 3) { wsGridAdd(g_wsDirt, f.x1, f.y1, 2.2f, 0.10f); return; }
     const int n = std::min(14, 2 + (int)(f.r * 170.f));
     if (f.r > 0.014f) for (int i = 0; i < n; ++i) {
@@ -1350,12 +1331,26 @@ void wsMudThrow(float power, int tint, bool spray) {                   // a burs
         g_wsFly.push_back(f);
     }
 }
+void wsWaterSplash(float power) {                                     // a tyre hit standing water: a wash of clear water is thrown up at the glass, blurs it and runs until the wipers clear it
+    power = std::max(0.f, std::min(1.f, power));
+    const int n = 10 + (int)(power * 34.f);
+    for (int i = 0; i < n; ++i) {
+        const float side = wsRnd() < 0.5f ? 0.27f : 0.73f;
+        WsFly f{}; f.kind = 0; f.mode = 1; f.shade = 1.f; f.variant = 1;                                         // variant 1: lands with a wide wash of film, not a single bead
+        f.r = (wsRnd() < 0.7f ? wsRange(0.003f, 0.009f) : wsRange(0.009f, 0.020f)) * (0.7f + 0.5f * power) * g_cfg.wsDropSize;
+        f.x1 = std::max(0.03f, std::min(0.97f, side + (wsRange(-1.f, 1.f) + wsRange(-1.f, 1.f)) * 0.30f / g_wsAspect * 1.6f));
+        f.y1 = 0.12f + 0.72f * std::pow(wsRnd(), 0.8f);
+        f.x0 = side + wsRange(-0.05f, 0.05f); f.y0 = 1.03f; f.arc = wsRange(-0.06f, 0.06f);
+        f.dur = wsRange(0.22f, 0.40f); f.t = -wsRange(0.f, 0.25f);
+        g_wsFly.push_back(f);
+    }
+}
 void wsFlyUpdate(float dt) {                                           // advance everything in flight, land what has arrived
     for (WsFly& f : g_wsFly) {
         f.t += dt / std::max(0.05f, f.dur);
         if (f.t < 1.f) continue;
         switch (f.kind) {
-            case 0: wsAddWater(f.x1, f.y1, f.r, 0.f, g_cfg.wsDrops); wsGridAdd(g_wsFilm, f.x1, f.y1, 3.5f, f.r < 0.0055f ? 1.2f : 2.0f); break;
+            case 0: wsAddWater(f.x1, f.y1, f.r, 0.f, g_cfg.wsDrops); if (f.variant == 1) wsGridAdd(g_wsFilm, f.x1, f.y1, 6.f, 0.55f); else wsGridAdd(g_wsFilm, f.x1, f.y1, 3.5f, (f.r < 0.0055f ? 0.30f : 0.55f) * (0.25f + 0.75f * g_wsRainEff * g_wsRainEff)); break;   // a splash lands as a wash, rain as a bead
             case 2: wsAddFlake(f.x1, f.y1, f.r, g_cfg.wsSnowMax); wsGridAdd(g_wsFilm, f.x1, f.y1, 4.f, 1.0f); break;
             default: wsMudLand(f); break;
         }
@@ -1369,7 +1364,14 @@ void wsSync() {                                                        // match 
     const bool wantD = (g_cfg.wsMode & 1) != 0, wantM = (g_cfg.wsMode & 2) != 0;
     if (g_wsReset) {                                                   // new stage: clean glass, rain and mud arrive from here on
         g_wsDrops.clear(); g_wsMud.clear(); g_wsTrails.clear(); g_wsFly.clear(); std::fill(g_wsFilm, g_wsFilm + kGX * kGY, 0.f); std::fill(g_wsDirt, g_wsDirt + kGX * kGY, 0.f);
-        g_wsBow[0] = g_wsBow[1] = 0.f; g_wsRainAcc = g_wsSnowAcc = g_wsMudAcc = g_wsMicroAcc = 0.f; g_wsSprayAcc = 0.f; g_wsReset = false; g_wsWipeT0 = GetTickCount(); wsHuntReset();
+        g_wsBow[0] = g_wsBow[1] = 0.f; g_wsRainAcc = g_wsSnowAcc = g_wsMudAcc = g_wsMicroAcc = 0.f; g_wsSprayAcc = 0.f; g_wsReset = false; g_wsWipeT0 = GetTickCount(); wsHuntReset(); g_wsDirtCol = wsMudRgb(); g_wsGround = wsl::Ground(); g_wsGroundTick = 0; g_wsGroundSeen = false;
+        g_wsRng = (g_wsRng ^ (uint32_t)GetTickCount()) | 1u;
+    }
+    if (g_wsResetWater) {                                              // next stage of the same rally: the water has dried, the mud is still there
+        g_wsResetWater = false;
+        g_wsDrops.clear(); g_wsTrails.clear(); g_wsFly.clear(); std::fill(g_wsFilm, g_wsFilm + kGX * kGY, 0.f);
+        g_wsBow[0] = g_wsBow[1] = 0.f; g_wsRainAcc = g_wsSnowAcc = g_wsMudAcc = g_wsMicroAcc = 0.f; g_wsSprayAcc = 0.f; g_wsWipeT0 = GetTickCount(); wsHuntReset();
+        g_wsGround = wsl::Ground(); g_wsGroundTick = 0; g_wsGroundSeen = false;
         g_wsRng = (g_wsRng ^ (uint32_t)GetTickCount()) | 1u;
     }
     if (!wantD) { g_wsDrops.clear(); g_wsTrails.clear(); std::fill(g_wsFilm, g_wsFilm + kGX * kGY, 0.f); }
@@ -1417,36 +1419,81 @@ void wsWiperGhost(float dt) {                                          // laggin
 }
 void wsSyncWipers() { g_wsWipeT0 = GetTickCount(); g_wsBladeInit = false; Logf("wiper cycle synced to now (Ctrl+F7): the real wipers should be starting their upward stroke"); }
 
+// A thick film does not sit still: where the water is deep it sags and runs down the glass in streams, each column wandering a cell either way for a
+// moment, and what reaches the bottom edge drains off. Ticks eight times a second, so a sheet takes a few seconds to run down the screen.
+float g_wsFlowAcc = 0.f, g_wsFlowT = 0.f;
+void wsFilmFlow(float dt, float rain) {
+    g_wsFlowAcc += dt * 8.f; g_wsFlowT += dt;
+    for (int guard = 0; g_wsFlowAcc >= 1.f && guard < 4; ++guard) {
+        g_wsFlowAcc -= 1.f;
+        const float share = std::min(0.5f, 0.25f + 0.25f * rain);     // of what is above the threshold, per tick
+        for (int j = kGY - 1; j >= 0; --j) for (int i = 0; i < kGX; ++i) {
+            float& f = g_wsFilm[j * kGX + i];
+            if (f < 0.40f) continue;
+            const float give = (f - 0.40f) * share;
+            f -= give;
+            if (j + 1 >= kGY) continue;                                // the bottom edge: it drains away
+            const unsigned h = (unsigned)i * 73856093u ^ (unsigned)((int)(g_wsFlowT * 0.6f)) * 19349663u;
+            const int ti = std::max(0, std::min(kGX - 1, i + (int)(h % 3u) - 1));
+            float& below = g_wsFilm[(j + 1) * kGX + ti]; below = std::min(1.f, below + give);
+        }
+    }
+}
+
 void wsWipe(float W, float H) {
     if (!g_cfg.wsWipers) return;
     WsBlade bl[2]; wsBlades(bl);
     std::vector<WsDrop> spawn; std::vector<WsMud> smears;
     const float life = std::max(0.5f, g_cfg.wsTrail);
     for (int bi = 0; bi < 2; ++bi) {
-        if (bl[bi].len <= 0.f) continue;
-        const float cur = g_wsBladeAng[bi], prev = g_wsBladePrev[bi], dA = cur - prev;
-        if (std::fabs(dA) < 1e-5f || std::fabs(dA) > 0.6f) continue;   // parked, or a jump (settings reloaded): no sweep this frame
-        const float pxv = bl[bi].px * W, pyv = bl[bi].py * H, L = bl[bi].len * H, lo = std::min(cur, prev), hi = std::max(cur, prev);
+        // Where the rubber is now and where it was in the last frame, as two end points each. Whatever lies between those two positions was wiped,
+        // so the real blade's length, the rake of the glass and the perspective are all already in the numbers.
+        wsl::Seg cur{}, prev{}; bool have = false;
+        if (g_cfg.wsWiperSource && g_wsModelBlade[bi].ok) {
+            cur = g_wsModelBlade[bi].seg; prev = g_wsSegPrev[bi]; have = g_wsSegHave[bi];
+            g_wsSegPrev[bi] = cur; g_wsSegHave[bi] = true;
+        } else {                                                       // the emulated blade from the ini: a straight arm turning about its pivot
+            g_wsSegHave[bi] = false;
+            if (bl[bi].len <= 0.f) continue;
+            const float pxv = bl[bi].px * W, pyv = bl[bi].py * H, L = bl[bi].len * H, in = std::max(0.f, std::min(0.9f, g_cfg.wsWiperInner));
+            auto at = [&](float a) { const float c = std::cos(a), sn = -std::sin(a); return wsl::Seg{pxv + c * L * in, pyv + sn * L * in, pxv + c * L, pyv + sn * L}; };
+            cur = at(g_wsBladeAng[bi]); prev = at(g_wsBladePrev[bi]); have = true;
+        }
+        if (!have || wsl::bladeMotion(prev, cur, 0.35f * W) != 1) continue;     // parked, or a jump (settings reloaded, a different blade): no sweep this frame
         const float half = 3.f + 0.004f * H;                           // blade half thickness in pixels
         float mass = 0.f;                                              // water gathered by the blade this frame (feeds the ridge in front of it)
-        auto swept = [&](float X, float Y, float R, float& tx, float& ty) -> bool {   // is the point (glass px) inside the sector the blade crossed this frame?
-            const float dx = X - pxv, dyUp = pyv - Y, r = std::sqrt(dx * dx + dyUp * dyUp);
-            if (r > L + R || r < 0.24f * L - R) return false;          // the rubber only covers the outer part of the arm
-            float a = std::atan2(dyUp, dx);
-            while (a < lo - 3.14159f) a += 6.28318f;
-            while (a > lo + 3.14159f) a -= 6.28318f;
-            const float margin = std::atan2(R + half, std::max(r, 1.f));
-            if (a < lo - margin || a > hi + margin) return false;
-            const float s = dA > 0.f ? 1.f : -1.f; tx = s * (-dyUp); ty = s * (-dx);       // direction the blade moves there (screen px)
-            return true;
-        };
-        for (WsDrop& d : g_wsDrops) {
+        auto swept = [&](float X, float Y, float R, float& tx, float& ty) -> bool { return wsl::sweptBy(prev, cur, X, Y, R, half, tx, ty); };   // (tx, ty): the way the blade moved there
+        // A wiper does not erase water, it moves it. A bead in the blade's path is pushed along in front of the rubber (a few slip under it and stay), the
+        // beads it meets on the way run together into bigger ones, and a little is always left behind as a smear and a few small beads. What is
+        // pushed off the edge of the glass is gone. Micro droplets and flakes are too small to hold together and are simply smeared away.
+        const float asp = H / W;                                       // viewport height per viewport width: radii are in heights, positions in widths
+        std::vector<size_t> pushed;
+        for (size_t di = 0; di < g_wsDrops.size(); ++di) {
+            WsDrop& d = g_wsDrops[di];
             if (d.dead) continue;
             float tx, ty; if (!swept(d.x * W, d.y * H, d.r * H, tx, ty)) continue;
-            d.dead = true; g_wsWiped++; mass += (d.kind == 2 ? 0.12f : 1.f) * std::min(1.f, d.r * 90.f);
-            if (d.kind == 0 && d.r > 0.005f && wsRnd() < 0.35f) {      // a few tiny beads are left behind
-                WsDrop n{}; n.kind = 0; n.x = d.x; n.y = d.y; n.r = wsRange(0.0016f, 0.0028f) * g_cfg.wsDropSize; n.age = 2.f; n.tx = n.x; n.ty = n.y; n.tr = n.r; n.thr = 0.55f;
-                spawn.push_back(n);
+            g_wsWiped++; mass += (d.kind == 2 ? 0.12f : 1.f) * std::min(1.f, d.r * 90.f);
+            if (d.kind != 0) { d.dead = true; continue; }
+            if (wsRnd() < 0.06f) continue;                             // slipped under the blade: the bead stays where it is
+            const float ox = d.x, oy = d.y;
+            d.x += tx * 1.15f / W; d.y += ty * 1.15f / H;              // rides a little ahead of the rubber
+            d.tx = d.x; d.ty = d.y; d.tr = d.r; d.vx = d.vy = 0.f; d.sliding = false;   // pushed, not running: no trail from the push
+            if (d.r > 0.004f) {
+                wsGridAdd(g_wsFilm, ox, oy, 2.f, 0.10f);                // the smear the rubber leaves
+                d.r *= 0.985f;
+                if (wsRnd() < 0.04f) {                                 // and now and then a small bead left behind (the bead is pushed every frame of the stroke, so this is per frame)
+                    WsDrop n{}; n.kind = 0; n.x = ox; n.y = oy; n.r = wsRange(0.0016f, 0.0028f) * g_cfg.wsDropSize; n.age = 2.f; n.tx = n.x; n.ty = n.y; n.tr = n.r; n.thr = 0.55f;
+                    spawn.push_back(n);
+                }
+            }
+            pushed.push_back(di);
+        }
+        for (size_t a = 0; a < pushed.size(); ++a) {                    // beads pushed together run into one
+            WsDrop& pa = g_wsDrops[pushed[a]]; if (pa.dead) continue;
+            for (size_t b = a + 1; b < pushed.size(); ++b) {
+                WsDrop& pb = g_wsDrops[pushed[b]]; if (pb.dead) continue;
+                const float ex = (pb.x - pa.x) / asp, ey = pb.y - pa.y;
+                if (std::sqrt(ex * ex + ey * ey) < (pa.r + pb.r) * 0.9f) { pa.r = std::sqrt(pa.r * pa.r + pb.r * pb.r); pb.dead = true; }
             }
         }
         for (WsTrail& t : g_wsTrails) { float tx, ty; if (swept((t.x0 + t.x1) * 0.5f * W, (t.y0 + t.y1) * 0.5f * H, t.w0 * H, tx, ty)) { t.age = life + 1.f; g_wsWiped++; } }
@@ -1459,16 +1506,54 @@ void wsWipe(float W, float H) {
                 s.rot = std::atan2(-tx, ty); smears.push_back(s);
             }
         }
-        const float cw = W / (float)kGX, ch = H / (float)kGY, cr = 0.75f * std::max(cw, ch);   // the haze grids: water is squeegeed away, dirt is mostly smeared (some stays)
+        const float cw = W / (float)kGX, ch = H / (float)kGY, cr = 0.75f * std::max(cw, ch);   // the haze grids: water is pushed along by the blade, dirt is mostly smeared (some stays)
+        std::vector<float> filmAdd((size_t)kGX * kGY, 0.f);            // where the pushed water lands: added after the pass, so it is not pushed twice in one frame
         for (int j = 0; j < kGY; ++j) for (int i = 0; i < kGX; ++i) {
             float tx, ty; if (!swept(((float)i + 0.5f) * cw, ((float)j + 0.5f) * ch, cr, tx, ty)) continue;
             float& f = g_wsFilm[j * kGX + i]; float& dt = g_wsDirt[j * kGX + i];
-            mass += f * 0.05f; f *= 0.03f; dt *= 0.62f;
+            const float wetNow = std::max(f, g_wsRainEff > 0.02f ? 0.6f : 0.f);
+            const float resid = g_wsRainEff > 0.02f ? 0.10f + 0.16f * g_wsRainEff : 0.f;   // a real blade never leaves it bone dry in the rain: a thin film stays, and fine droplets are left along the stroke
+            const float len = std::sqrt(tx * tx + ty * ty);
+            if (f > 0.01f && len > 0.01f) {                            // most of the water moves the way the blade moves, not all of it and not evenly
+                const float step = std::max(1.f, std::min(3.f, len / std::max(cw, ch) + 0.8f));
+                const int ti = i + (int)std::lround(tx / len * step), tj = j + (int)std::lround(ty / len * step);
+                const float carry = f * (0.70f + 0.25f * wsRnd());
+                if (ti >= 0 && ti < kGX && tj >= 0 && tj < kGY) filmAdd[(size_t)tj * kGX + ti] += carry;   // past the edge of the glass it is gone
+                mass += carry * 0.05f;
+                f = std::max(f - carry, std::min(f, resid));
+            }
+            dt *= 0.62f - 0.30f * clamp01(wetNow);                      // a wet blade lifts dirt, a dry one mostly smears it
+            if (g_cfg.wsMicro > 0 && g_wsRainEff > 0.05f && wsRnd() < 0.06f * g_wsRainEff) wsAddMicro(((float)i + wsRange(0.f, 1.f)) / (float)kGX, ((float)j + wsRange(0.f, 1.f)) / (float)kGY, wsRange(0.0008f, 0.0022f) * g_cfg.wsDropSize, g_cfg.wsMicro);
         }
+        for (int k = 0; k < kGX * kGY; ++k) if (filmAdd[(size_t)k] > 0.f) g_wsFilm[k] = std::min(1.f, g_wsFilm[k] + filmAdd[(size_t)k]);
         if (g_cfg.wsWiperBow) g_wsBow[bi] = std::min(1.5f, g_wsBow[bi] + mass * 0.045f);
     }
     for (const WsDrop& n : spawn) wsInsert(n, g_cfg.wsDrops);
     for (const WsMud& s : smears) g_wsMud.push_back(s);
+}
+
+// The surface scan says what is under each tyre. Read it ten times a second and smooth it, so one tyre on a verge does not flip the glass.
+void wsGroundUpdate(float dt) {
+    if (!g_cfg.wsGround || !g_hostIds) { g_wsGround = wsl::Ground(); return; }
+    const DWORD now = GetTickCount();
+    if (now - g_wsGroundTick >= 100) {
+        g_wsGroundTick = now;
+        int ids[4] = {-1, -1, -1, -1};
+        if (g_hostIds(ids)) {
+            const bool changed = memcmp(ids, g_wsGroundIds, sizeof(ids)) != 0;
+            memcpy(g_wsGroundIds, ids, sizeof(ids)); g_wsGroundSeen = true; g_wsGroundGood = now;
+            static DWORD lastLog = 0;
+            if (changed && now - lastLog > 1500) {
+                lastLog = now;
+                const wsl::Ground t = wsl::groundFromIds(ids, g_wsMat, wsl::GroundCfg{g_cfg.wsMudDry, g_cfg.wsMudDamp, g_cfg.wsMudWet, g_cfg.wsMudSnow});
+                Logf("windscreen ground: FL %s | FR %s | RL %s | RR %s  ->  loose %.2f wetMul %.2f spray %.2f dust %.2f snow %.2f", g_wsMat.name(ids[0]), g_wsMat.name(ids[1]), g_wsMat.name(ids[2]), g_wsMat.name(ids[3]),
+                     t.loose, t.mudMul, t.spray, t.dust, t.snow);
+            }
+        } else if (now - g_wsGroundGood > 1500) g_wsGroundSeen = false;        // the scan has not had all four tyres for a while
+    }
+    if (!g_wsGroundSeen) { g_wsGround = wsl::Ground(); return; }          // no scan yet: the heave-based estimate and the stage's wetness are used instead
+    const wsl::Ground t = wsl::groundFromIds(g_wsGroundIds, g_wsMat, wsl::GroundCfg{g_cfg.wsMudDry, g_cfg.wsMudDamp, g_cfg.wsMudWet, g_cfg.wsMudSnow});
+    wsl::smoothGround(g_wsGround, t, 1.f - std::exp(-dt / 0.5f));
 }
 
 void wsStep(float dt, float W, float H) {
@@ -1493,6 +1578,15 @@ void wsStep(float dt, float W, float H) {
         const bool wetNow = (GetTickCount() - g_wsGameTick.load()) < 300;
         g_wsWet += ((wetNow ? 1.f : 0.f) - g_wsWet) * std::min(1.f, dt * 0.5f);
     } else g_wsWet = 1.f;
+    if (g_hostCarKey && (g_wsLastCar.empty() || GetTickCount() < g_wsCarCheckUntil)) {   // a different car starts with a clean windscreen
+        const std::string k = g_hostCarKey();
+        if (!k.empty() && k != g_wsLastCar) {
+            if (wsl::carChanged(g_wsLastCar, k)) { g_wsReset = true; Logf("windscreen: a different car, glass cleaned"); }
+            g_wsLastCar = k;
+        }
+    }
+    wsGroundUpdate(dt);
+    const bool gnd = g_cfg.wsGround && g_wsGround.ok;                   // the glass follows what the tyres are on
     wsHuntPose(W, H);
     wsWiperUpdate();
 
@@ -1503,8 +1597,8 @@ void wsStep(float dt, float W, float H) {
         for (int guard = 0; g_wsRainAcc >= 1.f && guard < 50; ++guard) {
             g_wsRainAcc -= 1.f;
             const float u = wsRnd();                                                         // many small beads, some medium, a few big flat pools
-            const float pl = 0.06f + 0.16f * g_wsRainEff;                                  // heavier rain: more of the big flat pools
-            float r = u < 0.55f ? wsRange(0.0016f, 0.0055f) : u < 1.f - pl ? wsRange(0.0055f, 0.0115f) : wsRange(0.0115f, 0.030f);
+            const float pl = 0.03f + 0.10f * g_wsRainEff;                                  // a few big drops, more of them in heavier rain
+            float r = u < 0.62f ? wsRange(0.0016f, 0.0050f) : u < 1.f - pl ? wsRange(0.0050f, 0.0105f) : wsRange(0.0105f, 0.0165f + 0.005f * g_wsRainEff);
             const float tx = wsRange(0.03f, 0.97f), ty = 0.06f + 0.74f * std::pow(wsRnd(), 0.85f), rr = r * g_cfg.wsDropSize;
             if (g_cfg.wsFly && rr >= 0.0032f) {                                            // it comes from somewhere: from above when you are slow, from the vanishing point when you are fast
                 WsFly f{}; f.kind = 0; f.mode = 0; f.r = rr; f.x1 = tx; f.y1 = ty; f.shade = 1.f;
@@ -1512,14 +1606,14 @@ void wsStep(float dt, float W, float H) {
                 f.x0 = tx * (1.f - fast) + (0.5f + wsRange(-0.04f, 0.04f)) * fast; f.y0 = (-0.25f) * (1.f - fast) + 0.40f * fast;
                 f.dur = g_cfg.wsFlyTime * wsRange(0.7f, 1.3f) * (1.15f - 0.4f * fast); f.t = -wsRange(0.f, 0.6f / std::max(1.f, rainRate) + 0.02f);
                 g_wsFly.push_back(f);
-            } else { wsAddWater(tx, ty, rr, 0.f, g_cfg.wsDrops); wsGridAdd(g_wsFilm, tx, ty, 3.f, 1.0f); }
+            } else { wsAddWater(tx, ty, rr, 0.f, g_cfg.wsDrops); wsGridAdd(g_wsFilm, tx, ty, 3.f, 0.12f + 0.45f * g_wsRainEff * g_wsRainEff); }
         }
         if (g_cfg.wsMicro > 0) {                                       // the fine speckle of tiny droplets that makes wet glass look wet
             g_wsMicroAcc += g_cfg.wsMicroRate * g_wsRainEff * (0.5f + 0.5f * spdN) * g_wsWet * dt;
             for (int guard = 0; g_wsMicroAcc >= 1.f && guard < 80; ++guard) {
                 g_wsMicroAcc -= 1.f;
                 const float mx = wsRange(0.02f, 0.98f), my = wsRange(0.04f, 0.86f);
-                wsAddMicro(mx, my, wsRange(0.0006f, 0.0020f) * g_cfg.wsDropSize, g_cfg.wsMicro); wsGridAdd(g_wsFilm, mx, my, 3.f, 1.0f);
+                wsAddMicro(mx, my, wsRange(0.0006f, 0.0020f) * g_cfg.wsDropSize, g_cfg.wsMicro); wsGridAdd(g_wsFilm, mx, my, 3.f, 0.04f + 0.13f * g_wsRainEff * g_wsRainEff);
             }
         }
     }
@@ -1535,16 +1629,22 @@ void wsStep(float dt, float W, float H) {
         }
     }
     const float splash = g_wsSplash.exchange(0.f);
+    const float waterHit = g_wsWaterHit.exchange(0.f);
+    if (g_cfg.wsMode != 0 && waterHit > 0.05f) wsWaterSplash(waterHit);
     if (g_cfg.wsMode & 2) {
-        const float mudRate = g_cfg.wsMudRate * g_wsMudMul * wetMul / 60.f * spdN * std::pow(loose, 1.5f) * (1.f + 0.5f * std::min(1.f, std::fabs(g_in.sway.load())));   // speed on a rough, wet surface, more when cornering
+        const float lg = gnd ? g_wsGround.loose * (0.75f + 0.25f * loose) : loose;   // what the tyres can throw; bumps shake a little more loose
+        const float mudRate = g_cfg.wsMudRate * g_wsMudMul * (gnd ? g_wsGround.mudMul : wetMul) / 60.f * spdN * std::pow(lg, 1.5f) * (1.f + 0.5f * std::min(1.f, std::fabs(g_in.sway.load())));   // speed on loose, wet ground, more when cornering
         g_wsDbgMud = mudRate * 60.f; g_wsMudAcc += mudRate * dt;
-        const int tint = snowy ? 1 : 0;                                // thrown snow is grey slush
-        for (int guard = 0; g_wsMudAcc >= 1.f && guard < 8; ++guard) { g_wsMudAcc -= 1.f; wsMudThrow(1.f, tint, false); }
-        if (splash > 0.05f) { wsMudThrow(std::min(1.8f, 0.6f + splash * 0.5f), tint, false); if (splash > 0.6f) wsMudThrow(1.f, tint, true); }   // landing / impact
-        const float wetSpray = useGame ? (g_wsGW.wet == 2 ? 1.f : g_wsGW.wet == 1 ? 0.4f : 0.f) : 0.f;           // dirty water thrown up off a wet road
-        const float sprayRate = g_cfg.wsSpray * std::max(wetSpray, g_wsRainEff * 0.7f) * g_wsMudMul * 0.9f * std::pow(spdN, 1.5f) * (0.4f + 0.6f * std::min(1.f, loose + 0.3f));
+        auto clodTint = [&]() { return gnd ? wsl::pickTint(g_wsGround.clod, wsRnd(), snowy ? (int)wsl::kSlush : (int)wsl::kMud) : (snowy ? 1 : 0); };   // thrown snow is grey slush
+        auto fineTint = [&]() { return gnd ? wsl::pickTint(g_wsGround.fine, wsRnd(), (int)wsl::kSpray) : (snowy ? 1 : 0); };
+        for (int guard = 0; g_wsMudAcc >= 1.f && guard < 8; ++guard) { g_wsMudAcc -= 1.f; wsMudThrow(1.f, clodTint(), false); }
+        if (splash > 0.05f) { wsMudThrow(std::min(1.8f, 0.6f + splash * 0.5f), clodTint(), false); if (splash > 0.6f) wsMudThrow(1.f, fineTint(), true); }   // landing / impact
+        float sprayPot;                                                // dirty water, or dust on a dry loose road, thrown up behind the tyres
+        if (gnd) sprayPot = std::max(g_wsGround.spray + 0.8f * g_wsGround.dust, g_wsRainEff * 0.35f);
+        else sprayPot = std::max(useGame ? (g_wsGW.wet == 2 ? 1.f : g_wsGW.wet == 1 ? 0.4f : 0.f) : 0.f, g_wsRainEff * 0.7f);
+        const float sprayRate = g_cfg.wsSpray * sprayPot * g_wsMudMul * 0.9f * std::pow(spdN, 1.5f) * (gnd ? 0.5f + 0.5f * std::min(1.f, lg + 0.3f) : 0.4f + 0.6f * std::min(1.f, loose + 0.3f));
         g_wsSprayAcc += sprayRate * dt;
-        for (int guard = 0; g_wsSprayAcc >= 1.f && guard < 4; ++guard) { g_wsSprayAcc -= 1.f; wsMudThrow(1.f, tint, true); }
+        for (int guard = 0; g_wsSprayAcc >= 1.f && guard < 4; ++guard) { g_wsSprayAcc -= 1.f; wsMudThrow(1.f, fineTint(), true); }
     }
 
     // ---- drops: stick, slide, shed water, swallow neighbours; flakes melt ----
@@ -1571,11 +1671,12 @@ void wsStep(float dt, float W, float H) {
         else if (F < thr * 0.65f) d.sliding = false;                           // static friction is higher than kinetic: once moving it keeps going
         const bool slide = d.sliding;
         if (slide) {
-            const float k = (F - 0.65f * thr) / F * 2.0f * dt;                // kinetic friction is lower than static: a drop that lets go runs
+            const float sizeK = 0.7f + std::min(1.3f, d.r / 0.007f);           // a bigger drop is heavier and runs faster
+            const float k = (F - 0.65f * thr) / F * 4.0f * sizeK * dt;         // kinetic friction is lower than static: a drop that lets go runs
             const float wob = std::sin(d.age * 3.2f + d.rot) * 0.9f * dt;                  // slow heading drift, proportional to speed: smooth meander, no kinks
             const float ovx = d.vx, ovy = d.vy;
             d.vx += Fx * k - ovy * wob; d.vy += Fy * k + ovx * wob;
-            const float drag = std::exp(-2.5f * dt); d.vx *= drag; d.vy *= drag;
+            const float drag = std::exp(-2.0f * dt); d.vx *= drag; d.vy *= drag;
         } else { const float stick = std::exp(-14.f * dt); d.vx *= stick; d.vy *= stick; }
         const float dh = std::sqrt(d.vx * d.vx + d.vy * d.vy) * dt;    // distance travelled this step, in viewport heights
         if (dh > 0.f) {
@@ -1604,8 +1705,11 @@ void wsStep(float dt, float W, float H) {
     wsFlyUpdate(dt);
     wsWipe(W, H); wsWiperGhost(dt);
     for (int i = 0; i < 2; ++i) g_wsBow[i] *= std::exp(-dt * 1.6f);
+    // Dirt dries and flakes off, faster at speed (airflow), so the corners the wipers never reach do not fill up for ever. GrimeLife = seconds at full speed.
+    const float shed = g_cfg.wsGrimeLife > 1.f ? (0.25f + 0.75f * spdN) / g_cfg.wsGrimeLife : 0.f;
+    wsFilmFlow(dt, g_wsRainEff);
     {   // haze: water film runs off / evaporates slowly, rain washes dirt away a little, and a clean stretch of glass stays clean
-        const float fk = std::exp(-dt * g_cfg.wsFilmDecay * (snowy ? 0.4f : 1.f)), dk = std::exp(-dt * (0.004f + 0.03f * g_wsRainEff));
+        const float fk = std::exp(-dt * g_cfg.wsFilmDecay * (snowy ? 0.4f : 1.f)), dk = std::exp(-dt * (0.004f + 0.03f * g_wsRainEff + shed));
         for (int i = 0; i < kGX * kGY; ++i) { g_wsFilm[i] *= fk; g_wsDirt[i] *= dk; }
     }
     g_wsDrops.erase(std::remove_if(g_wsDrops.begin(), g_wsDrops.end(), [](const WsDrop& d) { return d.dead; }), g_wsDrops.end());
@@ -1625,7 +1729,7 @@ void wsStep(float dt, float W, float H) {
     }
     for (WsMud& m : g_wsMud) {
         m.age += dt; if (m.dying) m.fade -= dt / 2.f;
-        else if (m.age > 0.3f) m.fade -= dt * (g_wsRainEff * 0.010f + (m.variant == kMudSpeckle ? 0.03f : 0.f));   // rain slowly washes it off; dirty water dries
+        else if (m.age > 0.3f) m.fade -= dt * (g_wsRainEff * 0.010f + (m.variant == kMudSpeckle ? 0.03f : 0.f) + (m.variant == kMudSmear ? 1.5f : 1.f) * shed);   // rain slowly washes it off; dirty water dries
     }
     g_wsMud.erase(std::remove_if(g_wsMud.begin(), g_wsMud.end(), [](const WsMud& m) { return m.fade <= 0.06f; }), g_wsMud.end());
 }
@@ -1649,7 +1753,7 @@ bool wsDraw(IDirect3DDevice9* d) {
     M4 C = m4Ident(); bool haveC = false;
     if (gz >= 0.f && g_wsPok) { C = m4Mul(g_wsP, m4Mul(g_patchActive ? g_Hinv : m4Ident(), g_wsPinv)); haveC = true; }
     static bool logged = false;
-    if (!logged) { logged = true; Logf("WindscreenFX: first draw, DrawAt=%d depthTest=%d glassZ=%.5f glassLock=%d refraction=%d hideGameFx=%d viewport=%ux%u", g_cfg.wsDrawAt, useZ ? 1 : 0, gz, haveC ? 1 : 0, g_cfg.wsRefraction, g_cfg.wsHideGameFx, vp.Width, vp.Height); }
+    if (!logged) { logged = true; Logf("Windscreen: first draw, DrawAt=%d depthTest=%d glassZ=%.5f glassLock=%d refraction=%d hideGameFx=%d viewport=%ux%u", g_cfg.wsDrawAt, useZ ? 1 : 0, gz, haveC ? 1 : 0, g_cfg.wsRefraction, g_cfg.wsHideGameFx, vp.Width, vp.Height); }
 
     // Glass space: every position is where that spot of the glass appears with the camera at its base pose. Each vertex goes through the same head
     // transform (P * Hinv * P^-1) the game's 3D scene gets, at the glass depth, so everything stays fixed on the car when the head moves.
@@ -1748,7 +1852,8 @@ bool wsDraw(IDirect3DDevice9* d) {
             if (g_cfg.wsGlow > 0.001f) buildHaze(g_wsFilm, g_wsVGlow, g_cfg.wsGlow, 1.0f, 1.f, 1.f, 1.f, true);      // bright lights bloom through wet glass
         }
         if (g_cfg.wsDirt > 0.001f && dirtMax > 0.01f) {
-            const float dr = snowyNow ? 0.86f : g_cfg.wsMudR * 1.35f + 0.04f, dg = snowyNow ? 0.88f : g_cfg.wsMudG * 1.35f + 0.04f, db = snowyNow ? 0.92f : g_cfg.wsMudB * 1.35f + 0.04f;
+            const wsl::Rgb hc = g_cfg.wsGround ? g_wsDirtCol : wsMudRgb();       // with the surface scan the haze is the colour of what has been landing
+            const float dr = snowyNow ? 0.86f : hc.r * 1.35f + 0.04f, dg = snowyNow ? 0.88f : hc.g * 1.35f + 0.04f, db = snowyNow ? 0.92f : hc.b * 1.35f + 0.04f;
             buildHaze(g_wsDirt, g_wsVDirt, std::min(0.95f, 0.78f * g_cfg.wsDirt), 0.80f, std::min(1.f, dr), std::min(1.f, dg), std::min(1.f, db), false);
         }
     }
@@ -1763,11 +1868,12 @@ bool wsDraw(IDirect3DDevice9* d) {
         const float hw = m.r * H * pop, a = op * clamp01(m.fade), sh = m.shade > 0.f ? m.shade : 1.f;
         const bool dirty = m.variant == kMudSpeckle;
         DWORD col;
-        if (m.tint) col = rgba(0.88f * std::min(1.1f, sh), 0.90f * std::min(1.1f, sh), 0.94f * std::min(1.1f, sh), a);
-        else { const float k = dirty ? 1.25f : 1.f; col = rgba(g_cfg.wsMudR * sh * k, g_cfg.wsMudG * sh * k, g_cfg.wsMudB * sh * k, a * (dirty ? 0.85f : 1.f)); }
+        const wsl::Rgb tc = wsl::tintColour(m.tint, wsMudRgb());       // the colour of what it is: mud, slush, dust, road spray or grass
+        if (m.tint == wsl::kSlush) { const float k = std::min(1.1f, sh); col = rgba(tc.r * k, tc.g * k, tc.b * k, a); }
+        else { const float k = sh * (dirty ? 1.25f : 1.f); col = rgba(tc.r * k, tc.g * k, tc.b * k, a * (dirty ? 0.85f : 1.f)); }
         const float u0 = (float)(m.variant & 3) * 0.25f, v0 = (float)(m.variant >> 2) * 0.5f;
         if (useFrost && m.variant <= kMudSmear && hw >= 9.f && m.dur <= 0.f)      // mud is not clear: the view behind it is frosted and tinted
-            emitFrost(g_wsVFrost, x * W, y * H, hw, hw * stretch, ang, m.tint ? rgba(0.90f, 0.92f, 0.96f, 0.75f * a) : rgba(std::min(1.f, 0.50f + g_cfg.wsMudR * 0.9f), std::min(1.f, 0.50f + g_cfg.wsMudG * 0.9f), std::min(1.f, 0.50f + g_cfg.wsMudB * 0.9f), 0.78f * a * std::min(1.f, g_cfg.wsDirt)), u0, v0, u0 + 0.25f, v0 + 0.5f);
+            { const wsl::Rgb fc = wsl::frostColour(m.tint, wsMudRgb()); emitFrost(g_wsVFrost, x * W, y * H, hw, hw * stretch, ang, rgba(fc.r, fc.g, fc.b, m.tint == wsl::kSlush ? 0.75f * a : 0.78f * a * std::min(1.f, g_cfg.wsDirt)), u0, v0, u0 + 0.25f, v0 + 0.5f); }
         quad(g_wsVMud, x * W, y * H, hw, hw * stretch, ang, col, u0, v0, u0 + 0.25f, v0 + 0.5f);
     }
     for (const WsFly& f : g_wsFly) {                                   // particles on their way to the glass
@@ -1786,14 +1892,15 @@ bool wsDraw(IDirect3DDevice9* d) {
             const float dx = (X - bx * W), dy = (Y - by * H), len = std::sqrt(dx * dx + dy * dy), ang = len > 0.5f ? std::atan2(-dx, dy) : 0.f;
             const float hw = std::max(1.5f, rpx * (f.mode == 1 ? (0.40f + 0.60f * sc) : (0.25f + 0.75f * sc))), st = 1.f + std::min(1.4f, len / std::max(4.f, hw) * 0.35f);
             const float sh = f.shade, al = op * (f.kind == 3 ? 0.80f : 0.95f);
-            const DWORD col = f.tint ? rgba(0.88f, 0.90f, 0.94f, al) : rgba(g_cfg.wsMudR * sh * (f.kind == 3 ? 1.25f : 1.f), g_cfg.wsMudG * sh * (f.kind == 3 ? 1.25f : 1.f), g_cfg.wsMudB * sh * (f.kind == 3 ? 1.25f : 1.f), al);
+            const wsl::Rgb tc = wsl::tintColour(f.tint, wsMudRgb()); const float kc = f.tint == wsl::kSlush ? 1.f : sh * (f.kind == 3 ? 1.25f : 1.f);
+            const DWORD col = rgba(tc.r * kc, tc.g * kc, tc.b * kc, al);
             const float u0 = (float)(f.variant & 3) * 0.25f, v0 = (float)(f.variant >> 2) * 0.5f;
-            if (f.kind == 1 && len > 2.f) strip(g_wsVStreak, bx * W, by * H, X, Y, hw * 0.15f, hw * 0.55f, f.tint ? rgba(0.85f, 0.88f, 0.92f, op * 0.28f) : rgba(g_cfg.wsMudR, g_cfg.wsMudG, g_cfg.wsMudB, op * 0.30f));
+            if (f.kind == 1 && len > 2.f) strip(g_wsVStreak, bx * W, by * H, X, Y, hw * 0.15f, hw * 0.55f, f.tint == wsl::kSlush ? rgba(0.85f, 0.88f, 0.92f, op * 0.28f) : rgba(tc.r, tc.g, tc.b, op * 0.30f));
             quad(g_wsVFlyMud, X, Y, hw, hw * st, ang, col, u0, v0, u0 + 0.25f, v0 + 0.5f);
         }
     }
     for (const WsTrail& t : g_wsTrails) {
-        const float a = std::pow(std::max(0.f, 1.f - t.age / life), 1.3f) * op * 0.7f;
+        const float a = std::pow(std::max(0.f, 1.f - t.age / life), 1.6f) * op * 0.55f;
         strip(g_wsVTrail, t.x0 * W, t.y0 * H, t.x1 * W, t.y1 * H, t.w0 * H, t.w1 * H, rgba(1.f, 1.f, 1.f, a));
     }
     for (const WsDrop& dr : g_wsDrops) {
@@ -1811,7 +1918,7 @@ bool wsDraw(IDirect3DDevice9* d) {
         }
         const float vlen = std::sqrt(dr.vx * dr.vx + dr.vy * dr.vy);
         const bool moving = vlen > 0.02f;
-        const float stretch = moving ? 1.15f * (1.f + std::min(1.3f, vlen * 2.4f)) : 1.f;
+        const float stretch = moving ? 1.0f + std::min(0.7f, vlen * 1.6f) : 1.f;        // a runner is a little longer than wide, it does not carry a tail
         const float ang = moving ? std::atan2(-dr.vx, dr.vy) : 0.f;    // local y axis follows the motion, the head leads
         const float sc = 0.4f + 0.6f * wsSmooth(0.f, 0.12f, dr.age);   // impact: the drop spreads out
         const float lf = dr.melt0 > 0.f ? clamp01(dr.melt / 3.f) : 1.f;   // melted snow fades out
@@ -1831,8 +1938,8 @@ bool wsDraw(IDirect3DDevice9* d) {
             }
         }
         if (dr.age < 0.14f) {                                          // impact flash
-            const float k = dr.age / 0.14f, s = rpx * (1.3f + 2.6f * k);
-            quad(g_wsVSplash, dr.x * W, dr.y * H, s, s, 0.f, rgba(1.f, 1.f, 1.f, (1.f - k) * 0.7f * op), 0.f, 0.f, 1.f, 1.f);
+            const float k = dr.age / 0.14f, s = rpx * (1.2f + 1.6f * k);
+            if (rpx >= 3.f) quad(g_wsVSplash, dr.x * W, dr.y * H, s, s, 0.f, rgba(1.f, 1.f, 1.f, (1.f - k) * 0.20f * op), 0.f, 0.f, 1.f, 1.f);
         }
     }
     if (g_cfg.wsWipers && g_wsBladeInit) {
@@ -2053,10 +2160,11 @@ float wsRotAngle(const float* Ra, const float* Rb) {                  // angle b
 void wsHuntReset() {
     g_wsHunt.clear(); memset(g_wsSlots, 0, sizeof(g_wsSlots));
     g_wsLock[0].on = g_wsLock[1].on = false; g_wsHuntLocked = false; g_wsPrevSel[0] = g_wsPrevSel[1] = 0; g_wsHuntT0 = 0.f;
-    g_wsModelBlade[0].ok = g_wsModelBlade[1].ok = false;
+    g_wsModelBlade[0].ok = g_wsModelBlade[1].ok = false; g_wsMeas[0] = g_wsMeas[1] = WsMeasure{}; g_wsSegHave[0] = g_wsSegHave[1] = false; g_wsDrawLock = -1;
 }
 // Called for every 3D draw call while hunting or while a blade is locked. Returns true when the draw is a locked blade that should be hidden.
 bool wsHuntDraw(uint32_t sig) {
+    g_wsDrawLock = -1;
     if (!g_lastMvpOk || !g_wsPok) return false;
     WsHuntSlot* sl = nullptr;                                          // occurrence index of this mesh in the frame (two wipers can share a mesh)
     for (int p = 0; p < 8 && !sl; ++p) { WsHuntSlot& s = g_wsSlots[(sig + (uint32_t)p) & 2047u]; if (s.frame == g_wsFrameNo && s.sig == sig) sl = &s; }
@@ -2065,6 +2173,7 @@ bool wsHuntDraw(uint32_t sig) {
     const int k = std::min(sl->cnt++, 255);
     const uint64_t key = ((uint64_t)sig << 8) | (uint64_t)k;
     const bool l0 = g_wsLock[0].on && g_wsLock[0].key == key, l1 = g_wsLock[1].on && g_wsLock[1].key == key;
+    g_wsDrawLock = l0 ? 0 : (l1 ? 1 : -1);
     const bool hunting = !g_wsHuntLocked || g_cfg.wsProbe;
     if (!hunting && !l0 && !l1) return false;
     const M4 T = m4Mul(g_wsPinv, g_lastMvp);                           // V * M: the object's placement in camera space
@@ -2086,6 +2195,26 @@ bool wsHuntDraw(uint32_t sig) {
     }
     return (l0 || l1) && g_cfg.wsHideGameWipers;
 }
+// Reads the vertices of a locked wiper blade's draw call once, and measures the mesh: its long axis and how far it reaches (see wsl::measureExtent).
+// This replaces the guess in the ini (WiperAxis, WiperLenM). If the vertex buffer cannot be read, or the mesh does not look like a wiper,
+// nothing changes and the ini values stay in use.
+void wsMeasureBlade(void* devp, int lockIdx, INT baseVtx, UINT minVtx, UINT numVtx) {
+    if (lockIdx < 0 || lockIdx > 1 || g_wsMeas[lockIdx].tried) return;
+    WsMeasure& m = g_wsMeas[lockIdx]; m.tried = true;
+    IDirect3DDevice9* d = (IDirect3DDevice9*)devp; IDirect3DVertexBuffer9* vb = nullptr; UINT off = 0, stride = 0;
+    if (!d || FAILED(d->GetStreamSource(0, &vb, &off, &stride)) || !vb) { Logf("WiperHunt: blade %d: cannot read the vertex stream, using WiperAxis / WiperLenM", lockIdx + 1); return; }
+    D3DVERTEXBUFFER_DESC desc{}; vb->GetDesc(&desc);
+    const long first = (long)baseVtx + (long)minVtx;
+    if (first < 0 || stride < 12 || numVtx < 3 || numVtx > 20000 || (unsigned long long)off + (unsigned long long)(first + numVtx) * stride > desc.Size) {
+        Logf("WiperHunt: blade %d: unexpected vertex range (base %d min %u count %u stride %u), using WiperAxis / WiperLenM", lockIdx + 1, (int)baseVtx, minVtx, numVtx, stride); vb->Release(); return;
+    }
+    void* ptr = nullptr; HRESULT hr = vb->Lock(off + (UINT)first * stride, numVtx * stride, &ptr, D3DLOCK_READONLY);
+    if (SUCCEEDED(hr) && ptr) { m.ext = wsl::measureExtent((const uint8_t*)ptr, (int)numVtx, (int)stride); vb->Unlock(); }
+    vb->Release();
+    if (m.ext.ok) Logf("WiperHunt: blade %d measured: axis %d, %.3f .. %.3f model units (%d vertices, stride %u). Rubber and direction now come from the mesh", lockIdx + 1, m.ext.axis, m.ext.lo, m.ext.hi, (int)numVtx, stride);
+    else Logf("WiperHunt: blade %d: the mesh could not be measured (lock 0x%08X, %d vertices, stride %u), using WiperAxis / WiperLenM", lockIdx + 1, (unsigned)hr, (int)numVtx, stride);
+}
+
 bool wsProjectCam(float x, float y, float z, float W, float H, float& ox, float& oy) {    // camera-space point -> pixels of the base-pose frame
     const float cx = g_wsP.m[0][0] * x + g_wsP.m[0][1] * y + g_wsP.m[0][2] * z + g_wsP.m[0][3];
     const float cy = g_wsP.m[1][0] * x + g_wsP.m[1][1] * y + g_wsP.m[1][2] * z + g_wsP.m[1][3];
@@ -2093,17 +2222,26 @@ bool wsProjectCam(float x, float y, float z, float W, float H, float& ox, float&
     if (cw < 1e-4f) return false;
     ox = (cx / cw * 0.5f + 0.5f) * W; oy = (0.5f - cy / cw * 0.5f) * H; return true;
 }
-void wsHuntPose(float W, float H) {                                    // the locked blades' pivot, length and angle on the glass, from their current matrices
+void wsHuntPose(float W, float H) {                                    // the locked blades' pivot, length, angle and rubber end points on the glass, from their current matrices
     for (int i = 0; i < 2; ++i) {
         WsModelBlade& mb = g_wsModelBlade[i]; mb.ok = false;
         if (!g_cfg.wsWiperSource || !g_wsLock[i].on || !g_wsPok) continue;
         const auto it = g_wsHunt.find(g_wsLock[i].key); if (it == g_wsHunt.end()) continue;
         const WsHuntEnt& e = it->second; if (g_wsFrameNo - e.lastFrame > 30) continue;      // not drawn recently
-        const int ax = std::max(0, std::min(2, g_cfg.wsWiperAxis)); const float sgn = g_cfg.wsWiperAxisSign < 0 ? -1.f : 1.f, Lm = g_cfg.wsWiperLenM;
-        float s0x, s0y, s1x, s1y;
+        // Direction and extent: measured from the mesh's own vertices when that worked (WiperMeasure=1), else the ini's WiperAxis / WiperLenM.
+        int ax = std::max(0, std::min(2, g_cfg.wsWiperAxis)); float rA, rB, tip;           // rubber from rA to rB, tip = far end, positions along the axis in model units
+        const float sgn = g_cfg.wsWiperAxisSign < 0 ? -1.f : 1.f, Lm = g_cfg.wsWiperLenM;
+        const bool measured = g_cfg.wsWiperMeasure && g_wsMeas[i].ext.ok;
+        if (measured) { ax = g_wsMeas[i].ext.axis; wsl::rubberSpan(g_wsMeas[i].ext, g_cfg.wsWiperInner, rA, rB); tip = (std::fabs(g_wsMeas[i].ext.hi) >= std::fabs(g_wsMeas[i].ext.lo)) ? g_wsMeas[i].ext.hi : g_wsMeas[i].ext.lo; }
+        else { rA = sgn * Lm * std::max(0.f, std::min(0.9f, g_cfg.wsWiperInner)); rB = sgn * Lm; tip = sgn * Lm; }
+        const float cx = e.T[0 * 3 + ax], cy = e.T[1 * 3 + ax], cz = e.T[2 * 3 + ax];      // the model axis in camera space
+        float s0x, s0y, sTx, sTy, sAx, sAy, sBx, sBy;
         if (!wsProjectCam(e.T[9], e.T[10], e.T[11], W, H, s0x, s0y)) continue;
-        if (!wsProjectCam(e.T[9] + sgn * e.T[0 * 3 + ax] * Lm, e.T[10] + sgn * e.T[1 * 3 + ax] * Lm, e.T[11] + sgn * e.T[2 * 3 + ax] * Lm, W, H, s1x, s1y)) continue;
-        mb.ok = true; mb.px = s0x / W; mb.py = s0y / H; mb.len = std::sqrt((s1x - s0x) * (s1x - s0x) + (s1y - s0y) * (s1y - s0y)) / H; mb.ang = std::atan2(s0y - s1y, s1x - s0x);
+        if (!wsProjectCam(e.T[9] + cx * tip, e.T[10] + cy * tip, e.T[11] + cz * tip, W, H, sTx, sTy)) continue;
+        if (!wsProjectCam(e.T[9] + cx * rA, e.T[10] + cy * rA, e.T[11] + cz * rA, W, H, sAx, sAy)) continue;
+        if (!wsProjectCam(e.T[9] + cx * rB, e.T[10] + cy * rB, e.T[11] + cz * rB, W, H, sBx, sBy)) continue;
+        mb.ok = true; mb.px = s0x / W; mb.py = s0y / H; mb.len = std::sqrt((sTx - s0x) * (sTx - s0x) + (sTy - s0y) * (sTy - s0y)) / H; mb.ang = std::atan2(s0y - sTy, sTx - s0x);
+        mb.seg = {sAx, sAy, sBx, sBy};
     }
 }
 void wsHuntReport() {
@@ -2144,7 +2282,7 @@ void wsHuntReport() {
         g_wsPrevSel[0] = sel.size() > 0 ? sel[0].key : 0; g_wsPrevSel[1] = sel.size() > 1 ? sel[1].key : 0;
         if (agree) {
             for (size_t i = 0; i < sel.size(); ++i) {
-                g_wsLock[i] = {true, sel[i].key, sel[i].theta, sel[i].hp};
+                g_wsLock[i] = {true, sel[i].key, sel[i].theta, sel[i].hp}; g_wsMeas[i] = WsMeasure{}; g_wsSegHave[i] = false;
                 Logf("WiperHunt: LOCKED blade %d = mesh %08X #%d, sweep %.0f deg, stroke %.2fs, pivot %.2f,%.2f. WiperAxis=%d WiperLenM=%.2f decide the blade direction and length (WiperDebug=1 shows it)",
                      (int)i + 1, (unsigned)(sel[i].key >> 8), (int)(sel[i].key & 255u), sel[i].theta * 57.2958f, sel[i].hp * 2.f, sel[i].px, sel[i].py, g_cfg.wsWiperAxis, g_cfg.wsWiperLenM);
             }
@@ -2176,12 +2314,20 @@ HRESULT __stdcall hkReset(void* dev, void* pp) { wsReleaseDeviceObjects(); retur
 // While the game's own wet-windscreen function runs (HideGameFx=1) its draw calls are dropped here; its logic still runs, so the wipers keep working.
 HRESULT __stdcall hkDrawPrim(void* dev, DWORD t, UINT s, UINT p) {
     if (g_wsSuppress && !g_wsDrawing) { g_wsHidden++; return 0; }
-    if (wsHuntActive() && wsHuntDraw(wsSig(t, 0, 0, 0, s, p))) { g_wsHiddenWipers++; return 0; }
+    if (wsHuntActive()) {
+        const bool hide = wsHuntDraw(wsSig(t, 0, 0, 0, s, p));
+        if (g_wsDrawLock >= 0 && !g_wsMeas[g_wsDrawLock].tried) { g_wsMeas[g_wsDrawLock].tried = true; Logf("WiperHunt: blade %d is drawn without an index buffer and is not measured, using WiperAxis / WiperLenM", g_wsDrawLock + 1); }
+        if (hide) { g_wsHiddenWipers++; return 0; }
+    }
     return g_origDrawPrim(dev, t, s, p);
 }
 HRESULT __stdcall hkDrawIdxPrim(void* dev, DWORD t, INT b, UINT mn, UINT nv, UINT si, UINT p) {
     if (g_wsSuppress && !g_wsDrawing) { g_wsHidden++; return 0; }
-    if (wsHuntActive() && wsHuntDraw(wsSig(t, (UINT)b, mn, nv, si, p))) { g_wsHiddenWipers++; return 0; }
+    if (wsHuntActive()) {
+        const bool hide = wsHuntDraw(wsSig(t, (UINT)b, mn, nv, si, p));
+        if (g_wsDrawLock >= 0 && g_cfg.wsWiperMeasure) wsMeasureBlade(dev, g_wsDrawLock, b, mn, nv);     // once per locked blade
+        if (hide) { g_wsHiddenWipers++; return 0; }
+    }
     return g_origDrawIdxPrim(dev, t, b, mn, nv, si, p);
 }
 HRESULT __stdcall hkDrawPrimUP(void* dev, DWORD t, UINT p, const void* data, UINT stride) { if (g_wsSuppress && !g_wsDrawing) { g_wsHidden++; return 0; } return g_origDrawPrimUP(dev, t, p, data, stride); }
@@ -2196,17 +2342,17 @@ HRESULT __stdcall hkCreateDevice(void* self, UINT adapter, UINT devType, HWND hw
         const bool b = MH_CreateHook(vt[94], (void*)&hkSetVSConst, (void**)&g_origSetVSConst) == MH_OK && MH_EnableHook(vt[94]) == MH_OK;
         g_devHooked = a && b;
         g_wsDev = (IDirect3DDevice9*)*ppDev;
-        if (g_cfg.wsEnable) {                                          // WindscreenFX: EndScene = 42, Reset = 16
+        if (g_cfg.wsEnable) {                                          // Windscreen: EndScene = 42, Reset = 16
             const bool c = MH_CreateHook(vt[42], (void*)&hkEndScene, (void**)&g_origEndScene) == MH_OK && MH_EnableHook(vt[42]) == MH_OK;
             const bool r = MH_CreateHook(vt[16], (void*)&hkReset, (void**)&g_origReset) == MH_OK && MH_EnableHook(vt[16]) == MH_OK;
             g_wsHooked = c && r;
-            Note("WindscreenFX: EndScene hook %s, Reset hook %s", c ? "OK" : "FAILED", r ? "OK" : "FAILED");
+            Note("Windscreen: EndScene hook %s, Reset hook %s", c ? "OK" : "FAILED", r ? "OK" : "FAILED");
             if (g_cfg.wsHideGameFx == 1 || g_cfg.wsWiperSource || g_cfg.wsHideGameWipers || g_cfg.wsProbe) {   // DrawPrimitive = 81, DrawIndexedPrimitive = 82, DrawPrimitiveUP = 83, DrawIndexedPrimitiveUP = 84
                 const bool h1 = MH_CreateHook(vt[81], (void*)&hkDrawPrim, (void**)&g_origDrawPrim) == MH_OK && MH_EnableHook(vt[81]) == MH_OK;
                 const bool h2 = MH_CreateHook(vt[82], (void*)&hkDrawIdxPrim, (void**)&g_origDrawIdxPrim) == MH_OK && MH_EnableHook(vt[82]) == MH_OK;
                 const bool h3 = MH_CreateHook(vt[83], (void*)&hkDrawPrimUP, (void**)&g_origDrawPrimUP) == MH_OK && MH_EnableHook(vt[83]) == MH_OK;
                 const bool h4 = MH_CreateHook(vt[84], (void*)&hkDrawIdxPrimUP, (void**)&g_origDrawIdxPrimUP) == MH_OK && MH_EnableHook(vt[84]) == MH_OK;
-                Note("WindscreenFX: draw-call hooks for HideGameFx: %s %s %s %s", h1 ? "OK" : "FAILED", h2 ? "OK" : "FAILED", h3 ? "OK" : "FAILED", h4 ? "OK" : "FAILED");
+                Note("Windscreen: draw-call hooks for HideGameFx: %s %s %s %s", h1 ? "OK" : "FAILED", h2 ? "OK" : "FAILED", h3 ? "OK" : "FAILED", h4 ? "OK" : "FAILED");
             }
         }
         Note("D3D device created: SetTransform hook %s, SetVertexShaderConstantF hook %s", a ? "OK" : "FAILED", b ? "OK" : "FAILED");
@@ -2400,7 +2546,7 @@ void __fastcall hkRender(void* p) {
     } else if (g_dirty) {
         g_dirty = false; resetHead();
     }
-    g_wsArmed = g_wsOn.load() && g_wsHooked && g_cfg.wsEnable && isCockpit(type);   // WindscreenFX draws from the EndScene hook
+    g_wsArmed = g_wsOn.load() && g_wsHooked && g_cfg.wsEnable && isCockpit(type);   // Windscreen draws from the EndScene hook
     g_wsFrameNo++; g_wsStamp = now;
     g_in3D = true;
     g_origRender(p);
@@ -2410,16 +2556,20 @@ void __fastcall hkRender(void* p) {
 } // namespace
 
 // ================================================================================================ the module
-class CameraFx {
+class Camera {
 public:
-    struct Hooks { std::function<void(const std::string&)> log; };
+    struct Hooks {
+        std::function<void(const std::string&)> log;
+        std::function<std::string()> carKey;       // identifies the car in use ("name|id|slot"), empty while unknown
+        std::function<bool(int[4])> readIds;       // the material id under each tyre (FL, FR, RL, RR) from the surface scan; false until all four are known
+    };
 
     // Reads the camera sections of ForceFX.ini and installs the hooks. cameraOn / windscreenOn are the switches from ForceFX.ini. The windscreen
     // hooks are only installed when it is on here, so a restart is needed to switch it on later.
     void configure(const std::string& dir, Hooks h, bool cameraOn, bool windscreenOn) {
         if (m_started) return;
         m_started = true;
-        g_dir = dir; g_hostLog = h.log;
+        g_dir = dir; g_hostLog = h.log; g_hostIds = h.readIds; g_hostCarKey = h.carKey;
         g_enabled = cameraOn; g_wsOn = windscreenOn; g_cfg.wsEnable = windscreenOn ? 1 : 0;
         loadConfig();
         if (g_cfg.log) g_log = fopen((g_dir + "ForceFXCamera.log").c_str(), "w");
@@ -2439,9 +2589,9 @@ public:
             m_render = t2; Logf("hook render installed @ %p", t2);
         } else Note("hook render FAILED @ %p", t2);
         if (g_cfg.method == 4 && g_cfg.autoFallback && openRBRVRLoaded()) fallbackToMethod2("openRBRVR.dll detected at startup");
-        const bool wantD3D = (g_cfg.method == 4) || (g_cfg.wsEnable && !openRBRVRLoaded());   // WindscreenFX also needs the device hooks
+        const bool wantD3D = (g_cfg.method == 4) || (g_cfg.wsEnable && !openRBRVRLoaded());   // Windscreen also needs the device hooks
         if (wantD3D && installD3DHooks()) Logf("D3D hooks requested (method %d, windscreen enable=%d)", g_cfg.method, g_cfg.wsEnable);
-        if (wantD3D) {                                                  // also needed by WindscreenFX: counts the game's own wet-overlay calls
+        if (wantD3D) {                                                  // also needed by Windscreen: counts the game's own wet-overlay calls
             void* t3 = (void*)absAddr(0x452020);
             if (MH_CreateHook(t3, (void*)&hkWindscreenFx, (void**)&g_origWindscreenFx) == MH_OK && MH_EnableHook(t3) == MH_OK) {
                 m_wind = t3; Logf("hook windscreen effects installed @ %p", t3);
@@ -2456,19 +2606,40 @@ public:
     void setActive(bool on) { g_enabled = on; }
     void setWindscreen(bool on) { g_wsOn = on; }
 
+    // A tyre hit standing water at this strength (0..1): the windscreen throws a splash of water, the same way a landing throws mud.
+    // Ignored while the windscreen effects are off, so a stale splash can not appear when they are switched on later.
+    void splash(float strength) {
+        if (g_ready && g_wsOn.load() && strength > 0.0f) storeMax(g_wsWaterHit, strength < 1.0f ? strength : 1.0f);
+    }
+
     // One NGP telemetry packet. Safe to call from any thread, one packet at a time.
     void feed(const uint8_t* data, int len) {
         if (g_ready && data && len > 0) processPacket((const char*)data, len);
     }
 
     // The stage is starting: forget the old head pose and the last stage's events.
-    void stageStarted(int iMap) {
+    void stageStarted(int iMap, const char* player, bool) {
         if (!g_ready) return;
         const WsGameWeather gw = wsReadGameWeather();
         Logf("StageStarted: map id=%d | game conditions: sky=%d (%s) surfaceWetness=%d cloud=%d timeOfDay=%d valid=%d", iMap, gw.sky, wsSkyName(gw.sky), gw.wet, gw.cloud, gw.tod, gw.ok ? 1 : 0);
         g_wsGW = gw; g_wsStageId = iMap; wsApplyStage();
-        g_stageStartTick = GetTickCount(); g_wsReset = true; g_evCrashSurge = 0; g_evCrashSway = 0; g_evLand = 0;
+        g_stageStartTick = GetTickCount();
+        {   // Mud and dirt carry on from the last stage of the same rally; a new rally, a new driver or a stage that was not finished starts clean (new car: see wsStep)
+            const std::string who = player ? player : "";
+            g_wsHist.secondsSinceFinish = g_wsHist.finished ? (float)(GetTickCount() - g_wsFinishTick) / 1000.f : 0.f;
+            const char* why = wsl::cleanReason(g_cfg.wsCarryOver != 0, g_wsHist, iMap, who, g_cfg.wsCarryMinutes);
+            if (why) { g_wsReset = true; Logf("windscreen: glass cleaned for this stage: %s", why); }
+            else { g_wsResetWater = true; Logf("windscreen: mud and dirt carried over from the last stage, water cleared"); }
+            g_wsHist.have = true; g_wsHist.finished = false; g_wsHist.map = iMap; g_wsHist.player = who; g_wsCarCheckUntil = GetTickCount() + 12000;
+        }
+        g_evCrashSurge = 0; g_evCrashSway = 0; g_evLand = 0;
         resetHead(); g_haveBase = false; g_haveLast = false;
+    }
+
+    // The player finished the stage (finishTime > 0) or failed it (0). Only a finished stage lets the mud carry on to the next one.
+    void stageFinished(float finishTime) {
+        if (!g_ready || finishTime <= 0.f) return;
+        g_wsHist.finished = true; g_wsFinishTick = GetTickCount();
     }
 
     // One line for the diagnostics page.

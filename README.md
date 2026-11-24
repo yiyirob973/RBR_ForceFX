@@ -1,110 +1,102 @@
 # RBR_ForceFX
 
-Extra force feedback for Richard Burns Rally. ForceFX reads NGP telemetry and adds engine, road, braking and landing detail to your wheel on top of RBR's own steering force. Optional modules add dynamic surface audio, camera movement and windscreen effects.
+Extra force feedback for Richard Burns Rally. ForceFX reads NGP telemetry and adds engine, road, braking, water and landing detail to your wheel on top of RBR's own steering force. Optional modules add dynamic audio, camera movement and windscreen effects.
 
-> **Use at your own risk.** ForceFX sends force feedback straight to your wheel. Output limits and gradual derating are built in, but they cannot guarantee that hardware will not be damaged. Start with low settings and stop immediately if the wheel behaves unexpectedly.
+> **Use at your own risk.** ForceFX sends force feedback straight to your wheel. Output limits and gradual derating are built in, but they cannot guarantee that hardware will not be damaged. Start with low settings and stop if the wheel behaves unexpectedly.
 >
 > It is built and tested for the RallySimFans (RSF) version of RBR with NGP7. Other setups may work but are not supported. AI tools were used in its development.
 
 ## Features
 
 - **Engine:** vibration that follows rpm, throttle and the rev limit.
-- **Road:** vibration that follows the surface under each tyre (gravel, snow, ice, grass, tarmac, cobbles) together with speed, wheel slip and how rough the tyres measure.
-- **Braking:** front-end judder that gets harsh on lock-up.
-- **Landings:** jumps make RBR's own steering force pull harder for a moment. Bumps and rough ground never do.
-- **Optional dynamic surface audio:** tyre and ground sounds that follow each wheel (off by default).
-- **Optional camera movement:** your head moves with the car in the cockpit view: leaning into braking and corners, nodding, bouncing over bumps, shaking on crashes and landings.
-- **Alpha feature — optional windscreen effects:** rain, snow and mud on the glass, with wipers (disabled by default).
-- An in-game menu (**Plugins > ForceFX**) with per-effect switches, settings and diagnostics.
-- Optional per-car profiles.
+- **Road:** vibration that follows the ground under each tyre, your speed, wheel slip and how rough the tyres measure.
+- **Braking:** front-end judder, harsher on lock-up.
+- **Landings:** after a real jump, RBR's own steering force pulls harder for a moment. Bumps never trigger it.
+- **Water:** a thump and a tug when a tyre hits standing water, a rumble while you wade, heavier steering while the front tyres push through.
+- **Light steering under hard acceleration:** the steering loses force in proportion to the weight the front tyres lose (never more than 60%).
+- **Dynamic audio (optional, off by default):** tyre squeal, slides, rolling noise, stones, bumps, landings, water and crashes, following each wheel.
+- **Camera movement (optional):** your head moves with the car in the cockpit view.
+- **Windscreen effects (optional, alpha, off by default):** rain, snow and mud on the glass, with wipers.
+- An in-game menu (**Plugins > ForceFX**) with per-effect switches, settings and diagnostics, and optional per-car profiles.
 
 ## Requirements
 
-- Windows and 32-bit RBR.
-- RallySimFans RBR with NGP7 and UDP telemetry enabled.
-- A DirectInput force-feedback wheel that RBR already uses (not needed for the camera).
-- The camera builds also need the Microsoft Visual C++ 2015-2022 x86 Redistributable. Most gaming PCs already have it.
+- Windows and 32-bit RBR with RallySimFans and NGP7, with NGP's UDP telemetry turned on.
+- A DirectInput force feedback wheel that RBR already uses (the camera works without one).
+- The camera packages need the Microsoft Visual C++ 2015-2022 x86 Redistributable. Most gaming PCs have it.
 
 ## Install
 
-1. Download a release from the [Releases](https://github.com/yiyirob973/RBR_ForceFX/releases) page:
-   - `ForceFX-<version>-Full.zip` has dynamic audio and the camera.
-   - `ForceFX-<version>-Audio.zip` has dynamic audio only.
-   - `ForceFX-<version>-Camera.zip` has the camera only.
-   - `ForceFX-<version>-Basic.zip` is force feedback only.
-
-   Choose the package that provides the features you need. If you used the standalone `RBR_CameraFX.dll`, delete it first: both would hook the same game functions.
-2. Copy the contents into RBR's `Plugins` folder and keep the DLL and `.ini` files together.
-3. Turn on NGP UDP telemetry. The destination doesn't matter, so it can keep pointing at SimHub or similar. The camera reads the same telemetry, so it needs no extra endpoint.
-4. Start RBR, open **Plugins > ForceFX**, pick your wheel and connect. Set `AutoConnect=1` in `ForceFX.ini` to connect automatically next time. The camera works without connecting a wheel.
+1. Download a package from [Releases](https://github.com/yiyirob973/RBR_ForceFX/releases):
+   - `ForceFX-<version>-Full.zip`: audio and camera
+   - `ForceFX-<version>-Audio.zip`: audio only
+   - `ForceFX-<version>-Camera.zip`: camera only
+   - `ForceFX-<version>-Basic.zip`: force feedback only
+2. Copy the contents into RBR's `Plugins` folder. Keep the DLL and the `.ini` files together.
+3. Turn on NGP UDP telemetry. It can keep pointing at SimHub or similar; ForceFX needs no port of its own.
+4. Start RBR, open **Plugins > ForceFX**, pick your wheel and connect. Set `AutoConnect=1` in `ForceFX.ini` to do it automatically next time.
 
 ## Settings
 
-Settings live in `ForceFX.ini`, which describes every option. The most useful ones are also in the in-game menu.
+Everything is in `ForceFX.ini`, which describes each option, and the main ones are in the in-game menu.
 
-- **Road gain** (`RoadMaxMagnitude`) is the one setting for how strong the road feel is. The surface and what the car is doing decide what it feels like.
-- **Road feel delivery** (`RoadViaRbr`, also in the menu): by default the road vibration is added to RBR's own steering force, so the wheel gets no extra road effect. Set it to 0 to play the road through its own DirectInput effect.
+- **Road gain** (`RoadMaxMagnitude`) is the one setting for road strength. The ground and the car's behaviour decide how it feels.
 - **Total output** (`TotalMaxMagnitude`) caps all effects together. If the wheel feels too strong or busy, lower this first.
-- **Live level** scales everything down while you drive: Numpad **+** and **-** change it, Numpad **\*** mutes the added effects (keys are configurable in `ForceFX.ini`). It can only turn effects down; it never raises the settings in the file.
-- **Per-car profiles** are in `ForceFXCars.ini`. A profile can change a car's engine and road strength and set its `Drivetrain=RWD|FWD|AWD`. Cars without an entry are treated as RWD. The drivetrain changes engine vibration on the driven wheels.
+- **Live level:** Numpad **+** and **-** turn everything down or up (never above the ini values), Numpad **\*** mutes. Keys are configurable.
+- **Car profiles** are in `ForceFXCars.ini`: engine and road strength per car, and `Drivetrain=RWD|FWD|AWD`. Cars without an entry count as RWD.
+- **Road feel delivery** (`RoadViaRbr`): by default the road vibration is added to RBR's own force. Set it to 0 to play it as a separate effect.
 
-## Road feel
+## How the road feel works
 
-ForceFX reads which material is under each tyre from RBR's memory (read-only) and combines it with the telemetry. Loose ground is grainy, soft ground is dull, ice is hard and sharp, and cobbles hit in a repeating pattern.
+ForceFX reads which material is under each tyre from RBR's memory (read-only, RSF `RichardBurnsRally_SSE.exe` only, and only while a stage is running) and combines it with the telemetry. Loose ground is grainy, soft ground is dull, ice is hard and sharp, cobbles hit in a repeating pattern. Unknown ground is treated as plain hard ground.
 
-- If a material isn't recognised, it is treated as plain hard ground and the road still follows the telemetry.
-- Cobblestones and wooden bridges have no material of their own in the game. Cobbles are detected from the telemetry, and any material ID can be assigned with `Map=` in the `[Surface]` section of `ForceFX.ini`.
-- The ground is only read while a stage is running. It relies on the memory layout of the RSF `RichardBurnsRally_SSE.exe`.
-- The Diagnostics page shows the detected surface and the material IDs under the tyres. `ForceFX.log` records surface changes.
+Cobbles and wooden bridges have no material of their own in the game. Cobbles are detected from the telemetry, and you can assign any material ID with `Map=` in the `[Surface]` section of `ForceFX.ini`. The Diagnostics page shows the material IDs under the tyres, and `ForceFX.log` records surface changes.
 
-## Dynamic surface audio
+## Dynamic audio
 
-Audio build only. It is off by default: switch on **Dynamic audio** in the menu, or set `EnableDynamicAudio=1`.
+Audio packages only. Switch on **Dynamic audio** in the menu, or set `EnableDynamicAudio=1`.
 
-1. Run `ForceFXAudio\Copy-RbrSounds.bat` to copy matching sounds from your RBR `Audio` folder. See the short readme beside it. You can also put your own WAV files in `ForceFXAudio\sounds`.
-2. Mix levels and the output device are in the `[Audio]` section of `ForceFX.ini`.
+1. Run `ForceFXAudio\Copy-RbrSounds.bat` to copy matching sounds from your RBR `Audio` folder (see the short readme beside it). You can also put your own WAV files in `ForceFXAudio\sounds`.
+2. Levels and the output device are in the `[Audio]` section of `ForceFX.ini`. `audio/surfaces.md` lists the sound names ForceFX looks for.
 
-`audio/surfaces.md` lists the sound names ForceFX looks for.
+Water sounds the sounds folder lacks are made by ForceFX itself, and your own `water_*.wav` files replace them. Each crash is written to `ForceFX.log` with its peak g; `CrashMinG` sets how sensitive crash detection is.
 
 ## Camera movement
 
-Camera builds only. It is on by default. Switch it with **Camera movement** in the menu or `EnableCamera` in `ForceFX.ini`; it changes at once.
+Camera packages only, on by default. Switch it in the menu or with `EnableCamera`; it changes at once.
 
-- `Intensity` in the `[Camera]` section of `ForceFX.ini` is the main strength setting: 0.5 is very subtle, 1.0 natural, 1.5 to 2.0 pronounced. The other camera sections are described in the file.
-- With RBR in focus, hold Ctrl and press **F9** to reload the camera settings from `ForceFX.ini` while you drive, **F10** to switch the camera on or off.
-- It reads the same telemetry as the force feedback, so a wheel doesn't have to be connected. If telemetry comes only from ForceFX's own UDP port (`TelemetrySource=2`), the camera needs the wheel connection to supply the telemetry.
-- It hooks fixed addresses in the RallySimFans `RichardBurnsRally_SSE.exe` and stays off in any other executable.
-- It patches the Direct3D matrices the way openRBRVR does, so the game's own camera and wipers are untouched. With openRBRVR loaded, or if those hooks don't start, it switches to a simpler method that does not patch the matrices.
-- If a direction feels wrong, set `Test=1` and sit in the cockpit: the head runs scripted moves and `ForceFXCamera.log` (with `Log=1`) says what you should see. Flip the matching `Invert...` or `Sign...` settings until the moves match.
+- `Intensity` in `[Camera]` is the main strength: 0.5 subtle, 1.0 natural, 1.5 to 2.0 pronounced.
+- With RBR in focus, **Ctrl+F9** reloads the camera settings and **Ctrl+F10** switches the camera on or off.
+- It reads the same telemetry as the force feedback, so no wheel is needed. If telemetry only comes from ForceFX's own UDP port (`TelemetrySource=2`), the wheel must be connected to supply it.
+- It hooks fixed addresses in the RSF executable and stays off in any other. It works like openRBRVR's matrix patch, so the game's own camera and wipers are untouched. With openRBRVR loaded, or if those hooks don't start, it uses a simpler method.
+- If a direction feels wrong, set `Test=1` in `[Camera]` and sit in the cockpit: the head runs scripted moves and `ForceFXCamera.log` (with `Log=1`) says what you should see. Flip the matching `Invert...` or `Sign...` setting until they match.
 
-## Windscreen effects — alpha
+## Windscreen effects (alpha)
 
-> **Alpha feature:** Windscreen FX is experimental, may affect performance or stability, and is disabled by default.
+Camera packages only. Experimental, may affect performance or stability. Enable it with **Windscreen effects** in the menu or `EnableWindscreen=1`, then restart RBR.
 
-Camera builds only. Enable it in the menu with **Windscreen effects** or set `EnableWindscreen=1` in `ForceFX.ini`, then restart RBR. Its Direct3D hooks are only installed at startup while it is enabled.
-
-- Rain and snow follow the stage's weather, read from the game. Mud is thrown on rough, wet ground, on landings and on impacts.
-- Wipers clear the glass. The plugin finds the car's real wipers after about 12 seconds of rain and follows them; until then it uses emulated blades.
-- Drops, mud, haze, wipers and the game's own wet-windscreen effect have their own settings in the `[Windscreen]` section of `ForceFX.ini`. Hold Ctrl and press F8 to switch it on and off while driving.
-- It costs some frame rate. If that is a problem, lower `Micro`, `Drops` and `Mud`, or set `Refraction=0`.
+- Rain and snow follow the stage's weather. Mud is thrown on rough, wet ground, landings and impacts.
+- Wipers push the water aside rather than erasing it. Heavy rain also runs down the glass in streams.
+- Dirt follows the surface scan: dust on dry gravel, mud on wet dirt, spray on wet tarmac, slush on snow. Mud stays on the glass between the stages of a rally and is cleaned for a new car or driver.
+- All options are in `[Windscreen]`. **Ctrl+F8** switches it on and off while driving. If it costs too much frame rate, lower `Micro`, `Drops` and `Mud`, or set `Refraction=0`.
 
 ## Troubleshooting
 
-- **No telemetry:** check that NGP UDP telemetry is enabled. The ForceFX menu shows the packet count and source.
-- **Wheel won't connect or has no effects:** make sure force feedback is on in RBR and that you picked the same wheel RBR uses. Check `ForceFX.log`.
-- **Road doesn't react to the ground:** open the Diagnostics page. "looking for the tyres" means the tyre data wasn't found, usually because the RBR build is different. "unknown" means the material isn't recognised.
-- **Too strong or busy:** lower the total output or the live level first, then the individual effects.
-- **The camera doesn't move:** open the Diagnostics page and read the camera line, and look for lines starting with `Camera:` in `ForceFX.log`. "not the RallySimFans executable" means the game isn't being launched as the supported executable.
+- **No telemetry:** check that NGP UDP telemetry is on. The ForceFX menu shows the packet count and source.
+- **Wheel won't connect, or no effects:** make sure force feedback is on in RBR and that you picked the wheel RBR uses. Check `ForceFX.log`.
+- **Road ignores the ground:** open the Diagnostics page. "looking for the tyres" means the tyre data wasn't found, usually because the RBR build differs. "unknown" means the material isn't recognised.
+- **Too strong or busy:** lower the total output or the live level first.
+- **Camera doesn't move:** read the camera line on the Diagnostics page and the `Camera:` lines in `ForceFX.log`. "not the RallySimFans executable" means the game isn't running the supported executable.
 
-When reporting a problem, attach `ForceFX.log` (it is beside the DLL), plus `ForceFXCamera.log` for camera or windscreen problems, and describe your NGP setup. Review logs before sharing and remove paths, usernames or other personal information.
+When reporting a problem, attach `ForceFX.log` (beside the DLL), plus `ForceFXCamera.log` for camera or windscreen problems, and describe your NGP setup. Remove paths, usernames and other personal information first.
 
 ## Build from source
 
-32-bit Windows DLL, built with MSVC. From an x86 Visual Studio command prompt run `build.bat`. It builds four variants into `out\full`, `out\audio`, `out\camera` and `out\basic`. The audio module is built with CMake/MinGW in `audio/native`.
+32-bit Windows DLL, built with MSVC. From an x86 Visual Studio command prompt run `build.bat`. It builds `out\full`, `out\audio`, `out\camera` and `out\basic`.
 
-The version shown on the in-game ForceFX pages and in `ForceFX.log` is the git tag the build was made from (the release workflow passes it to `build.bat` as `FORCEFX_VERSION`, for example `v0.6.0`). A plain `build.bat` run has no tag and shows `dev`.
+The version shown in the game and in `ForceFX.log` is the git tag the build was made from (the release workflow passes it to `build.bat` as `FORCEFX_VERSION`, for example `v0.7.0`). A plain `build.bat` run shows `dev`.
 
-Unit tests for the logic headers are in `tests` and `audio/tests`. Each file has its build line at the top.
+Unit tests for the logic headers are in `tests` and `audio/tests`; each file has its build line at the top.
 
 ## Credits
 

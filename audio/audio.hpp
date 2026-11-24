@@ -1,4 +1,4 @@
-// RBR Surface Audio - WAV loading, sound bank, mixer and the sink that connects the controller to it.
+// Dynamic audio: WAV loading, sound bank, mixer and the sink that connects the controller to it.
 // Portable (no Windows APIs); the waveOut device lives in win_platform.hpp.
 #pragma once
 #include <atomic>
@@ -17,7 +17,7 @@
 #include <vector>
 #include "core.hpp"
 
-namespace rsa {
+namespace ffx {
 
 constexpr int kSampleRate = 44100;
 
@@ -149,6 +149,8 @@ public:
         auto it = map_.find(lower(key));
         return it == map_.end() ? nullptr : &it->second;
     }
+    // Adds a sound made in code (see water_sounds.hpp) under the key a file of that name would have.
+    void add(const std::string& key, std::vector<float> data) { map_[lower(key)].push_back(std::move(data)); }
     static std::string keyFor(const std::string& stem) {
         std::string s = lower(stem);
         size_t u = s.find_last_of('_');
@@ -427,7 +429,7 @@ private:
 class MixerSink : public IAudioSink {
 public:
     // map = null: build one from the bank with the default material table.
-    MixerSink(Mixer& mixer, const SoundBank& bank, const Settings& s, const SoundSetMap* map = nullptr) : mixer_(mixer), bank_(bank), eventLevel_((float)s.eventLevel), stoneLevel_((float)s.stoneLevel), squeakLevel_((float)s.squeakLevel), bottomLevel_((float)s.bottomLevel), rumbleLevel_((float)s.rumbleLevel) {
+    MixerSink(Mixer& mixer, const SoundBank& bank, const Settings& s, const SoundSetMap* map = nullptr) : mixer_(mixer), bank_(bank), eventLevel_((float)s.eventLevel), stoneLevel_((float)s.stoneLevel), squeakLevel_((float)s.squeakLevel), bottomLevel_((float)s.bottomLevel), rumbleLevel_((float)s.rumbleLevel), crashLevel_((float)s.crashLevel) {
         if (!map) { ownTable_.reset(new MaterialTable()); own_.reset(new SoundSetMap(bank, *ownTable_, s)); map = own_.get(); }
         map_ = map;
         int n = map_->count();
@@ -463,6 +465,15 @@ public:
             case SoundEvent::Landing: v = bank_.get("debris_landing"); if (!v) v = bank_.get("debris_impact"); break;
             case SoundEvent::SuspSqueak: v = bank_.get("susp_squeak"); break;
             case SoundEvent::SuspBottom: v = bank_.get("susp_bottom"); break;
+            case SoundEvent::Splash: v = bank_.get("water_splash"); if (!v) v = bank_.get("debris_splash"); break;
+            // Crashes: each takes its own sound (the RBR Impact folders, see tools/Copy-RbrSounds.ps1), and the thumps fall back to the bump and landing sounds
+            case SoundEvent::CrashLight: v = bank_.get("crash_light"); if (!v) v = bank_.get("debris_impact"); break;
+            case SoundEvent::CrashMedium: v = bank_.get("crash_medium"); if (!v) v = bank_.get("debris_impact"); break;
+            case SoundEvent::CrashHeavy: v = bank_.get("crash_heavy"); if (!v) v = bank_.get("debris_landing"); if (!v) v = bank_.get("debris_impact"); break;
+            case SoundEvent::CrashMetal: v = bank_.get("crash_metal"); break;
+            case SoundEvent::CrashCrumple: v = bank_.get("crash_crumple"); break;
+            case SoundEvent::CrashBranch: v = bank_.get("crash_branch"); break;
+            case SoundEvent::CrashGlass: v = bank_.get("crash_glass"); break;
         }
         if (!v || v->empty()) return;
         float g;
@@ -470,6 +481,8 @@ public:
             case SoundEvent::StoneHit: g = stoneLevel_ * liveStone_.load(); break;
             case SoundEvent::SuspSqueak: g = squeakLevel_ * liveSusp_.load(); break;
             case SoundEvent::SuspBottom: g = bottomLevel_ * liveSusp_.load(); break;
+            case SoundEvent::CrashLight: case SoundEvent::CrashMedium: case SoundEvent::CrashHeavy: case SoundEvent::CrashMetal:
+            case SoundEvent::CrashCrumple: case SoundEvent::CrashBranch: case SoundEvent::CrashGlass: g = crashLevel_ * liveImpact_.load(); break;
             default: g = eventLevel_ * liveImpact_.load(); break;
         }
         mixer_.playOneShot(&(*v)[rng_() % v->size()], gl * g, gr * g, rate);
@@ -487,7 +500,7 @@ private:
         v[i]->tgtL = gl; v[i]->tgtR = gr; v[i]->rate = rate;
     }
     Mixer& mixer_; const SoundBank& bank_;
-    float eventLevel_ = 1.0f, stoneLevel_ = 2.0f, squeakLevel_ = 1.0f, bottomLevel_ = 1.0f, rumbleLevel_ = 1.0f;
+    float eventLevel_ = 1.0f, stoneLevel_ = 2.0f, squeakLevel_ = 1.0f, bottomLevel_ = 1.0f, rumbleLevel_ = 1.0f, crashLevel_ = 1.0f;
     std::atomic<float> liveStone_{1.0f}, liveImpact_{1.0f}, liveSusp_{1.0f};
     std::unique_ptr<MaterialTable> ownTable_; std::unique_ptr<SoundSetMap> own_;
     const SoundSetMap* map_ = nullptr;
@@ -496,4 +509,4 @@ private:
     std::mt19937 rng_{4242};
 };
 
-}  // namespace rsa
+}  // namespace ffx

@@ -14,7 +14,11 @@ ForceFX plays its sounds from WAV files in `Plugins\ForceFXAudio\sounds`, found 
 | `Surfaces\Normal` and `Skid` `generic` | `grass_loop`, `grass_squeal`, `grass_slide` |
 | `Impact\Grus` | `debris_stone_1`, `_2`, ... (flying stones) |
 | `Impact\Medium` | `debris_impact_1`, `_2`, ... (bumps) |
-| `Impact\Heavy` | `debris_landing_1`, `_2`, ... (landings) |
+| `Impact\Heavy` | `debris_landing_1`, `_2`, ... (landings, and the heavy crash thump) |
+| `Impact\Soft` | `crash_light_1`, `_2`, ... (light crashes) |
+| `Impact\SoftMet`, `Impact\Addon` | `crash_metal_*`, `crash_crumple_*` (crumpling bodywork) |
+| `Impact\Branch` | `crash_branch_*` (twigs, for nose-first hits) |
+| `Impact\Shatter` | `crash_glass_*` (the hardest crashes) |
 | `Cars\Effects\rumble.wav` | `debris_rumble` |
 | `Cars\Effects\SuspSqee` | `susp_squeak_1`, `_2`, ... (suspension creaks) |
 | `Cars\Effects\Suspen` | `susp_bottom_1`, `_2`, ... (bottoming out) |

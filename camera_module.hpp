@@ -10,7 +10,7 @@
 #ifdef FORCEFX_CAMERA
 
 #include "camera/camera_fx.hpp"
-namespace ffx { using Camera = cam::CameraFx; }
+namespace ffx { using Camera = cam::Camera; }
 
 #else
 
@@ -20,13 +20,17 @@ class Camera {
 public:
     struct Hooks {
         std::function<void(const std::string&)> log;
+        std::function<std::string()> carKey;       // identifies the car in use; unused in this stand-in
+        std::function<bool(int[4])> readIds;       // material id under each tyre (FL, FR, RL, RR); unused in this stand-in
     };
 
     void configure(const std::string&, Hooks, bool, bool) {}
     void setActive(bool) {}
     void setWindscreen(bool) {}
     void feed(const uint8_t*, int) {}
-    void stageStarted(int) {}
+    void stageStarted(int, const char*, bool) {}
+    void stageFinished(float) {}
+    void splash(float) {}
     std::string status() { return std::string(); }
     void shutdown() {}
 };

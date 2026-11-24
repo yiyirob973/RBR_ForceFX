@@ -1,8 +1,8 @@
-// Dynamic surface audio for ForceFX.
+// Dynamic audio for ForceFX: the sounds of the ground under each tyre, squeal, slides, stones, bumps, landings and crashes.
 //
-// ForceFX already receives NGP's telemetry packets and already knows which material is under each tyre, so this engine
-// has no UDP listener and no memory scanner of its own. The plugin hands it the packets and a way to read the four
-// material ids; everything else (per-tyre analysis, sound sets, mixer, waveOut) comes from the surface audio code.
+// ForceFX already receives NGP's telemetry packets and already knows which material is under each tyre, so the audio has
+// no UDP listener or memory scanner of its own. The plugin hands it the packets and a way to read the four material ids.
+// Everything else (per-tyre analysis, sound sets, mixer, waveOut) lives in core.hpp, audio.hpp and waveout.hpp.
 //
 // It is off until the menu switch turns it on. Switching on loads the sounds on a background thread, so the force
 // feedback loop never waits for the disk. Switching off tears everything down again.
@@ -19,11 +19,12 @@
 #include <vector>
 #include "core.hpp"
 #include "audio.hpp"
+#include "water_sounds.hpp"
 #include "waveout.hpp"
 
-namespace rsa {
+namespace ffx {
 
-// Answers the audio code's "what is under each tyre" question from ForceFX's own surface reader.
+// Answers the audio code's "what is under each tyre" question from ForceFX's surface reader.
 // Wheel order is LF, RF, LB, RB on both sides, so the ids pass straight through.
 class ForceFXSurfaceMemory : public ISurfaceMemory {
 public:
@@ -90,6 +91,10 @@ public:
         TelemetryFrame f;
         if (!parsePacket(d, (size_t)n, t, f, s_->settings.packet)) return;
         s_->controller->onFrame(f);
+        if (s_->controller->debris.crashCount != crashesLogged_) {      // one line per crash, so the threshold can be tuned from the log
+            crashesLogged_ = s_->controller->debris.crashCount;
+            if (crashesLogged_ <= 100) log("Dynamic audio: crash, peak " + std::to_string(s_->controller->debris.crashLastG).substr(0, 5) + " g, strength " + std::to_string(s_->controller->debris.crashLastSeverity).substr(0, 4) + " at " + std::to_string((int)(s_->controller->analyzer.speedMs * 3.6)) + " km/h (CrashMinG=" + std::to_string(s_->settings.crashMinG).substr(0, 4) + ")");
+        }
         ++frames_;
         lastFrameNs_ = nowNs();
         if (s_->settings.debugLog && lastFrameNs_ >= nextDebugNs_) { nextDebugNs_ = lastFrameNs_ + 1000000000LL; debugLine(); }
@@ -121,6 +126,18 @@ public:
         liveDebris_ = debris; liveImpacts_ = impacts; liveSusp_ = suspension;
         std::lock_guard<std::mutex> lk(mu_);
         if (s_) s_->sink->setLiveLevels(debris, impacts, suspension);
+    }
+
+    // A tyre hit (or left) standing water: plays the splash, panned to that tyre, louder and lower the harder it hit (0..1).
+    // Safe to call from any thread.
+    void splash(float strength, int tyre) {
+        if (state_.load() != Running) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!s_) return;
+        const float k = strength > 0.0f ? (strength < 1.0f ? strength : 1.0f) : 0.0f;
+        const int w = tyre >= 0 && tyre < 4 ? tyre : 0;
+        float l, r; panGains(kWheelPan[w], (0.30f + 0.70f * k) * kWheelScale[w], l, r);
+        s_->sink->trigger(SoundEvent::Splash, 0, l, r, 1.15f - 0.30f * k);
     }
 
     // Units of the telemetry speed field, from SpeedIsKph in [ForceFX]: one setting for the whole plugin.
@@ -162,7 +179,7 @@ private:
         MaterialTable matTable;
         std::unique_ptr<SoundSetMap> sets;
         std::unique_ptr<MixerSink> sink;
-        std::unique_ptr<SurfaceAudioController> controller;
+        std::unique_ptr<AudioController> controller;
         std::vector<float> beep;
         WaveOutPlayer player;
     };
@@ -171,6 +188,7 @@ private:
     Hooks hooks_;
     ForceFXSurfaceMemory mem_;
     std::mutex mu_;                             // guards s_ between the telemetry thread and the loader / menu
+    int crashesLogged_ = 0;                     // crashes already written to the log
     std::unique_ptr<Session> s_;
     std::thread loader_;
     std::atomic<bool> wantOn_{false}, loading_{false};
@@ -212,7 +230,7 @@ private:
 
     void remakeController() {                   // caller holds mu_
         Session& s = *s_;
-        s.controller.reset(new SurfaceAudioController(s.settings, *s.sink));
+        s.controller.reset(new AudioController(s.settings, *s.sink));
         s.controller->setSurfaceMemory(&mem_);
         s.controller->materials().loadOverrides(dir_ + "ForceFXAudio\\materials.csv");
         s.sink->silence();
@@ -232,10 +250,7 @@ private:
             Settings& st = s->settings;
             const std::string ini = dir_ + "ForceFX.ini";
             if (!loadSettings(ini, st, "Audio")) log("Dynamic audio: no ForceFX.ini found, using defaults");
-            st.enabled = true;
             applyCar(st);
-            st.surfaceMode = 0;                  // surface comes from ForceFX's reader; telemetry inference is the fallback
-            st.memCrossCheck = false;            // the reader is exact: a rough road the game calls tarmac (cobbles, a bridge) is still tarmac to it, so never throw the surface away because the suspension is busy
 
             const std::string dataDir = dir_ + "ForceFXAudio\\";
             CreateDirectoryA(dataDir.c_str(), nullptr);
@@ -245,6 +260,8 @@ private:
             s->bank->normalize = st.normalizeSounds;
             s->bank->load(sounds);
             log("Dynamic audio: " + std::to_string(s->bank->fileCount) + " sound files from " + sounds);
+            bool fromRbr = false;
+            if (const int made = wsnd::addWaterFallbacks(*s->bank, &fromRbr)) log("Dynamic audio: made " + std::to_string(made) + " of splash / water_loop / water_hit that the sounds folder does not have" + (fromRbr ? " (the splash is built from RBR's own water sound)" : " in code") + " (add your own water_*.wav to replace them)");
             log("Audio devices: " + WaveOutPlayer::describeDevices());
             for (const std::string& e : s->bank->errors) log("  sound problem: " + e);
 
@@ -256,7 +273,7 @@ private:
             s->sets.reset(new SoundSetMap(*s->bank, s->matTable, st));
             s->sink.reset(new MixerSink(*s->mixer, *s->bank, st, s->sets.get()));
             s->sink->setLiveLevels(liveDebris_.load(), liveImpacts_.load(), liveSusp_.load());
-            s->controller.reset(new SurfaceAudioController(st, *s->sink));
+            s->controller.reset(new AudioController(st, *s->sink));
             s->controller->setSurfaceMemory(&mem_);
             s->controller->materials().loadOverrides(dataDir + "materials.csv");
 
@@ -285,6 +302,7 @@ private:
                 setsText_ = std::to_string(s->sets->count()) + " sound sets from " + std::to_string(s->bank->fileCount) + " files";
                 s->sink->setLiveLevels(liveDebris_.load(), liveImpacts_.load(), liveSusp_.load());
                 s_ = std::move(s);
+                crashesLogged_ = 0;
             }
             if (!wantOn_.load()) { teardown(); state_ = Off; loading_ = false; return; }
             state_ = Running;
@@ -300,4 +318,4 @@ private:
     }
 };
 
-}  // namespace rsa
+}  // namespace ffx

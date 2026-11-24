@@ -1,4 +1,4 @@
-// waveOut output for the dynamic surface audio: 16-bit stereo, a small ring of buffers filled from the mixer on its own thread.
+// waveOut output for the dynamic audio: 16-bit stereo, a small ring of buffers filled from the mixer on its own thread.
 // Windows only. RBR is a 32-bit process, so this is built as Win32 (x86) with the rest of ForceFX.
 #pragma once
 #ifndef WIN32_LEAN_AND_MEAN
@@ -18,7 +18,7 @@
 
 #pragma comment(lib, "winmm.lib")
 
-namespace rsa {
+namespace ffx {
 
 // 16-bit stereo waveOut with a small ring of buffers filled from the mixer on its own thread.
 class WaveOutPlayer {
@@ -101,4 +101,4 @@ private:
     }
 };
 
-}  // namespace rsa
+}  // namespace ffx

@@ -17,7 +17,7 @@ struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back(
 #define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
 static bool near(float a, float b, float e = 1e-4f) { return std::fabs(a - b) <= e; }
 static void resetMap() { for (int i = 0; i < 256; ++i) Surf::IdMap()[i] = 0; }
-static int idOf(const char* name) { for (const rsa::MaterialInfo& m : rsa::kMaterials) if (std::string(m.name) == name) return m.id; return -1; }
+static int idOf(const char* name) { for (const ffx::MaterialInfo& m : ffx::kMaterials) if (std::string(m.name) == name) return m.id; return -1; }
 static Road::Ground gnd(const char* name) { Road::Ground g; const bool ok = Road::GroundOfId(idOf(name), g); CHECK(ok); return g; }
 static Surf::Feel feel(const char* name, float activity = 0.6f, float ridge = 0.0f) { Road::Drive d; d.activity = activity; d.ridge = ridge; return Road::Derive(gnd(name), d); }
 static bool finite(const Surf::Feel& f) {
@@ -29,7 +29,7 @@ static bool finite(const Surf::Feel& f) {
 // ---------------------------------------------------------------- ground from the material names
 TEST(every_ground_material_has_a_ground_and_objects_have_none) {
     int grounds = 0;
-    for (const rsa::MaterialInfo& m : rsa::kMaterials) {
+    for (const ffx::MaterialInfo& m : ffx::kMaterials) {
         Road::Ground g;
         const bool ok = Road::GroundOfId(m.id, g);
         if (m.cls >= 0) {
@@ -181,7 +181,7 @@ TEST(the_feel_changes_smoothly_between_two_grounds) {
     CHECK(near(Road::Derive(Road::Mix(a, b, 0.0f), d).hz, Road::Derive(a, d).hz) && near(Road::Derive(Road::Mix(a, b, 1.0f), d).hz, Road::Derive(b, d).hz));
 }
 TEST(every_ground_at_every_activity_and_ridge_gives_values_in_range) {
-    for (const rsa::MaterialInfo& m : rsa::kMaterials) {
+    for (const ffx::MaterialInfo& m : ffx::kMaterials) {
         Road::Ground g;
         if (!Road::GroundOfId(m.id, g)) continue;
         for (float act : {0.0f, 0.3f, 1.0f})
