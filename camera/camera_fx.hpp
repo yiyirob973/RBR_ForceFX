@@ -56,6 +56,7 @@
 #include <algorithm>
 #include "../thirdparty/minhook/include/MinHook.h"
 #include "../materials.hpp"
+#include "../telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
 #include "ws_logic.hpp"
 #include "ws_art.hpp"
 
@@ -90,7 +91,7 @@ struct Cfg {
     // [Limits]
     float maxPos = 0.025f, maxAng = 3.0f, maxRoll = 3.0f;
     // [Windscreen]  proof-of-concept overlay
-    int   wsRainSource = 1, wsProbe = 0, wsWetFromGame = 0, wsDrawAt = 1, wsDepthTest = 1, wsEnable = 0, wsMode = 3, wsDrops = 450, wsMud = 16, wsSignSway = 1, wsSignSurge = 1, wsToggleKey = 119,
+    int   wsRainSource = 1, wsWetFromGame = 0, wsDrawAt = 1, wsDepthTest = 1, wsEnable = 0, wsMode = 3, wsDrops = 450, wsMud = 16, wsSignSway = 1, wsSignSurge = 1, wsToggleKey = 119,
           wsWiperSource = 1, wsWiperAxis = 0, wsWiperAxisSign = 1, wsHideGameWipers = 0, wsWiperDraw = 0, wsMicro = 3500, wsPools = 0, wsHideGameFx = 1, wsRefraction = 1, wsSnowMax = 140, wsMudSmear = 1, wsWipers = 0, wsWiperAuto = 1, wsWiperDebug = 0, wsWiperSyncKey = 118, wsFly = 1, wsWiperBow = 1, wsWiperBlur = 1, wsGround = 1, wsWiperMeasure = 1, wsCarryOver = 1;
     float wsRainLight = 0.45f, wsRainHeavy = 1.0f, wsMudDry = 0.15f, wsMudDamp = 0.7f, wsMudWet = 1.0f, wsSpeedRef = 120.f, wsRainLevel = 0.7f, wsRoughRef = 0.25f, wsRain = 100.f, wsMudRate = 6.f, wsTrail = 3.f, wsGlassDist = 0.9f, wsDropSize = 1.0f, wsMudSize = 1.0f, wsOpacity = 1.0f, wsWind = 1.0f, wsGravity = 1.0f,
           wsWiperLenM = 0.5f, wsMicroRate = 380.f, wsVeil = 0.7f, wsPoolMinPx = 8.f, wsRefractK = 2.0f, wsRefractMinPx = 4.0f, wsSnowLight = 0.5f, wsSnowHeavy = 1.0f, wsSnowLevel = 0.f, wsSnowRate = 18.f, wsSnowMelt = 14.f, wsSnowSize = 1.0f, wsMudSnow = 0.6f,
@@ -191,7 +192,7 @@ std::vector<Opt> optTable(Cfg& c) {
         {"Windscreen", "RainLight", &c.wsRainLight, nullptr, 0, 1}, {"Windscreen", "RainHeavy", &c.wsRainHeavy, nullptr, 0, 1},
         {"Windscreen", "MudDry", &c.wsMudDry, nullptr, 0, 3}, {"Windscreen", "MudDamp", &c.wsMudDamp, nullptr, 0, 3}, {"Windscreen", "MudWet", &c.wsMudWet, nullptr, 0, 3},
         {"Windscreen", "RainLevel", &c.wsRainLevel, nullptr, 0, 1}, {"Windscreen", "SpeedRef", &c.wsSpeedRef, nullptr, 20, 300},
-        {"Windscreen", "RoughRef", &c.wsRoughRef, nullptr, 0.01f, 5}, {"Windscreen", "Probe", nullptr, &c.wsProbe, 0, 1},
+        {"Windscreen", "RoughRef", &c.wsRoughRef, nullptr, 0.01f, 5},
         {"Windscreen", "Rain", &c.wsRain, nullptr, 0, 100},      {"Windscreen", "MudRate", &c.wsMudRate, nullptr, 0, 60},
         {"Windscreen", "Trail", &c.wsTrail, nullptr, 0.5f, 30},
         {"Windscreen", "Drops", nullptr, &c.wsDrops, 0, 400},    {"Windscreen", "DropSize", &c.wsDropSize, nullptr, 0.2f, 4},
@@ -310,15 +311,14 @@ bool sane3(const float* v) {
 }
 
 // ================================================================================================ telemetry
-constexpr int kOffCarRoll = 76, kOffSteer = 24, kOffBrake = 32, kOffGear = 44, kOffSpeed = 60, kOffYawRate = 108;
-constexpr int kOffSusp = 152, kSuspStride = 128, kOffStrut = 16, kMinSuspPacket = 560;
-constexpr int kOffSurge = 112, kOffSway = 116, kOffHeave = 120, kMinPacket = 136;
+// Where the packet fields are: the plugin's one telemetry layout (the Offset* keys in [ForceFX]), handed over once at start (ffx::Camera::setLayout).
+Telem::Layout g_lay;
+constexpr int kMinSuspPacket = 560, kMinPacket = 136;
 
 struct Inputs {                                                       // written by processPacket(), read by the render thread
     std::atomic<float> surge{0}, sway{0}, heave{0}, heaveHp{0}, yawN{0}, steerN{0}, speed{0}, brake{0}, carRoll{0};
 } g_in;
 std::atomic<float>    g_pkSurge{0}, g_pkSway{0}, g_pkHeave{0}, g_pkYaw{0}, g_pkSteer{0}, g_pkCarRoll{0};
-char                  g_pktLast[1500]; std::atomic<int> g_pktLen{0};      // last telemetry packet (only kept when [Windscreen] Probe=1)
 std::atomic<float>    g_wsSplash{0};                                       // landing / impact strength handed to Windscreen (mud splatter)
 std::atomic<float>    g_wsWaterHit{0};                                     // a tyre hit standing water, 0..1: Windscreen throws a wash of water at the glass
 std::atomic<float>    g_evCrashSurge{0}, g_evCrashSway{0}, g_evLand{0};   // impact events (signed excess g / landing strength), consumed by the render thread
@@ -359,18 +359,17 @@ void processPacket(const char* buf, int n) {
     float& fyaw = P.fyaw; float& fsteer = P.fsteer; float& fcr = P.fcr; bool& first = P.first; int& lastGear = P.lastGear;
     double& tsec = P.tsec; float& loadEnv = P.loadEnv; float& lastCrashT = P.lastCrashT; float& airT0 = P.airT0;
     bool& airborne = P.airborne; bool& airDisabled = P.airDisabled; int& badAir = P.badAir;
-    if (g_cfg.wsProbe) { memcpy(g_pktLast, buf, (size_t)std::min(n, 1500)); g_pktLen = n; }
     LARGE_INTEGER qn; QueryPerformanceCounter(&qn);
     float dt = (float)(qn.QuadPart - qlast.QuadPart) / (float)qf.QuadPart; qlast = qn;
     if (!(dt > 0.0005f && dt < 0.25f)) dt = 0.01f;
     tsec += dt;
 
     const Cfg c = g_cfg;                                           // snapshot (config can be reloaded live)
-    const float su = clean(rdf(buf, kOffSurge)), sw = clean(rdf(buf, kOffSway)), he = clean(rdf(buf, kOffHeave));
-    const float yr = clean(rdf(buf, kOffYawRate)), st = clean(rdf(buf, kOffSteer));
-    const float spd = clean(rdf(buf, kOffSpeed)), brk = clamp01(clean(rdf(buf, kOffBrake)));
-    const int   gear = rdi(buf, kOffGear);
-    const float cr = clean(rdf(buf, kOffCarRoll));
+    const float su = clean(rdf(buf, g_lay.accSurge)), sw = clean(rdf(buf, g_lay.accSway)), he = clean(rdf(buf, g_lay.accHeave));
+    const float yr = clean(rdf(buf, g_lay.yawRate)), st = clean(rdf(buf, g_lay.steering));
+    const float spd = clean(rdf(buf, g_lay.speed)), brk = clamp01(clean(rdf(buf, g_lay.brake)));
+    const int   gear = rdi(buf, g_lay.gear);
+    const float cr = clean(rdf(buf, g_lay.carRoll));
 
     // ---- impact events: crashes (large horizontal acceleration) and jumps / landings (all struts unloaded, then loaded again)
     const bool settled = (GetTickCount() - g_stageStartTick.load()) > 3000;          // ignore the stage-start teleport spikes
@@ -386,7 +385,7 @@ void processPacket(const char* buf, int n) {
         }
         if (n >= kMinSuspPacket) {
             float ls = 0.f;
-            for (int i = 0; i < 4; ++i) ls += std::fabs(clean(rdf(buf, kOffSusp + i * kSuspStride + kOffStrut)));
+            for (int i = 0; i < 4; ++i) ls += std::fabs(clean(rdf(buf, g_lay.suspBase[i] + g_lay.strutForce)));
             loadEnv = std::max(ls, loadEnv * std::exp(-dt / 30.f));
             const float frac = ls / std::max(loadEnv, 1e-3f);
             g_loadFrac = frac;
@@ -923,7 +922,6 @@ float         g_wsSprayAcc = 0.f, g_wsRainAcc = 0.f, g_wsSnowAcc = 0.f, g_wsMudA
 std::atomic<long>  g_wsGameCalls{0};      // calls of the game's own wet-windscreen function (0x452020), counted per second in the log
 std::atomic<DWORD> g_wsGameTick{0};       // tick of the last such call
 float         g_wsRough = 0.f, g_wsLoose = 0.f, g_wsSpdN = 0.f, g_wsDbgRain = 0.f, g_wsDbgMud = 0.f;   // telemetry-derived factors (logged for calibration)
-uintptr_t     g_wsProbeA = 0;             // object passed to the game's wet-windscreen function (Probe=1 dumps / scans it)
 float         g_wsWet = 1.f;              // 0..1 rain rate scale; follows the game's wet-windscreen calls when [Windscreen] WetFromGame=1
 // the car's real wiper blades, found among the 3D draw calls by the hunter (see wsHuntReport) and turned into a pose every frame
 struct WsModelBlade { bool ok; float px, py, len, ang; wsl::Seg seg; };      // seg: the two ends of the rubber on the glass, in pixels            // pivot (fraction of width / height), length (fraction of height), angle (rad, 0 = right, CCW with y up)
@@ -2041,13 +2039,9 @@ bool wsDraw(IDirect3DDevice9* d) {
     return true;
 }
 
-// ---- Probe=1 ----
-// (1) Wiper-pose scanner: every frame it watches ~1700 floats (the object the game's wet-windscreen function gets, the car info block, the car physics
-// block) and every 6 s logs the ones that swing back and forth like a wiper angle: clean, regular reversals every 0.25-4 s. Run it on a rain stage
-// with the wipers going, then read the "WiperScan candidate" lines: offsets are bytes from the start of that block.
+// ---- wiper pose statistics ----
+// Tracks how a value swings back and forth (clean, regular reversals every 0.25-4 s are what a wiper blade does); the wiper hunter below uses it.
 struct WsScanStat { float minV, maxV, hi, lo, hiT, loT, lastRevT, sumHP, sumHP2; int dir, n; bool init, bad; };
-std::vector<WsScanStat> g_wsScan; float g_wsScanT0 = 0.f;
-constexpr int kScanObj = 256, kScanCar = 256, kScanMove = 1152;
 void wsScanUpdate(WsScanStat& s, float v, float t) {
     if (!std::isfinite(v) || std::fabs(v) > 1.0e6f) { s.bad = true; return; }
     if (!s.init) { s = WsScanStat{}; s.init = true; s.minV = s.maxV = s.hi = s.lo = v; s.hiT = s.loT = t; return; }
@@ -2065,73 +2059,6 @@ void wsScanUpdate(WsScanStat& s, float v, float t) {
         else if (v - s.lo > thr) { rev(s.loT); s.dir = 1; s.hi = v; s.hiT = t; }
     }
 }
-void wsScanReport() {
-    struct Cand { int idx; float cv, mean; };
-    std::vector<Cand> c;
-    for (int i = 0; i < (int)g_wsScan.size(); ++i) {
-        const WsScanStat& s = g_wsScan[i];
-        if (!s.init || s.bad || s.n < 4 || s.maxV - s.minV < 0.05f) continue;
-        const float mean = s.sumHP / (float)s.n, var = std::max(0.f, s.sumHP2 / (float)s.n - mean * mean);
-        if (mean < 0.25f || mean > 4.f) continue;
-        const float cv = std::sqrt(var) / mean;
-        if (cv < 0.35f) c.push_back({i, cv, mean});
-    }
-    std::sort(c.begin(), c.end(), [](const Cand& a, const Cand& b) { return a.cv < b.cv; });
-    Logf("WiperScan: %d candidate(s) in the last 6 s (an angle-like value with regular reversals; run it on a rain stage with the wipers going)", (int)c.size());
-    for (size_t k = 0; k < c.size() && k < 8; ++k) {
-        const int i = c[k].idx; const WsScanStat& s = g_wsScan[i];
-        const char* blk = i < kScanObj ? "wet-fx object" : i < kScanObj + kScanCar ? "car info" : "car physics";
-        const int off = (i < kScanObj ? i : i < kScanObj + kScanCar ? i - kScanObj : i - kScanObj - kScanCar) * 4;
-        Logf("WiperScan candidate: %s +0x%X  range %.4g..%.4g  half-period %.2fs  irregularity %.2f  reversals %d", blk, off, s.minV, s.maxV, c[k].mean, c[k].cv, s.n);
-    }
-    for (WsScanStat& s : g_wsScan) s = WsScanStat{};
-}
-void wsScan(void* obj) {
-    if (g_wsScan.empty()) g_wsScan.assign(kScanObj + kScanCar + kScanMove, WsScanStat{});
-    const float t = (float)GetTickCount() / 1000.f;
-    if (g_wsScanT0 == 0.f) g_wsScanT0 = t;
-    int base = 0;
-    auto region = [&](uintptr_t a, int n) {
-        if (a && readableRange(a, (size_t)n * 4)) for (int i = 0; i < n; ++i) { float v; memcpy(&v, (const void*)(a + (uintptr_t)i * 4), 4); wsScanUpdate(g_wsScan[base + i], v, t); }
-        base += n;
-    };
-    region((uintptr_t)obj, kScanObj);
-    region(absAddr(0x165FC68), kScanCar);
-    uintptr_t mv = 0; const uintptr_t pm = absAddr(0x8EF660);
-    if (readableRange(pm, 4)) mv = (uintptr_t) * (const uint32_t*)pm;
-    region(mv, kScanMove);
-    if (t - g_wsScanT0 > 6.f) { wsScanReport(); g_wsScanT0 = t; }
-}
-// (2) raw dumps of the last telemetry packet and the game's wet-windscreen object every ~2 s.
-void wsProbeLog() {
-    static int tick = 0; if ((++tick & 1) != 0) return;
-    char line[1100]; int len = 0;
-    auto flush = [&]() { if (len > 0) { Logf("%s", line); len = 0; } };
-    const int n = g_pktLen.load();
-    if (n >= 136) {
-        Logf("probe pkt: %d bytes; dword index (= byte offset / 4) = value, zeros skipped, iNNN = integer", n);
-        for (int i = 0; i < n / 4; ++i) {
-            float f; int iv; memcpy(&f, g_pktLast + i * 4, 4); memcpy(&iv, g_pktLast + i * 4, 4);
-            if (iv == 0) continue;
-            if (std::isfinite(f) && std::fabs(f) < 1.0e6f && std::fabs(f) > 1.0e-6f) len += snprintf(line + len, sizeof(line) - len, " %d=%.4g", i, f);
-            else len += snprintf(line + len, sizeof(line) - len, " %d=i%d", i, iv);
-            if (len > 900) flush();
-        }
-        flush();
-    }
-    if (g_wsProbeA && readableRange(g_wsProbeA, 0x100)) {
-        Logf("probe wet-windscreen object @%p (dword index = value):", (void*)g_wsProbeA);
-        const uint32_t* w = (const uint32_t*)g_wsProbeA;
-        for (int i = 0; i < 64; ++i) {
-            if (!w[i]) continue;
-            float f; memcpy(&f, &w[i], 4);
-            if (std::isfinite(f) && std::fabs(f) < 1.0e6f && std::fabs(f) > 1.0e-6f) len += snprintf(line + len, sizeof(line) - len, " %d=%.4g", i, f);
-            else len += snprintf(line + len, sizeof(line) - len, " %d=0x%X", i, (unsigned)w[i]);
-        }
-        flush();
-    }
-}
-
 // ---- wiper hunter ----
 // The car's wipers are an ordinary 3D model. Every draw call of the cockpit pass carries its matrix (MVP = P * V * M through shader constants 0-3), and
 // P^-1 * MVP is the object's placement in camera space. A wiper blade is the placement that swings back and forth with a regular rhythm: the steering
@@ -2150,7 +2077,7 @@ uint32_t wsSig(DWORD type, UINT a, UINT b, UINT c, UINT d, UINT e) {
     for (int i = 0; i < 6; ++i) { h ^= v[i]; h *= 16777619u; h ^= h >> 15; }
     return h;
 }
-inline bool wsHuntActive() { return g_in3D && g_wsArmed && !g_wsDrawing && ((g_cfg.wsWipers && g_cfg.wsWiperSource) || g_cfg.wsProbe); }
+inline bool wsHuntActive() { return g_in3D && g_wsArmed && !g_wsDrawing && (g_cfg.wsWipers && g_cfg.wsWiperSource); }
 float wsRotAngle(const float* Ra, const float* Rb) {                  // angle between two rotations: acos((tr(Ra^T Rb) - 1) / 2)
     float tr = 0.f; for (int i = 0; i < 9; ++i) tr += Ra[i] * Rb[i];
     return std::acos(std::max(-1.f, std::min(1.f, (tr - 1.f) * 0.5f)));
@@ -2172,7 +2099,7 @@ bool wsHuntDraw(uint32_t sig) {
     const uint64_t key = ((uint64_t)sig << 8) | (uint64_t)k;
     const bool l0 = g_wsLock[0].on && g_wsLock[0].key == key, l1 = g_wsLock[1].on && g_wsLock[1].key == key;
     g_wsDrawLock = l0 ? 0 : (l1 ? 1 : -1);
-    const bool hunting = !g_wsHuntLocked || g_cfg.wsProbe;
+    const bool hunting = !g_wsHuntLocked;
     if (!hunting && !l0 && !l1) return false;
     const M4 T = m4Mul(g_wsPinv, g_lastMvp);                           // V * M: the object's placement in camera space
     float v[12]; for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) v[r * 3 + c] = T.m[r][c];
@@ -2293,10 +2220,10 @@ void wsHuntReport() {
     }
 }
 void wsHuntTick() {                                                    // called once per drawn frame
-    if (!((g_cfg.wsWipers && g_cfg.wsWiperSource) || g_cfg.wsProbe)) return;
+    if (!(g_cfg.wsWipers && g_cfg.wsWiperSource)) return;
     const float t = (float)GetTickCount() / 1000.f;
     if (g_wsHuntT0 == 0.f) g_wsHuntT0 = t;
-    if (g_wsHuntLocked && !g_cfg.wsProbe) return;
+    if (g_wsHuntLocked) return;
     if (t - g_wsHuntT0 < 6.f) return;
     g_wsHuntT0 = t; wsHuntReport();
 }
@@ -2345,7 +2272,7 @@ HRESULT __stdcall hkCreateDevice(void* self, UINT adapter, UINT devType, HWND hw
             const bool r = MH_CreateHook(vt[16], (void*)&hkReset, (void**)&g_origReset) == MH_OK && MH_EnableHook(vt[16]) == MH_OK;
             g_wsHooked = c && r;
             Note("Windscreen: EndScene hook %s, Reset hook %s", c ? "OK" : "FAILED", r ? "OK" : "FAILED");
-            if (g_cfg.wsHideGameFx == 1 || g_cfg.wsWiperSource || g_cfg.wsHideGameWipers || g_cfg.wsProbe) {   // DrawPrimitive = 81, DrawIndexedPrimitive = 82, DrawPrimitiveUP = 83, DrawIndexedPrimitiveUP = 84
+            if (g_cfg.wsHideGameFx == 1 || g_cfg.wsWiperSource || g_cfg.wsHideGameWipers) {   // DrawPrimitive = 81, DrawIndexedPrimitive = 82, DrawPrimitiveUP = 83, DrawIndexedPrimitiveUP = 84
                 const bool h1 = MH_CreateHook(vt[81], (void*)&hkDrawPrim, (void**)&g_origDrawPrim) == MH_OK && MH_EnableHook(vt[81]) == MH_OK;
                 const bool h2 = MH_CreateHook(vt[82], (void*)&hkDrawIdxPrim, (void**)&g_origDrawIdxPrim) == MH_OK && MH_EnableHook(vt[82]) == MH_OK;
                 const bool h3 = MH_CreateHook(vt[83], (void*)&hkDrawPrimUP, (void**)&g_origDrawPrimUP) == MH_OK && MH_EnableHook(vt[83]) == MH_OK;
@@ -2389,8 +2316,7 @@ bool installD3DHooks() {
 using WindscreenFxFn = void(__fastcall*)(void* a);
 WindscreenFxFn g_origWindscreenFx = nullptr;
 void __fastcall hkWindscreenFx(void* a) {
-    g_wsGameCalls++; g_wsGameTick = GetTickCount(); g_wsProbeA = (uintptr_t)a;
-    if (g_cfg.wsProbe) wsScan(a);                                      // Probe=1: look for the wiper angle in the game's memory
+    g_wsGameCalls++; g_wsGameTick = GetTickCount();
     wsDrawFrom(2, g_wsDev);                                            // DrawAt=2: just before the game would draw its own wet overlay
     const bool hide = g_wsOn.load() && g_wsArmed && g_wsHooked && g_cfg.wsHideGameFx != 0;      // only while our own effect is what is on screen
     if (hide && g_cfg.wsHideGameFx == 2) { wsDrawFrom(1, g_wsDev); return; }                      // 2: the game's function does not run at all
@@ -2442,7 +2368,6 @@ void logStatus(DWORD now, uint32_t type, const Drive& d) {
              (int)g_wsDrops.size() - flakes - micro, micro, flakes, (int)g_wsMud.size(), g_wsVpW, g_wsVpH, g_wsStageId, g_wsGW.sky, wsSkyName(g_wsGW.sky), g_wsGW.wet, g_wsRainEff, g_wsSnowEff, g_wsMudMul,
              g_wsWiperW * 100.f, g_cfg.wsWiperSource, g_wsLock[0].on ? 1 : 0, g_wsLock[1].on ? 1 : 0, g_wsHiddenWipers.exchange(0), g_wsWiped.exchange(0), g_wsSpdN, g_wsRough, g_wsLoose, g_wsDbgRain, g_wsDbgMud, wsGridMax(g_wsFilm), wsGridMax(g_wsDirt), (int)g_wsFly.size(), g_wsBow[0], g_wsBow[1]);
     }
-    if (g_cfg.wsProbe) wsProbeLog();
     Logf("air=%d load=%.2f shake=%.2f", g_airborne.load() ? 1 : 0, g_loadFrac.load(), g_shake.amp);
     Logf("fps=%ld applies/s=%ld natcam/s=%ld type=%u base=%d en=%d | in S/W/H=%.2f/%.2f/%.2f bump=%.2f yawN=%.2f steerN=%.2f spd=%.0f brk=%.2f gear=%d | "
          "raw peak S/W/H=%.2f/%.2f/%.2f yaw=%.2f steer=%.2f | head mm F/R/U=%.1f/%.1f/%.1f ang pitch/yaw=%.2f/%.2f | pkt_age_ms=%u",
@@ -2614,6 +2539,8 @@ public:
     void feed(const uint8_t* data, int len) {
         if (g_ready && data && len > 0) processPacket((const char*)data, len);
     }
+    // Where the packet fields are (the plugin's one layout from [ForceFX]). Call before the first packet; it is not changed while the game runs.
+    void setLayout(const Telem::Layout& l) { g_lay = l; }
 
     // The stage is starting: forget the old head pose and the last stage's events.
     void stageStarted(int iMap, const char* player, bool) {

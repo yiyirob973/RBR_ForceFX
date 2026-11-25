@@ -10,7 +10,8 @@ Extra force feedback for Richard Burns Rally. ForceFX reads NGP telemetry and ad
 
 - **Engine:** vibration that follows rpm, throttle and the rev limit.
 - **Road:** vibration that follows the ground under each tyre, your speed, wheel slip and how rough the tyres measure.
-- **Braking:** front-end judder, harsher on lock-up.
+- **Braking:** front-end judder that grows with the pedal and the weight on the front tyres, a coarser scrub when the front wheels lock (its pitch follows the ground), and RBR's own steering force going light while they are locked. It rides on RBR's force like the road feel. Heavier steering in hard braking is available but off, since RBR already does that (`BrakeHeaviness`).
+- **Crashes:** when the car hits a tree, a rock or a wall, the wheel is yanked for a moment (RBR's own force, boosted). No effect of its own.
 - **Landings:** after a real jump, RBR's own steering force pulls harder for a moment. Bumps never trigger it.
 - **Water:** a thump and a tug when a tyre hits standing water, a rumble while you wade, heavier steering while the front tyres push through.
 - **Light steering under hard acceleration:** the steering loses force in proportion to the weight the front tyres lose (never more than 60%).
@@ -40,7 +41,8 @@ Everything is in `ForceFX.ini`, which describes each option, and the main ones a
 - **Total output** (`TotalMaxMagnitude`) caps all effects together. If the wheel feels too strong or busy, lower this first.
 - **Live level:** Numpad **+** and **-** turn everything down or up (never above the ini values), Numpad **\*** mutes. Keys are configurable.
 - **Car profiles** are in `ForceFXCars.ini`: engine and road strength per car, and `Drivetrain=RWD|FWD|AWD`. Cars without an entry count as RWD.
-- **Road feel delivery** (`RoadViaRbr`): by default the road vibration is added to RBR's own force. Set it to 0 to play it as a separate effect.
+- **How the road and brake feel reach the wheel:** they are added to RBR's own force, so the wheel gets no extra effect. Without RBR's force updates (menus, test mode) they play as effects of their own.
+- **Limits:** landing, water, light steering, brake lock-up and crash all scale RBR's force. Together they never go past `MaxForceMultiplier` (3 by default), and the multiplier cannot jump in one step.
 
 ## How the road feel works
 
@@ -92,7 +94,9 @@ When reporting a problem, attach `ForceFX.log` (beside the DLL), plus `ForceFXCa
 
 The version shown in the game and in `ForceFX.log` is the git tag the build was made from (the release workflow passes it to `build.bat` as `FORCEFX_VERSION`, for example `v0.7.0`). A plain `build.bat` run shows `dev`.
 
-Unit tests for the logic headers are in `tests` and `audio/tests`; each file has its build line at the top.
+Unit tests for the logic headers are in `tests` and `audio/tests`; each file has its build line at the top. The release workflow runs them (with g++) before it builds anything; `camera_packet_test` needs the Windows headers and runs only on a Windows machine.
+
+All telemetry field offsets are the `Offset*` keys in `[ForceFX]` of `ForceFX.ini` (`telemetry_layout.hpp`): the force feedback, the audio and the camera read the packet through the same table. `ForceFX.log` starts fresh each run; the previous one is kept as `ForceFX.old.log`.
 
 ## Credits
 

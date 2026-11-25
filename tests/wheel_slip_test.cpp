@@ -260,6 +260,47 @@ TEST(standing_still_is_not_a_dead_vector) {
     CHECK(g.fromVelocity() && v == 0.0);
 }
 
+// ---- the options the audio module needs from the shared ground-speed logic
+TEST(mode_velocity_always_takes_the_vector_even_when_it_looks_dead) {
+    Slip::GroundSpeed g; g.setMode(1); double v = 1;
+    for (int i = 0; i < 400; ++i) v = g.update(40.0, 0.0, 0.0, 0.0, 0.0, 0.01);
+    CHECK(g.fromVelocity() && v == 0.0);
+}
+TEST(mode_field_always_takes_the_speed_field_as_it_is) {
+    Slip::GroundSpeed g; g.setMode(2); double v = 0;
+    for (int i = 0; i < 100; ++i) v = g.update(40.0, 25.0, 0.0, 0.0, 0.0, 0.01);
+    CHECK(!g.fromVelocity() && v == 40.0);
+}
+TEST(a_bad_mode_is_auto) {
+    Slip::GroundSpeed g; g.setMode(9); double v = 0;
+    for (int i = 0; i < 100; ++i) v = g.update(40.0, 25.0, 0.0, 0.0, 0.0, 0.01);
+    CHECK(g.fromVelocity() && v == 25.0);
+}
+TEST(the_field_scale_is_learned_from_a_steady_roll_and_clamped) {
+    Slip::GroundSpeed g; double v = 0;
+    for (int i = 0; i < 3000; ++i) v = g.update(40.0, 25.0, 0.0, 0.0, 0.0, 0.01);       // field 1.6 x the vector
+    CHECK(std::fabs(g.drivenMs(40.0) - 25.0) < 0.3);
+    Slip::GroundSpeed h;
+    for (int i = 0; i < 3000; ++i) h.update(100.0, 20.0, 0.0, 0.0, 0.0, 0.01);          // 5x: clamped to 2.5
+    CHECK(std::fabs(h.drivenMs(100.0) - 40.0) < 0.5);
+    (void)v;
+}
+TEST(before_anything_is_learned_the_initial_scale_is_used) {
+    Slip::GroundSpeed g; g.setInitialFieldScale(2.0); g.update(40.0, 25.0, 0.0, 0.5, 0.0, 0.01);
+    CHECK(std::fabs(g.drivenMs(40.0) - 20.0) < 1e-9);
+    g.setInitialFieldScale(-1.0); CHECK(std::fabs(g.drivenMs(40.0) - 40.0 / 1.609) < 1e-9);   // a bad value falls back to the default
+}
+TEST(with_a_dead_vector_the_driven_speed_is_the_field_itself) {
+    Slip::GroundSpeed g;
+    for (int i = 0; i < 300; ++i) g.update(40.0, 0.0, 0.0, 0.0, 0.0, 0.01);
+    CHECK(!g.fromVelocity() && g.drivenMs(40.0) == 40.0);
+}
+TEST(a_dead_vector_after_a_learned_scale_gives_the_scaled_field) {
+    Slip::GroundSpeed g; for (int i = 0; i < 3000; ++i) g.update(40.0, 25.0, 0.0, 0.0, 0.0, 0.01);
+    double v = 0; for (int i = 0; i < 300; ++i) v = g.update(40.0, 0.0, 0.0, 0.0, 0.0, 0.01);
+    CHECK(!g.fromVelocity() && std::fabs(v - 25.0) < 0.3);
+}
+
 int main() {
     for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
     std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);

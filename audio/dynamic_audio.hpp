@@ -155,6 +155,13 @@ public:
         if (s_) applyCar(s_->settings);
     }
 
+    // Where the fields are in the packet: the plugin's one telemetry layout (from [ForceFX] of ForceFX.ini). Safe from any thread.
+    void setLayout(const Telem::Layout& l) {
+        std::lock_guard<std::mutex> lk(mu_);
+        layout_ = l;
+        if (s_) s_->settings.packet = l;
+    }
+
     State state() const { return state_.load(); }
 
     std::string status() {
@@ -187,7 +194,8 @@ private:
     std::string dir_;
     Hooks hooks_;
     ForceFXSurfaceMemory mem_;
-    std::mutex mu_;                             // guards s_ between the telemetry thread and the loader / menu
+    std::mutex mu_;                             // guards s_ and layout_ between the telemetry thread and the loader / menu
+    Telem::Layout layout_;                      // the plugin's packet layout (see setLayout)
     int crashesLogged_ = 0;                     // crashes already written to the log
     std::unique_ptr<Session> s_;
     std::thread loader_;
@@ -250,6 +258,7 @@ private:
             Settings& st = s->settings;
             const std::string ini = dir_ + "ForceFX.ini";
             if (!loadSettings(ini, st, "Audio")) log("Dynamic audio: no ForceFX.ini found, using defaults");
+            { std::lock_guard<std::mutex> lk(mu_); st.packet = layout_; }
             applyCar(st);
 
             const std::string dataDir = dir_ + "ForceFXAudio\\";

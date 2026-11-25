@@ -208,6 +208,59 @@ TEST(bad_input_never_makes_nan) {
     CHECK(AccelLight::Mul(r.t.Update(bad, 0.01f), nan) == 1.0f);
 }
 
+// ---- braking side of the same tracker: dive and heavy
+// A car that stood on the line (so "normal" is learned), then drives at 25 m/s and brakes at `decelG`, with the front share at `share`.
+struct BrakeRig {
+    AccelLight::Tracker t; float v = 0; Out last;
+    void stand(float share) { for (int i = 0; i < 100; ++i) { In in; in.frontShare = share; in.throttle = 0.1f; last = t.Update(in, 0.01f); } }
+    void drive(float share, float secs, float v0) { v = v0; for (int i = 0; i < (int)(secs * 100); ++i) { In in; in.frontShare = share; in.speed = v; in.throttle = 0.3f; in.accOk = true; in.accMag = 0.2f; last = t.Update(in, 0.01f); } }
+    void brake(float share, float decelG, float pedal, float secs) {
+        for (int i = 0; i < (int)(secs * 100); ++i) {
+            v = std::max(0.0f, v - decelG * 9.81f * 0.01f);
+            In in; in.frontShare = share; in.speed = v; in.brake = pedal; in.accOk = true; in.accMag = decelG * 9.81f; last = t.Update(in, 0.01f);
+        }
+    }
+};
+TEST(dive_follows_the_weight_moving_onto_the_front_while_braking) {
+    BrakeRig r; r.stand(0.50f); r.drive(0.50f, 2.0f, 25.0f);
+    CHECK(r.last.dive < 0.02f);
+    r.brake(0.58f, 0.8f, 1.0f, 1.0f);
+    CHECK(r.last.dive > 0.7f);                          // 8 points of share is most of the 10 that make 1.0
+    r.brake(0.62f, 0.8f, 1.0f, 0.5f);
+    CHECK(r.last.dive > 0.95f);
+}
+TEST(dive_needs_the_brake_pedal_and_is_zero_without_it) {
+    BrakeRig r; r.stand(0.50f); r.drive(0.50f, 2.0f, 25.0f);
+    r.brake(0.60f, 0.8f, 0.0f, 1.0f);                   // share high, pedal off (engine braking, a downhill)
+    CHECK(r.last.dive < 0.02f);
+}
+TEST(heavy_braking_needs_the_car_to_really_slow_down) {
+    BrakeRig a; a.stand(0.50f); a.drive(0.50f, 2.0f, 25.0f);
+    a.brake(0.60f, 0.02f, 1.0f, 1.5f);                  // pedal and weight, but the speed hardly changes (a short tap)
+    CHECK(a.last.dive > 0.8f); CHECK(a.last.heavy < 0.05f);
+    BrakeRig b; b.stand(0.50f); b.drive(0.50f, 2.0f, 25.0f);
+    b.brake(0.60f, 0.8f, 1.0f, 1.5f);
+    CHECK(b.last.heavy > 0.8f);
+}
+TEST(braking_never_teaches_the_normal_share) {
+    BrakeRig r; r.stand(0.50f); r.drive(0.50f, 2.0f, 25.0f);
+    r.brake(0.62f, 0.8f, 1.0f, 3.0f);
+    CHECK(std::fabs(r.last.base - 0.50f) < 0.01f);
+}
+TEST(dive_is_zero_before_the_normal_is_known_and_in_the_air) {
+    AccelLight::Tracker t; Out o;
+    for (int i = 0; i < 20; ++i) { In in; in.frontShare = 0.7f; in.speed = 20.0f; in.brake = 1.0f; in.throttle = 0.8f; o = t.Update(in, 0.01f); }
+    CHECK(o.dive == 0.0f && o.heavy == 0.0f);
+    BrakeRig r; r.stand(0.50f); r.drive(0.50f, 2.0f, 25.0f);
+    for (int i = 0; i < 100; ++i) { In in; in.frontShare = 0.62f; in.speed = 10.0f; in.brake = 1.0f; in.airborne = 1.0f; in.accOk = true; in.accMag = 8.0f; r.last = r.t.Update(in, 0.01f); }
+    CHECK(r.last.heavy < 0.01f);
+}
+TEST(dive_and_heavy_survive_bad_input) {
+    AccelLight::Tracker t; Out o;
+    for (int i = 0; i < 50; ++i) { In in; in.frontShare = i % 2 ? std::numeric_limits<float>::quiet_NaN() : 0.6f; in.speed = i % 3 ? 20.0f : std::numeric_limits<float>::infinity(); in.brake = 1.0f; o = t.Update(in, i % 5 ? 0.01f : std::numeric_limits<float>::quiet_NaN()); }
+    CHECK(std::isfinite(o.dive) && std::isfinite(o.heavy) && o.dive >= 0.0f && o.dive <= 1.0f && o.heavy >= 0.0f && o.heavy <= 1.0f);
+}
+
 int main() {
     for (const Reg& r : regs()) { const int before = g_fail; r.fn(); std::printf("%s %s\n", g_fail == before ? "ok  " : "FAIL", r.name); }
     std::printf("\n%d tests, %d checks, %d failures\n", (int)regs().size(), g_checks, g_fail);

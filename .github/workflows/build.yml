@@ -3,13 +3,35 @@ name: Build and release ForceFX
 on:
   push:
     branches:
-      - main
+      - dev
     tags:
       - 'v*'       # runs when you push a tag like v1.0.0
   workflow_dispatch: # lets you run it by hand from the Actions tab
 
 jobs:
+  # The portable logic (road, tyres, landing, brake, force scaling, audio logic, ...) is tested with g++ before anything is built or released.
+  # camera_packet_test needs the Windows headers, so it is left out here.
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build and run the unit tests
+        shell: bash
+        run: |
+          mkdir -p out_t
+          fail=0
+          for f in tests/*_test.cpp audio/tests/*_test.cpp; do
+            n=$(basename "$f" .cpp)
+            [ "$n" = "camera_packet_test" ] && continue
+            if ! g++ -std=c++17 -O1 -Wall -I. -Iaudio -Itests -o "out_t/$n" "$f"; then echo "::error::$n does not build"; fail=1; continue; fi
+            if ! "./out_t/$n"; then echo "::error::$n failed"; fail=1; fi
+          done
+          exit $fail
+
   build-and-release:
+    needs: tests
     runs-on: windows-latest
     permissions:
       contents: write # needed to create the release and upload the zips

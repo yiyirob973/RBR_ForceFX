@@ -1,3 +1,4 @@
+// FRONT LOAD TRACKER, shared by light steering (acceleration) and the brake feel (dive and heavy braking).
 // Light steering under hard acceleration: the weight moves to the rear, the front tyres have less load to push against, and the steering force falls
 // with the load on the front axle. This scales RBR's own steering force down in proportion to how much front load the telemetry says has gone, only
 // while the telemetry says the car is accelerating forward, and never adds a force of its own. Pure logic, no Windows or game access, tested in
@@ -24,6 +25,10 @@
 //     noisy speed telemetry.
 //   - The share is smoothed over about 0.07 s so a bump does not flicker the steering, and the drop fades in over about the same and out over
 //     a quarter of a second, so it never snaps. A few percent of drop is ignored (noise in the strut forces).
+//   - The other direction is the same measurement the other way up: braking puts weight on the front. `dive` is how far the front share is above
+//     normal while the brake is pressed (0.10 of share = 1.0), and `heavy` is the same, only while the car is really slowing down (judged from the
+//     ground speed like the acceleration gate), which is what makes the steering heavier. The brake feel reads these, so there is one learner of the
+//     front load in the plugin.
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -56,6 +61,8 @@ struct Out {
     float accelG = 0.0f;       // the car's forward acceleration from the ground speed, in g, smoothed (negative when braking)
     float gate = 0.0f;         // 0..1: how far the acceleration lets the effect through
     float rawDrop = 0.0f;      // the same as measured right now: not smoothed, no dead band (0.2 = the front carries 20% less than normal). For the log
+    float dive = 0.0f;         // 0..1: weight moving onto the front while the brake is pressed (0.10 of share above normal = 1), smoothed over about 0.1 s
+    float heavy = 0.0f;        // 0..1: the same, only while the ground speed says the car is really slowing down (from 0.06 g, fully from 0.22 g)
 };
 
 class Tracker {
@@ -115,12 +122,18 @@ public:
         drop_ += (target - drop_) * alphaFor(dt, target > drop_ ? 0.07f : 0.25f - 0.20f * air);   // in the air it lets go quickly
         if (!(drop_ > 0.0f)) drop_ = 0.0f;
         o.drop = drop_;
+
+        // Braking: the share rising above normal while the brake is pressed. Measured against the raw share, as the weight really moves.
+        const float diveT = (o.learned && base_ > 0.05f && brk > 0.1f) ? c01((share - base_) / 0.10f) : 0.0f;
+        dive_ += (diveT - dive_) * alphaFor(dt, 0.1f);
+        o.dive = dive_;
+        o.heavy = dive_ * smooth01(0.06f, 0.22f, -accG_) * (1.0f - air);
         return o;
     }
 
 private:
     bool haveShare_ = false, haveBase_ = false, haveRest_ = false, haveSpeed_ = false;
-    float sm_ = 0.5f, base_ = 0.5f, restT_ = 0.0f, steadyT_ = 0.0f, drop_ = 0.0f, vPrev_ = 0.0f, accG_ = 0.0f;
+    float sm_ = 0.5f, base_ = 0.5f, restT_ = 0.0f, steadyT_ = 0.0f, drop_ = 0.0f, dive_ = 0.0f, vPrev_ = 0.0f, accG_ = 0.0f;
 };
 
 // RBR's force times this (<= 1). `gain` is the setting: 0 = off, 1 = in proportion to the front load lost, at most 2; never more than kMaxCut off.

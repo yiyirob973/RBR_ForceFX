@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include "../materials.hpp"
+#include "../telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
 #include "../wheel_slip.hpp"   // wheel slip from the segment counter (shared with the road feel)
 #include "../tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slide (shared with the road feel)
 #include "crash.hpp"             // crashes (trees, rocks, walls) from the body acceleration
@@ -50,26 +51,9 @@ private:
 };
 
 // -------------------------------------------------------------------- settings
-// Byte offsets of the NGP packet fields, as laid out in NGP 7.4.778 (rbr.telemetry.data.TelemetryData.h).
-// "Packet.<Name> = <offset>" in the [Audio] section of ForceFX.ini overrides one if a future NGP changes the layout.
-struct PacketLayout {
-    int minLength = 664;
-    int steps = 0;                                    // totalSteps_: NGP's own step counter, a clean clock for the wheel counters (-1 = not there)
-    int steering = 24, throttle = 28, brake = 32, handbrake = 36, gear = 44;
-    int speed = 60, velSurge = 88, velSway = 92, velHeave = 96, yawRate = 108;
-    int accSurge = 112, accSway = 116, accHeave = 120;
-    int suspBase[4] = {152, 280, 408, 536};   // LF, RF, LB, RB
-    int springDeflection = 0, rollbarForce = 4, springForce = 8, damperForce = 12, strutForce = 16;
-    int pistonVelocity = 28, brakeDiskTemp = 36, tirePressure = 44, tireTemp = 48, tireTreadTemp = 56, currentSegment = 60;
-    int neededLength() const {
-        int m = std::max({steps, steering, throttle, brake, handbrake, gear, speed, velSurge, velSway, velHeave, yawRate,
-                          accSurge, accSway, accHeave});
-        int inBlock = std::max({springDeflection, rollbarForce, springForce, damperForce, strutForce, pistonVelocity,
-                                brakeDiskTemp, tirePressure, tireTemp, tireTreadTemp, currentSegment});
-        for (int b : suspBase) m = std::max(m, b + inBlock);
-        return std::max(minLength, m + 4);
-    }
-};
+// Where the NGP packet fields are: the same table the force feedback and the camera use (telemetry_layout.hpp). The plugin hands it over from the
+// Offset* keys in [ForceFX] of ForceFX.ini, so a future NGP that moves a field is fixed in one place.
+using PacketLayout = Telem::Layout;
 
 struct Settings {
     std::string soundsFolder;          // blank = "<plugin folder>\ForceFXAudio\sounds"
@@ -186,25 +170,6 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "CrashLevel") s.crashLevel = clampd(d(), 0.0, 6.0);
     else if (key == "DebugLog") s.debugLog = toBool(v);
     else if (key == "StartupBeep") s.startupBeep = toBool(v);
-    else if (key.compare(0, 7, "Packet.") == 0) {
-        PacketLayout& p = s.packet;
-        std::string k = key.substr(7);
-        int val = (int)std::strtol(v.c_str(), nullptr, 0);
-        if (k == "MinLength") p.minLength = val; else if (k == "Steering") p.steering = val;
-        else if (k == "Throttle") p.throttle = val; else if (k == "Brake") p.brake = val;
-        else if (k == "Handbrake") p.handbrake = val; else if (k == "Gear") p.gear = val;
-        else if (k == "Speed") p.speed = val; else if (k == "VelSurge") p.velSurge = val;
-        else if (k == "VelSway") p.velSway = val; else if (k == "VelHeave") p.velHeave = val;
-        else if (k == "YawRate") p.yawRate = val; else if (k == "AccSurge") p.accSurge = val;
-        else if (k == "AccSway") p.accSway = val; else if (k == "AccHeave") p.accHeave = val;
-        else if (k == "SpringDeflection") p.springDeflection = val; else if (k == "RollbarForce") p.rollbarForce = val;
-        else if (k == "SpringForce") p.springForce = val; else if (k == "DamperForce") p.damperForce = val;
-        else if (k == "StrutForce") p.strutForce = val; else if (k == "PistonVelocity") p.pistonVelocity = val;
-        else if (k == "BrakeDiskTemp") p.brakeDiskTemp = val; else if (k == "TirePressure") p.tirePressure = val;
-        else if (k == "TireTemp") p.tireTemp = val; else if (k == "TireTreadTemp") p.tireTreadTemp = val;
-        else if (k == "CurrentSegment") p.currentSegment = val;
-        else if (k == "SuspBase") { auto q = split(v, ','); for (size_t i = 0; i < q.size() && i < 4; ++i) p.suspBase[i] = (int)std::strtol(q[i].c_str(), nullptr, 0); }
-    }
 }
 
 // Reads key = value lines. With a section name, only that [section] is read (ForceFX.ini holds several); with an empty
@@ -256,7 +221,7 @@ struct TelemetryFrame {
 // Offsets come from PacketLayout so a changed NGP layout can be handled from the ini.
 inline bool parsePacket(const uint8_t* d, size_t length, double time, TelemetryFrame& f,
                         const PacketLayout& L = PacketLayout()) {
-    if (!d || length < (size_t)L.neededLength()) return false;
+    if (!d || length < (size_t)L.NeededLength()) return false;
     auto F = [&](int o) { float v; std::memcpy(&v, d + o, 4); return std::isfinite(v) ? v : 0.0f; };
     auto U = [&](int o) { uint32_t v; std::memcpy(&v, d + o, 4); return v; };
     f.time = time;
@@ -498,23 +463,21 @@ public:
     static double slipGate(double throttle, double brake, double speedMs) {
         return (1.0 - smoothstep((brake - 0.05) / 0.2)) * (1.0 - smoothstep((throttle - 0.45) / 0.3)) * (speedMs > 5.0 ? 1.0 : 0.0);
     }
-    double velDead_ = 0; Ema fieldScale_{4.0};
+    Slip::GroundSpeed gspeed_;                // the shared ground-speed logic (wheel_slip.hpp), the same one the force feedback uses
     int falseAirborneResets = 0;   // times the 1.5 s airborne safety net fired (shown in the debug log)
 
     void update(const TelemetryFrame& f, double dt) {
         fieldMs = f.speed * (s_.speedIsKph ? (1.0 / 3.6) : 0.44704);
-        double velMag = std::sqrt((double)f.velSurge * f.velSurge + (double)f.velSway * f.velSway) * s_.velocityScale;
         // A vector that stays at zero while the car is clearly rolling (steady, no pedals) is a dead channel: fall back to the field.
-        if (fieldMs > 8.0 && f.throttle < 0.1f && f.brake < 0.1f) { if (velMag < 0.5) velDead_ += dt; else velDead_ = 0.0; }
-        else if (velMag > 2.0) velDead_ = 0.0;
-        groundFromVelocity = s_.groundSource == 1 || (s_.groundSource == 0 && velDead_ < 2.0);
-        speedMs = groundFromVelocity ? velMag : fieldMs;
+        gspeed_.setMode(s_.groundSource); gspeed_.setInitialFieldScale(s_.speedFieldScale);
+        speedMs = gspeed_.update(fieldMs, (double)f.velSurge * s_.velocityScale, (double)f.velSway * s_.velocityScale, f.throttle, f.brake, dt);
+        groundFromVelocity = gspeed_.fromVelocity();
+        if (!groundFromVelocity && speedMs <= 0.0) speedMs = fieldMs;   // nothing to compare the field with yet: the audio uses it as it is
         justLanded = false;
         bool coasting = f.throttle < 0.12f && f.brake < 0.03f && f.handbrake < 0.03f &&
                         std::fabs(f.accSway * dynamics.accelScale(s_)) < s_.coastAccelLimit &&
                         std::fabs(f.accSurge * dynamics.accelScale(s_)) < s_.coastAccelLimit && speedMs > 8.0;
-        if (groundFromVelocity && coasting && speedMs > 8.0) fieldScale_.update(clampd(fieldMs / speedMs, 1.0, 2.5), dt);
-        drivenMs = groundFromVelocity ? fieldMs / (fieldScale_.hasValue() ? fieldScale_.value() : s_.speedFieldScale) : fieldMs;
+        drivenMs = gspeed_.drivenMs(fieldMs);
         const Slip::Timebase::Stamp stamp = timebase_.stamp(f.steps, f.haveSteps, f.time);
         dynamics.update(f, dt, speedMs, s_, groundFromVelocity);   // first: each tyre's own ground speed is what its spin is compared with
         double total = 0, raw[4];
@@ -909,7 +872,7 @@ public:
     bool usingMemory() const { return mem_ && mem_->configured() && health_.usable(); }
 
     std::string surfaceSourceText() const {
-        if (!telemetry_.ok()) return "Telemetry: packet layout looks wrong (values out of range), so the audio is silent. Check the Packet.* offsets in [Audio] of ForceFX.ini.";
+        if (!telemetry_.ok()) return "Telemetry: packet layout looks wrong (values out of range), so the audio is silent. Check the Offset* keys in [ForceFX] of ForceFX.ini.";
         if (!mem_ || !mem_->configured()) return "Surface source: telemetry inference (tyre reader: " + (mem_ ? mem_->statusText() : std::string("no reader")) + ")";
         if (health_.usable()) return "Surface source: tyre reader (" + mem_->statusText() + ")";
         return std::string("Surface source: telemetry inference (tyre reader ") + health_.text() + "; " + mem_->statusText() + ")";
