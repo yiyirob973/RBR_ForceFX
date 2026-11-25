@@ -98,6 +98,8 @@
 #include "tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slides (shared with the audio module)
 #include "water_fx.hpp"     // splash, wading and heavy steering when the tyres are in standing water
 #include "accel_light.hpp"  // the shared front-load tracker: lighter steering under acceleration, dive and heavy braking
+#include "surface_model.hpp"       // what the plugin knows about the ground under a tyre: one form for the road feel and the audio
+#include "wet_surface.hpp"        // what damp and wet ground do to the tyre sounds
 #include "telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
 #include "brake_fx.hpp"     // brake judder, lock-up lightening, heavy braking
 #include "force_scale.hpp"  // combines the scalings of RBR's force and keeps them in bounds
@@ -208,6 +210,7 @@ struct Config {
     int   fxAudio = 0;               // dynamic audio (settings in the [Audio] section of ForceFX.ini); off until switched on
     float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in [Audio] of ForceFX.ini)
     float audioImpact = 1.0f;        // 0..4 live multiplier on impacts and landings (on top of EventLevel)
+    float audioWet = 1.0f;           // 0..2 live multiplier on how much damp and wet ground changes the tyre sounds (on top of the Wet* settings in [Audio])
     float audioSusp = 1.0f;          // 0..4 live multiplier on suspension creaks and bottoming out (on top of SqueakLevel / BottomOutLevel)
     int   fxCamera = 0;              // head movement in the cockpit camera (settings in the [Camera...] sections of ForceFX.ini)
     int   fxWindscreen = 0;          // rain, snow and mud on the windscreen; off by default. Its hooks are installed at startup, so switching it on needs a restart
@@ -313,7 +316,7 @@ void ClampConfig(Config& c) {
     c.crashBoost = clampf(c.crashBoost, 0.0f, 3.0f); c.crashAdd = clampf(c.crashAdd, 0.0f, 1.0f);
     c.maxForceMul = ForceScale::Cap(c.maxForceMul);
     c.fxAudio = c.fxAudio ? 1 : 0;
-    c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f);
+    c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f); c.audioWet = clampf(c.audioWet, 0.0f, 2.0f);
     c.fxCamera = c.fxCamera ? 1 : 0; c.fxWindscreen = c.fxWindscreen ? 1 : 0;
     c.fxWater = c.fxWater ? 1 : 0; c.waterGain = clampf(c.waterGain, 0.0f, 2.0f); c.waterHeavy = clampf(c.waterHeavy, 0.0f, 2.0f);
     c.fxAccelLight = c.fxAccelLight ? 1 : 0; c.accelLight = clampf(c.accelLight, 0.0f, 2.0f);
@@ -365,7 +368,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     I("OffsetGear", c.offGear); I("OffsetCarRoll", c.offCarRoll); I("OffsetVelHeave", c.offVelHeave);
     I("EnableWater", c.fxWater); F("WaterGain", c.waterGain); F("WaterHeaviness", c.waterHeavy);
     I("EnableAccelLight", c.fxAccelLight); F("AccelLightness", c.accelLight);
-    I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp);
+    I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp); F("AudioWetLevel", c.audioWet);
     I("EnableCamera", c.fxCamera); I("EnableWindscreen", c.fxWindscreen);
     I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
@@ -2389,6 +2392,26 @@ bool Ids(int out[4]) {
     return true;
 }
 bool Found() { return g_reader && g_reader->nTyres.load() >= 4; }
+// What the reader decided about each tyre, in the form the audio takes: the same class, wetness and ground the road feel works with
+// (Map= corrections, materials.csv overrides, cobbles and planks included). False until the reader knows a class for at least one tyre.
+bool Tyres(SurfaceModel::Tyre out[4]) {
+    if (!g_reader) return false;
+    bool any = false;
+    for (int w = 0; w < 4; ++w) {
+        SurfaceModel::Tyre& t = out[w];
+        t = SurfaceModel::Tyre();
+        const int id = CurrentId(w), cls = Current(w);
+        t.id = id;
+        if (cls == C_NONE || id < 0) continue;
+        t.audioClass = SurfaceModel::AudioClassOf(cls);
+        t.wet = Road::WetOfId(id);
+        const Road::Ground g = Road::GroundForTyre(id, cls);
+        t.loose = g.loose;
+        t.ridged = g.ridged > 0.5f;
+        any = true;
+    }
+    return any;
+}
 
 }  // namespace Surf
 
@@ -2709,6 +2732,7 @@ private:
 
         m_audio.setActive(base.fxAudio != 0);
         m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
+        m_audio.setWetLevel(base.audioWet);
         while (m_run) {
             // Wait for a packet from either source (or 20 ms), then handle everything that has arrived.
             if (nWait) {
@@ -2745,6 +2769,7 @@ private:
                 m_audio.setCar(eff.drivetrain, eff.wheelbase, eff.cgToFront, eff.trackWidth);
                 m_audio.setActive(base.fxAudio != 0);
                 m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
+                m_audio.setWetLevel(base.audioWet);
             }
             {   // telemetry cobble detection: copy its state for the Diagnostics page and log when it switches on and off
                 m_cobScore = synth.cob.score; m_cobLevel = synth.cob.ema;
@@ -2925,6 +2950,7 @@ private:
             {"Audio: debris level",              "AudioDebrisLevel",   nullptr, &Config::audioDebris, 0.0f,   4.0f, 0.1f,  'x', false},
             {"Audio: impact / landing level",    "AudioImpactLevel",   nullptr, &Config::audioImpact, 0.0f,   4.0f, 0.1f,  'x', false},
             {"Audio: suspension level",          "AudioSuspensionLevel", nullptr, &Config::audioSusp, 0.0f,   4.0f, 0.1f,  'x', false},
+            {"Audio: wet ground level",          "AudioWetLevel",      nullptr, &Config::audioWet,     0.0f,   2.0f, 0.1f,  'x', false},
             {"Camera movement",                  "EnableCamera",       &Config::fxCamera,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Windscreen effects (restart)",     "EnableWindscreen",   &Config::fxWindscreen, nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             // effect switches (turn effects off to feel the others on their own)
@@ -3046,6 +3072,7 @@ private:
             {"EnableBrake",        "Turns the brake feel on or off: the braking judder, the scrub when the front wheels lock, and the steering going light when they do. It rides on RBR's own force like the road feel."},
             {"LockLightness",      "How much RBR's steering force drops while the front tyres are locked: they have stopped gripping, so the wheel goes light. x1.00 takes half of it away when both are fully locked. 0 = off."},
             {"BrakeHeaviness",     "Extra weight in the steering under hard braking, from the front load the telemetry measures. RBR already makes it heavier, so this is 0 (off) unless you want more."},
+            {"AudioWetLevel",      "How much damp and wet ground changes the tyre sounds: duller, quieter loose-ground loops and a spray hiss that grows with speed, made from the dry loops unless you have real wet recordings (gravel_wet_loop.wav, ...). 0 = off, 1 = the Wet* settings in ForceFX.ini, 2 = twice as much."},
             {"EnableCrash",        "Turns the crash jolt on or off: when the car hits a tree, a rock or a wall, the wheel is yanked for a moment (RBR's own force, boosted)."},
             {"CrashBoost",         "How hard the wheel is yanked in a full-strength crash, as a multiple of RBR's own force (80% = 1.8x). Never more than the overall limit (MaxForceMultiplier in ForceFX.ini)."},
             {"CrashMinPush",       "The least extra push of a full-strength crash, a share of full torque, so a hit is felt even when RBR's force is nearly zero."},
@@ -3160,6 +3187,13 @@ public:
         if (!exists) SyncConfig(m_cfg, m_iniPath, true);     // first run: write an ini with every key and its default
         SyncConfig(m_cfg, m_iniPath, false);
         m_userGain = m_cfg.userGain;
+        {   // the same materials.csv that corrects the audio's table corrects the road feel and the tyre reader (before the reader starts, so Map= still wins)
+            ffx::MaterialTable base, ovr;
+            if (ovr.loadOverrides(g_dir + "ForceFXAudio\\materials.csv")) {
+                const int n = Road::ApplyMaterialOverrides(base, ovr);
+                if (n) Logf("Surface: %d material id(s) corrected by ForceFXAudio\\materials.csv, for the road feel as well as the audio", n);
+            }
+        }
         Surf::Start(m_iniPath);               // reads which ground is under the tyres
         Logf("Version: %s", VersionText().c_str());
         Logf("Build: with dynamic audio module");
@@ -3168,6 +3202,7 @@ public:
             h.readIds = [](int ids[4]) { return Surf::Ids(ids); };
             h.idsAvailable = []() { return Surf::Found(); };
             h.idsStatus = []() { return Surf::Status(); };
+            h.readSurface = [](SurfaceModel::Tyre out[4]) { return Surf::Tyres(out); };   // the audio gets what the road feel gets
             h.log = [](const std::string& s) { Logf("%s", s.c_str()); };
             m_audio.setLayout(LayoutFromConfig(m_cfg));
             m_audio.configure(g_dir, h);

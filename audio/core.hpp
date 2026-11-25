@@ -11,9 +11,12 @@
 #include <string>
 #include <vector>
 #include "../materials.hpp"
+#include "../surface_model.hpp"    // what the plugin knows about the ground under a tyre, shared with the road feel
+#include "../wet_surface.hpp"      // what damp and wet ground do to the tyre sounds
 #include "../telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
 #include "../wheel_slip.hpp"   // wheel slip from the segment counter (shared with the road feel)
 #include "../tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slide (shared with the road feel)
+#include <atomic>
 #include "crash.hpp"             // crashes (trees, rocks, walls) from the body acceleration
 
 namespace ffx {
@@ -66,6 +69,8 @@ struct Settings {
     double stoneLevel = 2.0;           // stones and debris thrown at the car (separate from impacts: they are quick, light sounds that need more gain)
     double loopBoost = 2.0;            // extra rolling-noise gain at full slip / very rough ground (0 = flat level)
     double loopLevel = 0.25, squealLevel = 0.5, slideLevel = 0.5;   // mix levels per tyre (each of 4 tyres has its own)
+    // Damp and wet ground (wet_surface.hpp): the dry loops get duller and quieter and a spray hiss is added, unless a real wet recording is used.
+    bool wetTreatment = true; double wetTone = 0.6, wetCrunch = 0.3, wetHiss = 0.5, wetStones = 0.4;
     // Where the squeal and the slide begin, in units of the tyre's grip limit (1 = the limit, from PeakSlipRatio / PeakSlipAngleDeg).
     // Squeal is wheelspin: a driven tyre turning faster than the ground under power. A slide is a tyre moving the wrong way:
     // sideways, or locked under braking. Any tyre can slide; only the driven ones can spin.
@@ -127,6 +132,11 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "TotalGain") s.totalGain = (float)clampd(d(), 0.0, 8.0);
     else if (key == "NormalizeSounds") s.normalizeSounds = toBool(v);
     else if (key == "LoopLevel") s.loopLevel = d();
+    else if (key == "WetTreatment") s.wetTreatment = toBool(v);
+    else if (key == "WetTone") s.wetTone = clampd(d(), 0.0, 1.0);
+    else if (key == "WetCrunch") s.wetCrunch = clampd(d(), 0.0, 1.0);
+    else if (key == "WetHiss") s.wetHiss = clampd(d(), 0.0, 1.0);
+    else if (key == "WetStones") s.wetStones = clampd(d(), 0.0, 1.0);
     else if (key == "EventLevel") s.eventLevel = clampd(d(), 0.0, 4.0);
     else if (key == "StoneLevel") s.stoneLevel = clampd(d(), 0.0, 6.0);
     else if (key == "RumbleLevel") s.rumbleLevel = clampd(d(), 0.0, 4.0);
@@ -452,6 +462,8 @@ public:
     bool memValid[4] = {false, false, false, false};
     int memClass[4] = {0, 0, 0, 0}, memWet[4] = {0, 0, 0, 0};
     double memLoose[4] = {-1, -1, -1, -1};   // how much loose material the game says is under each tyre (-1 = not known)
+    bool memClassFirst[4] = {false, false, false, false};   // the reader's class (a Map= or materials.csv correction, cobbles) overrides the material's own sound set
+    double wetLevel = 1.0;                   // the live multiplier on the wet treatment from the menu
     double speedMs = 0, landingAirTime = 0;   // speedMs = true ground speed
     double fieldMs = 0, drivenMs = 0;         // the Speed field (speedometer) and the driven-wheel road speed derived from it
     bool groundFromVelocity = true;
@@ -533,6 +545,9 @@ class ISurfaceMemory {
 public:
     virtual ~ISurfaceMemory() {}
     virtual bool readMaterials(int ids[4]) = 0;      // false = nothing usable this frame
+    // What the plugin's tyre reader decided about each tyre (class, wetness, looseness): the same information the road feel uses. False = not
+    // available, and the controller works it out from the ids with its own table, as it did before.
+    virtual bool readSurface(SurfaceModel::Tyre out[4]) { (void)out; return false; }
     virtual bool configured() const = 0;             // false until the reader has found the tyres
     virtual std::string statusText() const = 0;
 };
@@ -576,7 +591,7 @@ private:
 };
 
 // ------------------------------------------------------------------ audio sink
-enum class SoundEvent { StoneHit, Impact, Landing, SuspSqueak, SuspBottom, Splash, CrashLight, CrashMedium, CrashHeavy, CrashMetal, CrashCrumple, CrashBranch, CrashGlass };
+enum class SoundEvent { StoneHit, Impact, Landing, SuspSqueak, SuspBottom, Splash, CrashLight, CrashMedium, CrashHeavy, CrashMetal, CrashCrumple, CrashBranch, CrashGlass, WetStone };
 
 constexpr int kMaxSets = 64;
 
@@ -590,6 +605,7 @@ public:
     virtual int forMaterial(int id) const = 0;     // -1 if not a ground material
     virtual int forClass(int cls) const = 0;       // coarse class 0..3 (used with telemetry inference)
     virtual float volume(int set) const = 0;
+    virtual bool wetNative(int set) const { (void)set; return false; }   // true if the set's loop is a recording of damp or wet ground
 };
 
 // Default: one set per coarse class (what a plain tarmac / gravel / grass / snow pack provides).
@@ -614,6 +630,8 @@ public:
     virtual void setRumble(float gl, float gr) = 0;
     // Telemetry-driven tone for one tyre's sounds, -1 (deep, dull) .. +1 (bright, crisp). Optional.
     virtual void setWheelTone(int wheel, float tone) { (void)wheel; (void)tone; }
+    // The spray hiss of wet ground under one tyre (made in code, see wet_surface.hpp). Optional.
+    virtual void setWetHiss(int wheel, float gl, float gr, float rate) { (void)wheel; (void)gl; (void)gr; (void)rate; }
     virtual void trigger(SoundEvent kind, int cls, float gl, float gr, float rate) = 0;
     virtual void silence() = 0;
     // The sink decides which sets exist (it owns the sound bank); the controller follows it.
@@ -643,6 +661,11 @@ struct SetView {
     int dominant(int wheel) const { const std::vector<double>& v = w[wheel]; int b = 0; for (int i = 1; i < count; ++i) if (v[i] > v[b]) b = i; return b; }
     float volume(int set) const { return sets ? sets->volume(set) : 1.f; }
 };
+
+inline WetSurface::Params wetParams(const Settings& s) {
+    WetSurface::Params p; p.on = s.wetTreatment; p.tone = (float)s.wetTone; p.crunch = (float)s.wetCrunch; p.hiss = (float)s.wetHiss; p.stones = (float)s.wetStones;
+    return p;
+}
 
 // Situation streams on top of the per-tyre loops: impacts, landings, stone spray, rumble, squeal/slide.
 class DebrisTriggers {
@@ -722,14 +745,16 @@ private:
     //    start throws stones too) and how hard it is pushed (slip and throttle). There is no speed cut-off: rate and strength grow
     //    with surface speed.
     // The rate is not a setting. On clean tarmac the ground half is zero, so nothing is thrown whatever the car does.
-    void stones(const TelemetryFrame& f, SurfaceAnalyzer& a, const Settings&, double dt, IAudioSink& sink, const SetView& sv) {
+    void stones(const TelemetryFrame& f, SurfaceAnalyzer& a, const Settings& s, double dt, IAudioSink& sink, const SetView& sv) {
         constexpr double kStonesPerSecond = 10.0;      // what a gravel road gives at 90 km/h with the tyres working: fixed, not a setting
-        double weight[4], total = 0, spray[4];
+        double weight[4], total = 0, spray[4], groundOf[4];
         for (int w = 0; w < 4; ++w) {
             const WheelAnalyzer& wa = a.wheels[w];
             spray[w] = std::max(a.speedMs, wa.contactSpeedMs()) * 3.6;                   // km/h
             double ground = a.memValid[w] && a.memLoose[w] >= 0.0 ? a.memLoose[w]
                                                                    : 0.8 * clampd(1.0 - wa.inferred[Tarmac], 0.0, 1.0);
+            groundOf[w] = ground;
+            ground *= WetSurface::Make(wa.wetness, (float)ground, 0.0f, 1.0f, (float)a.wetLevel, wetParams(s)).stones;   // wet ground holds on to its stones
             double slip = std::min(wa.slipNorm, 1.0);                                  // wheelspin or sliding: the tyre is throwing material
             weight[w] = ground * (0.4 + 0.6 * std::max(slip, (double)f.throttle)) * clampd(spray[w] / 90.0, 0.0, 1.5);
             total += weight[w];
@@ -743,7 +768,11 @@ private:
         for (int w = 0; w < 4; ++w) { pick -= weight[w]; if (pick <= 0) { wheel = w; break; } }
         float gain = (float)(0.4 + 0.6 * rng_.next()) * (float)clampd(spray[wheel] / 100.0, 0.15, 1.0), l, rr;
         panGains(kWheelPan[wheel], gain * kWheelScale[wheel], l, rr);
-        sink.trigger(SoundEvent::StoneHit, sv.dominant(wheel), l, rr, rate(0.12));
+        const int set = sv.dominant(wheel);
+        sink.trigger(SoundEvent::StoneHit, set, l, rr, rate(0.12));
+        // On wet ground some of the stones land in water: a small splash with the stone (not when the set's own recording already has it).
+        const WetSurface::Plan wp = WetSurface::Make(a.wheels[wheel].wetness, (float)groundOf[wheel], 0.0f, sv.sets && sv.sets->wetNative(set) ? 1.0f : 0.0f, (float)a.wetLevel, wetParams(s));
+        if (wp.wetStone > 0.0f && rng_.next() < wp.wetStone) sink.trigger(SoundEvent::WetStone, set, 0.7f * l, 0.7f * rr, rate(0.15));
     }
 
     // Suspension sounds from the damper and strut telemetry of each tyre. Both are rare, deliberate events, not texture:
@@ -846,6 +875,7 @@ class AudioController {
     Rng rng_;
     double lastTime_ = -1;
     ISurfaceMemory* mem_ = nullptr;
+    std::atomic<float> wetLevel_{1.0f};
     MaterialTable table_;
     MemoryHealth health_;
     ClassSoundSets defaultSets_;
@@ -861,6 +891,8 @@ public:
 
     // Optional: the surface reader (null or not configured = telemetry inference only).
     void setSurfaceMemory(ISurfaceMemory* m) { mem_ = m; }
+    // The live multiplier on the wet treatment (the menu), 0 .. 2. Safe from any thread.
+    void setWetLevel(float v) { wetLevel_ = v; }
     // Normally taken from the sink; override only in tests. Null = one set per coarse class.
     void setSoundSets(const ISoundSets* sets) {
         sets_ = sets ? sets : &defaultSets_;
@@ -890,13 +922,26 @@ public:
         bool readOk = false;
         bool useMem = mem_ && mem_->configured();
         if (useMem) readOk = mem_->readMaterials(ids);
+        // The plugin's tyre reader says what each tyre is on (class, wetness, looseness), the same as it tells the road feel. Without it the
+        // controller works it out from the ids with its own table.
+        SurfaceModel::Tyre sf[4]; const bool surfOk = readOk && mem_->readSurface(sf);
         for (int w = 0; w < 4; ++w) {
             int cls = readOk ? table_.cls(ids[w]) : -2;
+            double loose = readOk ? table_.looseness(ids[w]) : -1.0;
+            int wet = readOk ? table_.wet(ids[w]) : 0;
+            bool first = false;
+            if (surfOk) {
+                if (sf[w].audioClass >= 0) { first = sf[w].audioClass != cls || sf[w].ridged; cls = sf[w].audioClass; }
+                if (sf[w].loose >= 0.0f) loose = sf[w].loose;
+                wet = sf[w].wet;
+            }
             analyzer.memValid[w] = useMem && health_.usable() && cls >= 0;   // objects / unknown ids: no info for this tyre
             analyzer.memClass[w] = cls >= 0 ? cls : 0;
-            analyzer.memWet[w] = readOk ? table_.wet(ids[w]) : 0;
-            analyzer.memLoose[w] = readOk ? table_.looseness(ids[w]) : -1.0;
+            analyzer.memWet[w] = wet;
+            analyzer.memLoose[w] = loose;
+            analyzer.memClassFirst[w] = first;
         }
+        analyzer.wetLevel = wetLevel_.load();
 
         analyzer.update(f, dt);
         if (useMem) health_.update(readOk, ids, table_);
@@ -918,7 +963,7 @@ private:
             std::fill(target_.begin(), target_.end(), 0.0);
             bool mem = analyzer.memValid[w];
             if (mem) {
-                int st = sets_->forMaterial(ids[w]);
+                int st = analyzer.memClassFirst[w] ? -1 : sets_->forMaterial(ids[w]);
                 if (st < 0 || st >= n) st = sets_->forClass(analyzer.memClass[w]);
                 target_[std::min(std::max(st, 0), n - 1)] = 1.0;
             } else {
@@ -952,18 +997,29 @@ private:
             double activity = std::max(slipAct, roughAct);
             double sq = 0; for (int i = 0; i < n; ++i) sq += weights[i] * weights[i];
             if (sq < 1e-9) sq = 1;
+            // Damp and wet ground: the dry loops are dulled, a little quieter and joined by a spray hiss, in proportion to how much of this tyre's
+            // sound is not a real recording of wet ground (see wet_surface.hpp).
+            double native = 0; for (int i = 0; i < n; ++i) if (sets_->wetNative(i)) native += weights[i] * weights[i] / sq;
+            const double looseHere = analyzer.memValid[w] && analyzer.memLoose[w] >= 0.0 ? analyzer.memLoose[w] : 0.8 * clampd(1.0 - wa.inferred[Tarmac], 0.0, 1.0);
+            const WetSurface::Plan wet = WetSurface::Make(wa.wetness, (float)looseHere, (float)kph, (float)native, (float)analyzer.wetLevel, wetParams(s_));
             for (int i = 0; i < n; ++i) {
                 double share = std::sqrt(weights[i] * weights[i] / sq);   // equal power: two uncorrelated sounds crossfade without a dip
                 double g = s_.enableWheelLoops ? share * s_.loopLevel * (1.0 + s_.loopBoost * activity) * sets_->volume(i) * shape * std::max(0.4, wa.loadFraction()) : 0.0;
+                if (!sets_->wetNative(i)) g *= wet.gain;
                 float l, r; panGains(kWheelPan[w], (float)g * kWheelScale[w], l, r);
                 sink_.setWheelLoop(w, i, l, r, rate);
+            }
+            {
+                const double hg = s_.enableWheelLoops && shape > 0.0 ? s_.loopLevel * wet.hiss * std::max(0.4, wa.loadFraction()) : 0.0;
+                float hl, hr; panGains(kWheelPan[w], (float)hg * kWheelScale[w], hl, hr);
+                sink_.setWetHiss(w, hl, hr, (float)(0.9 + 0.2 * clampd(kph / 200.0, 0.0, 1.0)));
             }
             // Tone from the telemetry, on top of each sound set's own character (dry stones/rubble bright, wet/snow deep):
             // faster = brighter, more loose/rough ground = crisper, slippery (low grip, smooth) = duller and deeper,
             // a heavily loaded tyre = a little fuller.
             double tone = 0.5 * (clampd(kph / 150.0, 0.0, 1.0) - 0.4) + 0.35 * (wa.inferred[1] + wa.inferred[2]) - 0.7 * wa.inferred[3]
                           - 0.15 * clampd(wa.loadFraction() - 1.0, 0.0, 1.0);
-            sink_.setWheelTone(w, (float)clampd(tone, -1.0, 1.0));
+            sink_.setWheelTone(w, (float)clampd(tone + wet.tone, -1.0, 1.0));
         }
     }
 };

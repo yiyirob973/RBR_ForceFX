@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include "surface_model.hpp"
 
 namespace Road {
 
@@ -88,14 +89,14 @@ inline bool FromName(const std::string& n, int wet, Ground& g) {
     return true;
 }
 
-struct Entry { Ground g; bool known = false; };
+struct Entry { Ground g; bool known = false; int wet = 0; };
 inline Entry* Table() {
     static Entry t[256];
     static bool built = false;
     if (!built) {
         built = true;
         for (const ffx::MaterialInfo& m : ffx::kMaterials)
-            if (m.id >= 0 && m.id < 256 && m.cls >= 0) t[m.id].known = FromName(m.name, m.wet, t[m.id].g);
+            if (m.id >= 0 && m.id < 256 && m.cls >= 0) { t[m.id].known = FromName(m.name, m.wet, t[m.id].g); t[m.id].wet = m.wet; }
     }
     return t;
 }
@@ -108,6 +109,31 @@ inline bool GroundOfId(int id, Ground& out) {
     if (!e.known) return false;
     out = e.g;
     return true;
+}
+
+// How wet the ground is for a game material id: 0 dry, 1 damp, 2 wet (from the game's table, or a materials.csv override). 0 for anything unknown.
+inline int WetOfId(int id) {
+    if (id < 0 || id > 255) return 0;
+    return detail::Table()[id].wet;
+}
+
+// The materials.csv overrides (the file the audio reads, ForceFXAudio\materials.csv) for the road too, so one file corrects both: for every id the
+// override changes, the wetness and the ground are redone, and the reader's class follows the override unless [Surface] Map= already set one.
+// base: the built-in table; ovr: the same table after loadOverrides. Returns how many ids it changed.
+inline int ApplyMaterialOverrides(const ffx::MaterialTable& base, const ffx::MaterialTable& ovr) {
+    int changed = 0;
+    for (int id = 0; id < 256; ++id) {
+        if (ovr.cls(id) == base.cls(id) && ovr.wet(id) == base.wet(id)) continue;
+        ++changed;
+        detail::Entry& e = detail::Table()[id];
+        e.wet = ovr.wet(id);
+        const std::string name = base.name(id);
+        if (ovr.cls(id) < 0) { e.known = false; continue; }                                  // the override says it is not ground
+        if (name == "unknown") e.known = false;                                              // a new id: its class gives the ground
+        else e.known = detail::FromName(name, e.wet, e.g);                                   // a known material, wetter or drier
+        if (ovr.cls(id) != base.cls(id) && Surf::IdMap()[id] == 0) Surf::IdMap()[id] = SurfaceModel::SurfClassOfAudio(ovr.cls(id)) + 1;
+    }
+    return changed;
 }
 
 // A rough ground for a surface class, for ids the material table does not have (cobbles and planks assigned with Map=).

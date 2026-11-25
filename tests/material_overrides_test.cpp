@@ -1,0 +1,70 @@
+// Tests for the materials.csv overrides reaching the road feel (Road::ApplyMaterialOverrides). Self-contained:
+//   g++ -std=c++17 -O1 -I.. material_overrides_test.cpp -o material_overrides_test && ./material_overrides_test
+#include <cmath>
+#include <cstdio>
+#include <fstream>
+#include <functional>
+#include <string>
+#include <vector>
+#include "../materials.hpp"
+#include "../surface_feel.hpp"
+#include "../road_feel.hpp"
+
+static int g_fail = 0, g_checks = 0;
+struct Reg { const char* name; std::function<void()> fn; };
+static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
+struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
+#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
+#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
+
+static int apply(const char* csv) {
+    const std::string path = "material_overrides_test.csv";
+    { std::ofstream f(path); f << csv; }
+    ffx::MaterialTable base, ovr;
+    CHECK(ovr.loadOverrides(path));
+    std::remove(path.c_str());
+    return Road::ApplyMaterialOverrides(base, ovr);
+}
+
+// Each test works on its own ids, because the table and the class map are process-wide.
+TEST(the_wetness_of_a_known_material_is_the_games_until_overridden) {
+    CHECK(Road::WetOfId(1) == 0); CHECK(Road::WetOfId(2) == 1); CHECK(Road::WetOfId(3) == 2);
+    CHECK(Road::WetOfId(-1) == 0); CHECK(Road::WetOfId(999) == 0);
+}
+TEST(an_override_that_makes_a_known_material_wetter_changes_its_ground_too) {
+    Road::Ground before; CHECK(Road::GroundOfId(9, before));                      // Gravel_Fine_Deep_Dry
+    CHECK(Road::WetOfId(9) == 0);
+    CHECK(apply("9, 1, 2   ; wet\n") == 1);
+    Road::Ground after; CHECK(Road::GroundOfId(9, after));
+    CHECK(Road::WetOfId(9) == 2);
+    CHECK(after.slick > before.slick);                                            // wet gravel is slicker
+    CHECK(std::fabs(after.hard - before.hard) < 1e-6f);                           // and nothing else moved
+}
+TEST(a_new_id_gets_its_wetness_and_its_ground_comes_from_its_class) {
+    Road::Ground g; CHECK(!Road::GroundOfId(200, g));                              // not in the game's table
+    CHECK(apply("200, 1, 1\n") == 1);
+    CHECK(Road::WetOfId(200) == 1);
+    CHECK(!Road::GroundOfId(200, g));                                              // no name to work the ground from: GroundForTyre uses the class
+    CHECK(Surf::ClassOfId(200) == Surf::C_GRAVEL);                                 // and the reader's class follows the override (audio class 1)
+}
+TEST(a_class_override_moves_the_readers_class_unless_map_set_one) {
+    Surf::IdMap()[201] = Surf::C_COBBLE + 1;                                       // [Surface] Map= already says cobble
+    CHECK(apply("201, 0, 0\n202, 3, 0\n") == 2);
+    CHECK(Surf::ClassOfId(201) == Surf::C_COBBLE);                                 // Map= wins
+    CHECK(Surf::ClassOfId(202) == Surf::C_SNOW);
+}
+TEST(an_override_that_says_not_ground_removes_the_ground) {
+    Road::Ground g; CHECK(Road::GroundOfId(13, g));
+    CHECK(apply("13, -1, 0\n") == 1);
+    CHECK(!Road::GroundOfId(13, g));
+}
+TEST(an_override_that_changes_nothing_changes_nothing) {
+    CHECK(apply("17, 1, 0\n") == 0);                                               // id 17 is Gravel ..._Dry in the built-in table: same class, same wetness
+    Road::Ground g; CHECK(Road::GroundOfId(17, g));
+}
+
+int main() {
+    for (auto& r : regs()) { int before = g_fail; r.fn(); std::printf("%s %s\n", before == g_fail ? "ok  " : "FAIL", r.name); }
+    std::printf("\n%d checks, %d failed\n", g_checks, g_fail);
+    return g_fail ? 1 : 0;
+}

@@ -161,5 +161,35 @@ inline int addWaterFallbacks(SoundBank& bank, bool* splashFromRbr = nullptr) {
     return added;
 }
 
+// The spray of wet ground under a tyre: a soft, steady hiss with the low end and the very top taken off, so it sits above the tyre's own noise
+// without covering it. wet_surface.hpp mixes it in under each tyre in proportion to how wet the ground is and how fast the tyre goes. About 3 seconds,
+// made to join up with itself. A recording named wet_hiss_loop.wav in the sounds folder is used instead.
+inline std::vector<float> makeWetHiss() {
+    const double dur = 3.0;
+    const size_t n = (size_t)(dur * kSampleRate);
+    std::vector<float> d(n, 0.0f);
+    Noise r(31337u), m(2718u);
+    double l1 = 0.0, l2 = 0.0, hp = 0.0, slow = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double t = (double)i / kSampleRate;
+        const double a = 1.0 - std::exp(-kTwoPi * 6500.0 / kSampleRate);          // top end off above about 6.5 kHz
+        l1 += a * (r.next() - l1); l2 += a * (l1 - l2);
+        hp += 0.20 * (l2 - hp);                                                   // low end off below about 1.6 kHz
+        slow += 0.0010 * (m.next() - slow);                                       // a little unevenness, a few swells a second
+        const double am = 0.85 + 0.10 * std::sin(kTwoPi * 3.0 * t / dur + 0.4) + 2.0 * slow;
+        d[i] = (float)((l2 - hp) * std::max(0.3, am));
+    }
+    makeSeamless(d);
+    normalizeLoudness(d, targetRmsFor("wet_hiss_loop"));
+    return d;
+}
+
+// Adds the wet hiss if the bank has none of its own. Returns true if it was made.
+inline bool addWetFallbacks(SoundBank& bank) {
+    if (bank.get("wet_hiss_loop")) return false;
+    bank.add("wet_hiss_loop", makeWetHiss());
+    return true;
+}
+
 }  // namespace wsnd
 }  // namespace ffx
