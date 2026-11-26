@@ -465,7 +465,7 @@ public:
     bool memValid[4] = {false, false, false, false};
     int memClass[4] = {0, 0, 0, 0}, memWet[4] = {0, 0, 0, 0};
     double memLoose[4] = {-1, -1, -1, -1};   // how much loose material the game says is under each tyre (-1 = not known)
-    bool memClassFirst[4] = {false, false, false, false};   // the reader's class (a Map= or materials.csv correction, cobbles) overrides the material's own sound set
+    bool memClassFirst[4] = {false, false, false, false};   // the reader's class (a Map= or materials.csv correction) overrides the material's own sound set
     double wetLevel = 1.0;                   // the live multiplier on the wet treatment from the menu
     double speedMs = 0, landingAirTime = 0;   // speedMs = true ground speed
     double fieldMs = 0, drivenMs = 0;         // the Speed field (speedometer) and the driven-wheel road speed derived from it
@@ -961,7 +961,7 @@ public:
             int wet = readOk ? table_.wet(ids[w]) : 0;
             bool first = false;
             if (surfOk) {
-                if (sf[w].audioClass >= 0) { first = sf[w].audioClass != cls || sf[w].ridged; cls = sf[w].audioClass; }
+                if (sf[w].audioClass >= 0) { first = sf[w].audioClass != cls; cls = sf[w].audioClass; }
                 if (sf[w].loose >= 0.0f) loose = sf[w].loose;
                 wet = sf[w].wet;
             }

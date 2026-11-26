@@ -46,9 +46,9 @@ Everything is in `ForceFX.ini`, which describes each option, and the main ones a
 
 ## How the road feel works
 
-ForceFX reads which material is under each tyre from RBR's memory (read-only, RSF `RichardBurnsRally_SSE.exe` only, and only while a stage is running) and combines it with the telemetry. Loose ground is grainy, soft ground is dull, ice is hard and sharp, cobbles hit in a repeating pattern. Unknown ground is treated as plain hard ground.
+ForceFX reads which material is under each tyre from RBR's memory (read-only, RSF `RichardBurnsRally_SSE.exe` only, and only while a stage is running) and combines it with the telemetry. Loose ground is grainy, soft ground is dull, ice is hard and sharp. Unknown ground is treated as plain hard ground.
 
-Cobbles and wooden bridges have no material of their own in the game. Cobbles are detected from the telemetry, and you can assign any material ID with `Map=` in the `[Surface]` section of `ForceFX.ini`. The Diagnostics page shows the material IDs under the tyres, and `ForceFX.log` records surface changes.
+You can assign any material ID to a surface type with `Map=` in the `[Surface]` section of `ForceFX.ini`. The Diagnostics page shows the material IDs under the tyres, and `ForceFX.log` records surface changes.
 
 ## Dynamic audio
 

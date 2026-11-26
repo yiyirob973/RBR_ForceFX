@@ -166,7 +166,7 @@ TEST(there_is_no_stone_rate_setting_any_more) {
     std::filesystem::remove(p);
 }
 TEST(rough_road_that_the_game_calls_tarmac_keeps_its_surface) {
-    // cobbles and bridges: the game says tarmac, the suspension is busy. The audio keeps the surface the reader gave it.
+    // very rough ground: the game says tarmac, the suspension is busy. The audio keeps the surface the reader gave it.
     FakeSurface m; for (int& i : m.ids) i = 77;
     FakeSink sink; Settings st = ff(); AudioController c(st, sink, 1); c.setSurfaceMemory(&m);
     std::mt19937 g(9); std::normal_distribution<float> n(0, 1); double t = 0;

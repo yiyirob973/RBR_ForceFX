@@ -19,8 +19,6 @@ TEST(the_numbers_in_the_mapping_are_the_readers_classes) {
     CHECK(SurfaceModel::AudioClassOf(Surf::C_SOFT) == 2);
     CHECK(SurfaceModel::AudioClassOf(Surf::C_SNOW) == 3);
     CHECK(SurfaceModel::AudioClassOf(Surf::C_ICE) == 3);
-    CHECK(SurfaceModel::AudioClassOf(Surf::C_COBBLE) == 0);
-    CHECK(SurfaceModel::AudioClassOf(Surf::C_WOOD) == 0);
     CHECK(SurfaceModel::AudioClassOf(Surf::C_NONE) == -1);
 }
 TEST(unknown_classes_have_no_audio_class) {
@@ -35,7 +33,7 @@ TEST(every_audio_class_goes_back_to_a_matching_reader_class) {
     for (int a = 0; a < 4; ++a) CHECK(SurfaceModel::AudioClassOf(SurfaceModel::SurfClassOfAudio(a)) == a);
 }
 TEST(a_tyre_with_nothing_known_says_so) {
-    SurfaceModel::Tyre t; CHECK(t.id == -1 && t.audioClass == -1 && t.wet == 0 && t.loose < 0.0f && !t.ridged);
+    SurfaceModel::Tyre t; CHECK(t.id == -1 && t.audioClass == -1 && t.wet == 0 && t.loose < 0.0f);
 }
 
 int main() {

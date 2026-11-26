@@ -48,9 +48,9 @@ TEST(a_new_id_gets_its_wetness_and_its_ground_comes_from_its_class) {
     CHECK(Surf::ClassOfId(200) == Surf::C_GRAVEL);                                 // and the reader's class follows the override (audio class 1)
 }
 TEST(a_class_override_moves_the_readers_class_unless_map_set_one) {
-    Surf::IdMap()[201] = Surf::C_COBBLE + 1;                                       // [Surface] Map= already says cobble
+    Surf::IdMap()[201] = Surf::C_ICE + 1;                                          // [Surface] Map= already says ice
     CHECK(apply("201, 0, 0\n202, 3, 0\n") == 2);
-    CHECK(Surf::ClassOfId(201) == Surf::C_COBBLE);                                 // Map= wins
+    CHECK(Surf::ClassOfId(201) == Surf::C_ICE);                                    // Map= wins
     CHECK(Surf::ClassOfId(202) == Surf::C_SNOW);
 }
 TEST(an_override_that_says_not_ground_removes_the_ground) {

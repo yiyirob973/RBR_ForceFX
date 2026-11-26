@@ -25,7 +25,6 @@ inline float smooth01(float a, float b, float x) { const float t = c01((x - a) /
 }  // namespace detail
 
 constexpr float kBaseGrain = 0.9f;       // how random the road strength and pitch are on ground with no special character (0 smooth .. 1 coarse)
-constexpr float kRidgeSpacing = 0.12f;   // metres between hits on cobbles; sets the pitch of ridged ground
 
 // What a tyre is rolling on, each 0..1.
 struct Ground {
@@ -33,15 +32,12 @@ struct Ground {
     float loose = 0.0f;      // loose material on top that can be thrown or ploughed: clean tarmac 0, gravel .75 to 1
     float coarse = 0.5f;     // grain size: fine .25, medium .55, coarse .9
     float slick = 0.0f;      // how little grip there is: dry 0, wet tarmac .15, snow on ice 1
-    float ridged = 0.0f;     // 1 = known to be made of separate ridges (cobbles or planks assigned with Map=); the telemetry can add to this
-    float spacing = kRidgeSpacing;   // metres between ridges
 };
 
 inline Ground Mix(const Ground& a, const Ground& b, float t) {
     Ground r;
     r.hard = a.hard + (b.hard - a.hard) * t;       r.loose = a.loose + (b.loose - a.loose) * t;
     r.coarse = a.coarse + (b.coarse - a.coarse) * t; r.slick = a.slick + (b.slick - a.slick) * t;
-    r.ridged = a.ridged + (b.ridged - a.ridged) * t; r.spacing = a.spacing + (b.spacing - a.spacing) * t;
     return r;
 }
 
@@ -136,7 +132,7 @@ inline int ApplyMaterialOverrides(const ffx::MaterialTable& base, const ffx::Mat
     return changed;
 }
 
-// A rough ground for a surface class, for ids the material table does not have (cobbles and planks assigned with Map=).
+// A rough ground for a surface class, for ids the material table does not have.
 inline Ground GroundOfClass(int cls) {
     Ground g;
     switch (cls) {
@@ -145,8 +141,6 @@ inline Ground GroundOfClass(int cls) {
         case Surf::C_SNOW:   g.hard = 0.25f; g.loose = 0.6f; g.coarse = 0.1f; g.slick = 0.5f; break;
         case Surf::C_ICE:    g.hard = 0.65f; g.loose = 0.2f; g.coarse = 0.05f; g.slick = 1.0f; break;
         case Surf::C_SOFT:   g.hard = 0.4f; g.loose = 0.35f; g.coarse = 0.2f; g.slick = 0.1f; break;
-        case Surf::C_COBBLE: g.hard = 1.0f; g.coarse = 0.9f; g.ridged = 1.0f; g.spacing = 0.12f; break;
-        case Surf::C_WOOD:   g.hard = 0.9f; g.coarse = 0.5f; g.ridged = 1.0f; g.spacing = 0.25f; break;
         default: break;
     }
     return g;
@@ -166,7 +160,6 @@ inline Ground GroundForTyre(int id, int cls) {
 // ---------------------------------------------------------------- the road character
 struct Drive {
     float activity = 0.0f;   // 0..1: how hard the tyres are working the ground (speed and wheel slip)
-    float ridge = 0.0f;      // 0..1: the telemetry says the tyres are hitting regular ridges (Surf::CobbleDetector)
     float spin = 0.0f;       // 0..1: wheelspin on the driven tyres (a tyre faster than the ground under power)
     float slide = 0.0f;      // 0..1: tyres sliding sideways or locked under braking (Tyre::Classify, measured against this ground's grip limit)
 };
@@ -180,23 +173,17 @@ inline Surf::Feel Derive(const Ground& g, const Drive& d) {
     const float hs = hard * slick;                                    // hard and slippery: ice, wet glaze
     const float lc = loose * coarse;                                  // loose and coarse: stones that rattle
 
-    // Ridges: only hard ground that is not mostly loose can have them. The detector's score and a Map= class both count.
-    const float gate = smooth01(0.7f, 0.9f, hard) * (1.0f - 0.5f * loose);
-    const float r = c01(std::max(d.ridge, c01(g.ridged))) * gate;
-
     Surf::Feel f = Surf::kNeutral;
-    f.amp      = (1.0f - 0.55f * soft * (1.0f - 0.5f * loose)) * (1.0f - 0.12f * slick) * (1.0f + 1.4f * r);   // soft ground absorbs, ridges hammer
-    f.grainAdd = 0.24f * lc - 0.85f * soft * (1.0f - loose) - 0.45f * hs - 0.6f * r;                          // stones are random, soft ground and ice are smooth
+    f.amp      = (1.0f - 0.55f * soft * (1.0f - 0.5f * loose)) * (1.0f - 0.12f * slick);   // soft ground absorbs
+    f.grainAdd = 0.24f * lc - 0.85f * soft * (1.0f - loose) - 0.45f * hs;                                  // stones are random, soft ground and ice are smooth
     f.dropout  = 0.35f * lc + 0.10f * soft * loose;                                                           // gaps between grains of loose stuff
     f.hz       = 1.0f - 0.65f * soft + 0.45f * loose + 0.70f * hs;                                            // soft ground is low and dull, loose and glazed ground is high
     f.atk      = 0.12f + 0.50f * hard + 0.60f * hs + 0.30f * lc;                                              // soft ground rises slowly
-    f.rel      = 0.30f + 0.80f * hard + 1.80f * lc + 1.40f * hs + 2.0f * r;                                   // hard and stony ground lets go fast: short, sharp hits
-    f.base     = 1.0f - 1.00f * hs + 0.25f * r;                                                               // glaze is quiet between its cracks
-    f.spark    = 0.08f * loose * act + 0.12f * hs + 0.07f * r;                                                // a stone flung up, a crack in the glaze, a ridge
-    f.sparkMul = 1.0f + 0.8f * loose * act + 1.4f * hs + 1.2f * r;
-    f.floor    = 0.17f * soft + 0.10f * loose + 0.15f * slick + 0.55f * r;                                    // ground that is never silent while the car moves
-    f.ridge    = r > 0.0f ? clampf(g.spacing, 0.03f, 1.0f) : 0.0f;
-    f.ridgeMix = r;
+    f.rel      = 0.30f + 0.80f * hard + 1.80f * lc + 1.40f * hs;                                           // hard and stony ground lets go fast: short, sharp hits
+    f.base     = 1.0f - 1.00f * hs;                                                                           // glaze is quiet between its cracks
+    f.spark    = 0.08f * loose * act + 0.12f * hs;                                                            // a stone flung up, a crack in the glaze
+    f.sparkMul = 1.0f + 0.8f * loose * act + 1.4f * hs;
+    f.floor    = 0.17f * soft + 0.10f * loose + 0.15f * slick;                                                // ground that is never silent while the car moves
 
     // Wheelspin and slides work the ground differently. Both dig into loose ground (strength, flung stones) and scrub hard ground
     // (a higher chatter, never silent), but a tyre sliding on ice has little to grab, so it stays quiet.

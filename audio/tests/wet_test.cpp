@@ -127,9 +127,9 @@ TEST(the_plugins_reader_decides_the_class_when_it_differs_from_the_materials_tab
     Reader r; r.id = 1;                                        // the table says gravel (class 1)
     const Sink plain = drive(r);
     CHECK(plain.setGain[1] > plain.setGain[0]);
-    r.haveSurface = true; r.tyre.id = 1; r.tyre.audioClass = 0; r.tyre.loose = 0.0f; r.tyre.ridged = true;   // Map= says cobbles: hard ground
-    const Sink cobble = drive(r);
-    CHECK(cobble.setGain[0] > cobble.setGain[1]);
+    r.haveSurface = true; r.tyre.id = 1; r.tyre.audioClass = 0; r.tyre.loose = 0.0f;   // the plugin's reader says tarmac: hard ground
+    const Sink hard = drive(r);
+    CHECK(hard.setGain[0] > hard.setGain[1]);
 }
 TEST(the_plugins_reader_decides_how_wet_it_is) {
     Reader r; r.id = 1;                                        // the table says dry

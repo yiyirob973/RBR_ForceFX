@@ -133,28 +133,6 @@ TEST(the_pitch_of_the_bands_is_shared_and_follows_speed) {
     for (int i = 0; i < 3; ++i) CHECK(b.hz[i] >= a.hz[i] && b.hz[i] <= kMax && a.hz[i] >= kMin);
     CHECK(b.hz[1] > a.hz[1]);
 }
-TEST(ridged_ground_locks_the_band_that_holds_the_ridge_pitch_and_makes_it_the_strongest) {
-    Surf::Feel cobbles = Surf::kNeutral; cobbles.ridge = 0.12f; cobbles.ridgeMix = 1.0f;
-    Road::SideIn s[2]; s[0].fe = cobbles; s[1].fe = cobbles; s[0].strength = s[1].strength = 800.0f;
-    const float speed = 6.0f;                                              // 6 m/s over 12 cm ridges = 50 Hz
-    const Road::Targets t = Road::Plan(s, speed, kMin, kMax);
-    CHECK(near(t.hz[1], 50.0f, 0.1f));                                     // the middle band sits exactly on the ridge pitch
-    CHECK(t.share[0][1] > t.share[0][0] && t.share[0][1] > t.share[0][2]);
-    // a faster car folds the ridge pitch down by octaves, into the high band's third
-    const Road::Targets f = Road::Plan(s, 20.0f, kMin, kMax);
-    CHECK(f.hz[2] >= 63.0f && f.hz[2] <= 100.0f && f.share[0][2] > f.share[0][0]);
-    // no ridges: the pitch stays where speed puts it
-    Road::SideIn n[2] = {side(1.0f, 800.0f), side(1.0f, 800.0f)};
-    const Road::Targets p = Road::Plan(n, speed, kMin, kMax);
-    CHECK(near(p.hz[1], Road::BandPitch(speed, kMin, kMax, 1), 1e-3f));
-}
-TEST(ridges_on_a_silent_side_do_not_move_the_pitch) {
-    Surf::Feel cobbles = Surf::kNeutral; cobbles.ridge = 0.12f; cobbles.ridgeMix = 1.0f;
-    Road::SideIn s[2]; s[0].fe = cobbles; s[0].strength = 0.0f; s[1] = side(1.0f, 600.0f);
-    const Road::Targets t = Road::Plan(s, 6.0f, kMin, kMax);
-    for (int b = 0; b < 3; ++b) CHECK(near(t.hz[b], Road::BandPitch(6.0f, kMin, kMax, b), 1e-3f));
-}
-
 // ---------------------------------------------------------------- putting the two sides together
 TEST(two_sides_never_cancel_however_alike_they_are) {
     Road::SideIn s[2] = {side(1.0f, 700.0f), side(1.0f, 700.0f)};

@@ -1692,7 +1692,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 // (for example Gravel_Coarse_Deep_Wet), and road_feel.hpp turns that name into a few physical properties: how hard the ground
 // is, how much loose material lies on it, how coarse it is and how slippery. The road effect then follows from those together
 // with the telemetry: the measured roughness of the tyres sets how strong it is, speed and wheel slip decide how hard loose
-// ground is worked (stones flung, grain), and tyres that shake in a regular pattern on hard ground are cobbles. Everything
+// ground is worked (stones flung, grain). Everything
 // reshapes the existing road effect, so no new effects are added and the force stays zero-mean. Unknown ground is plain hard
 // ground. The one setting for all of it is the road gain; the switch is in the menu (Plugins > ForceFX).
 // ====================================================================================================================
@@ -1705,9 +1705,6 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
 static_assert(Water::kBands == Road::kBands, "the water effects ride on the same bands as the road");
 namespace Surf {
 float g_fade = 0.25f;                // seconds to cross-fade between two surfaces
-int   g_cobbleDetect = 1;            // 1 = hard ground that shakes in a regular pattern gets the cobble feel (detected from the telemetry)
-float g_cobbleLo = 0.5f;             // rough-per-speed level (x100) where that blend starts ...
-float g_cobbleHi = 1.0f;             // ... and where it is complete
 }  // namespace Surf
 
 // How far each side's road strength follows its own tyres (0 = both sides identical, 1 = left and right fully separate).
@@ -1715,7 +1712,6 @@ constexpr float kRoadDirectional = 0.7f;
 
 struct Synth {
     float sm[S_COUNT] = {};
-    Surf::CobbleDetector cob;                              // telemetry check for hard ground made of regular ridges
     Road::Ground gnd[4];                                   // the ground under each tyre (FL, FR, RL, RR), moved gradually towards what was read
     Tyre::GripLearner grip;                                // how hard the car can accelerate on each kind of ground (reset with the car)
     float spinSm[4] = {}, slideSm[4] = {}, lockSm[4] = {};   // wheelspin, sliding and lock-up of each tyre (FL, FR, RL, RR), 0..1, smoothed
@@ -1860,14 +1856,12 @@ struct Synth {
         Surf::Feel fes[2] = {Surf::kNeutral, Surf::kNeutral};                        // [0] = left, [1] = right
         if (c.fxSurface) {
             const float aw = alphaFor(dt, Surf::g_fade);
-            const float cobScore = Surf::g_cobbleDetect ? cob.update(s.rough, s.speed, s.airborne > 0.5f, dt, Surf::g_cobbleLo, Surf::g_cobbleHi) : 0.0f;
             for (int w = 0; w < 4; ++w) gnd[w] = Road::Mix(gnd[w], Road::GroundForTyre(s.mat[w], s.surf[w]), aw);
             const float fw = Surf::g_front;
             for (int k2 = 0; k2 < 2; ++k2) {                                          // front tyre of this side is wheel k2, rear tyre is wheel 2 + k2
                 Road::Drive dr;
                 dr.spin = sideDyn(spinSm, k2); dr.slide = sideDyn(slideSm, k2);
                 dr.activity = Road::Activity(spN, std::max(dr.spin, dr.slide));
-                dr.ridge = cobScore;
                 fes[k2] = Road::Derive(Road::Mix(gnd[2 + k2], gnd[k2], fw), dr);
             }
         }
@@ -1913,7 +1907,7 @@ struct Synth {
         // ---------------- BRAKE: front-end judder, harsh on lock-up. It rides on RBR's force as one more band of the road vibration (see the worker loop), and
         // lock-up of the front tyres also lightens RBR's force (below). The weight on the front comes from the shared front-load tracker.
         const float gB = smooth01(2.0f, 8.0f, s.speed);
-        // Lock-up shakes the wheel according to the ground: soft ground swallows it, hard ground and cobbles pass it on.
+        // Lock-up shakes the wheel according to the ground: soft ground swallows it, hard ground passes it on.
         const float lockU = std::max(s.lock, lockAmt) * (c.fxSurface ? clampf(0.5f * (fes[0].amp + fes[1].amp), 0.4f, 1.3f) : 1.0f);
         const float Ab = BrakeFx::JudderAmp(s.brake, std::max(s.dive, aout.dive), lockU);
         const float gHard = c.fxSurface ? 0.5f * (gnd[0].hard + gnd[1].hard) : 0.4f, gLoose = c.fxSurface ? 0.5f * (gnd[0].loose + gnd[1].loose) : 0.6f;   // the ground under the front tyres sets the pitch of a lock-up scrub
@@ -2101,7 +2095,6 @@ private:
             GetPrivateProfileStringA(K, k, "", b, sizeof(b), ini_.c_str()); if (b[0]) v = (float)atof(b);
         };
         F("FadeSeconds", g_fade); F("FrontWeight", g_front);
-        I("CobbleDetect", g_cobbleDetect); F("CobbleDetectLow", g_cobbleLo); F("CobbleDetectHigh", g_cobbleHi);
         I("ReadHz", readHz_); I("CommitMs", commitMs_); I("TyreVtable", vtableCfg_, true);
         {   // which wheel each tyre object is, in the order the scan finds them (measured on test drives: rear pair first, then front pair)
             std::string order = "RL,RR,FL,FR";
@@ -2124,7 +2117,6 @@ private:
         if (fresh) Wr("Map", ""); else { GetPrivateProfileStringA(K, "Map", "", b, sizeof(b), ini_.c_str()); map = b; }
         ParseMap(map);
         g_fade = clampf(g_fade, 0.05f, 3.0f); g_front = clampf(g_front, 0.0f, 1.0f);
-        g_cobbleDetect = g_cobbleDetect ? 1 : 0; g_cobbleLo = clampf(g_cobbleLo, 0.0f, 20.0f); g_cobbleHi = clampf(g_cobbleHi, g_cobbleLo + 0.05f, 40.0f);
         readHz_ = std::max(5, std::min(readHz_, 100)); commitMs_ = std::max(0, std::min(commitMs_, 2000));
     }
     // "88:snow,92:none,129:soft": correct the class of single ids
@@ -2132,7 +2124,7 @@ private:
         std::vector<std::string> bad;
         const int n = ParseIdMap(m, &bad);
         if (n > 0) Log("Map: %d surface override(s) applied", n);
-        for (const std::string& b : bad) Log("Map: ignored '%s'. Types: tarmac, gravel, snow, ice, soft, cobble, wood, none", b.c_str());
+        for (const std::string& b : bad) Log("Map: ignored '%s'. Types: tarmac, gravel, snow, ice, soft, none", b.c_str());
     }
 
     // ---------------------------------------------------------------- memory
@@ -2205,20 +2197,19 @@ private:
     }
 
     // The first time the car drives on a ground that has no class, say which id it is, so it can be assigned with Map=.
-    // (The game's own table has no cobblestone or wooden bridge entry, so this is how those ids are found.)
     bool unmappedSeen_[256] = {};
     void NoteUnmapped(int id) {
         if (id < 0 || id > 255 || unmappedSeen_[id]) return;
         const ffx::MaterialInfo* known = nullptr;
         for (const ffx::MaterialInfo& m : ffx::kMaterials) if (m.id == id) { known = &m; break; }
         unmappedSeen_[id] = true;
-        if (known && known->cls < 0) { Log("tyre contact id %d (%s) is an object or undefined, not ground; if this is a bridge or another special surface add Map=%d:wood (or cobble, gravel...) in [Surface]", id, known->name, id); return; }
-        if (known) Log("ground material id %d (%s) has no surface class; add Map=%d:gravel (or tarmac, snow, ice, soft, cobble, wood) in [Surface] to give it one", id, known->name, id);
-        else Log("ground material id %d is not in the game's table and has no surface class; if this is cobblestone or a wooden bridge add Map=%d:cobble (or wood) in [Surface]", id, id);
+        if (known && known->cls < 0) { Log("tyre contact id %d (%s) is an object or undefined, not ground", id, known->name); return; }
+        if (known) Log("ground material id %d (%s) has no surface class; add Map=%d:gravel (or tarmac, snow, ice, soft) in [Surface] to give it one", id, known->name, id);
+        else Log("ground material id %d is not in the game's table and has no surface class; add Map=%d:gravel (or tarmac, snow, ice, soft) in [Surface] to give it one", id, id);
     }
 
     // Every ground id the tyres touch is listed once with the class it got, so a surface that is being read as the wrong class
-    // (cobbles that share a tarmac id, say) shows up in the log as well as one that isn't known at all.
+    // shows up in the log as well as one that isn't known at all.
     bool idSeen_[256] = {};
     void NoteIdSeen(int id, int cls) {
         if (id < 0 || id > 255 || idSeen_[id]) return;
@@ -2394,7 +2385,7 @@ bool Ids(int out[4]) {
 }
 bool Found() { return g_reader && g_reader->nTyres.load() >= 4; }
 // What the reader decided about each tyre, in the form the audio takes: the same class, wetness and ground the road feel works with
-// (Map= corrections, materials.csv overrides, cobbles and planks included). False until the reader knows a class for at least one tyre.
+// (Map= corrections and materials.csv overrides included). False until the reader knows a class for at least one tyre.
 bool Tyres(SurfaceModel::Tyre out[4]) {
     if (!g_reader) return false;
     bool any = false;
@@ -2408,7 +2399,6 @@ bool Tyres(SurfaceModel::Tyre out[4]) {
         t.wet = Road::WetOfId(id);
         const Road::Ground g = Road::GroundForTyre(id, cls);
         t.loose = g.loose;
-        t.ridged = g.ridged > 0.5f;
         any = true;
     }
     return any;
@@ -2449,7 +2439,6 @@ private:
     std::atomic<int>   m_cfgRev{0};         // bumped by the menu whenever m_cfg changes
     std::atomic<float> m_dStat{0}, m_dLoadL{1}, m_dLoadR{1}, m_dAir{0};
     std::atomic<bool>  m_stageReset{false};
-    std::atomic<float> m_cobScore{0.0f}, m_cobLevel{0.0f};   // telemetry cobble detection, for the Diagnostics page, the log and the probe file
     ffx::Audio         m_audio;            // sounds for the ground under each tyre; off until the menu switch is on
     ffx::Camera        m_camera;           // head movement and windscreen effects
     static ffx::Camera*& CameraSlot() { static ffx::Camera* p = nullptr; return p; }
@@ -2670,7 +2659,6 @@ private:
 
         const auto t0 = Clock::now();
         auto lastRx = t0 - std::chrono::seconds(10);
-        bool cobOn = false; int cobLogs = 0;     // cobble detection state, for the log
         unsigned lastWaterEvents = 0; int waterLogs = 0;   // splashes already handed on to the audio and the windscreen, and how many were logged
         bool audioQuiet = false;               // the audio has been told that telemetry stopped
         auto lastPkt = t0, lastApply = t0, nextTry = t0, tapLastRx = t0 - std::chrono::seconds(10), nextRescan = t0, nextUpdCount = t0 + std::chrono::seconds(1);
@@ -2773,16 +2761,6 @@ private:
                 m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
                 m_audio.setWetLevel(base.audioWet);
                 m_audio.setCabinLevel(base.audioCabin);
-            }
-            {   // telemetry cobble detection: copy its state for the Diagnostics page and log when it switches on and off
-                m_cobScore = synth.cob.score; m_cobLevel = synth.cob.ema;
-                if (!cobOn && synth.cob.score > 0.6f) {
-                    cobOn = true;
-                    if (++cobLogs <= 200) Logf("Cobbles detected from the telemetry (roughness per speed %.2f, %.0f km/h): tarmac tyres now get the cobble feel", (double)synth.cob.ema, (double)(live.speed * 3.6f));
-                } else if (cobOn && synth.cob.score < 0.3f) {
-                    cobOn = false;
-                    if (++cobLogs <= 200) Logf("Cobbles no longer detected (roughness per speed %.2f)", (double)synth.cob.ema);
-                }
             }
             if (m_audio.msSinceFrame() > 500) { if (!audioQuiet) { audioQuiet = true; m_audio.telemetryLost(); } }   // menus, pause, stage end, or packets that are not real telemetry: let the loops fade out
             else audioQuiet = false;
@@ -3081,7 +3059,7 @@ private:
             {"EnableCrash",        "Turns the crash jolt on or off: when the car hits a tree, a rock or a wall, the wheel is yanked for a moment (RBR's own force, boosted)."},
             {"CrashBoost",         "How hard the wheel is yanked in a full-strength crash, as a multiple of RBR's own force (80% = 1.8x). Never more than the overall limit (MaxForceMultiplier in ForceFX.ini)."},
             {"CrashMinPush",       "The least extra push of a full-strength crash, a share of full torque, so a hit is felt even when RBR's force is nearly zero."},
-            {"EnableSurfaceFeel",  "Lets the ground under each tyre shape the road feel, together with how fast the car goes and how much the wheels slip: loose ground is grainy and throws stones, soft ground is dull, slippery hard ground is quiet with sharp cracks, cobbles hammer in time with your speed. Needs the road feel effect. Off, the road feels the same on every surface."},
+            {"EnableSurfaceFeel",  "Lets the ground under each tyre shape the road feel, together with how fast the car goes and how much the wheels slip: loose ground is grainy and throws stones, soft ground is dull, slippery hard ground is quiet with sharp cracks. Needs the road feel effect. Off, the road feels the same on every surface."},
             {"EnableLandingBoost", "Turns the landing boost on or off. With it off, landings feel exactly as RBR sends them."},
             {"EnableAccelLight",   "Turns light steering on or off: while the car accelerates forward and the front tyres carry less weight than they do standing still, the steering loses force in proportion. With it off, the steering feels exactly as RBR sends it."},
             {"AccelLightness",     "How much of the front load that is lost shows up as lighter steering. At x1.00 the steering loses force in proportion to the front weight lost under acceleration, measured from the strut forces against the car standing still on the start line (never more than 60% of RBR's force); x2 doubles it, 0 turns it off. ForceFX.log shows how far the front unloads."},
@@ -3147,9 +3125,6 @@ private:
         line(Surf::Status().c_str());
         line(m_audio.status().c_str());
         line(m_camera.status().c_str());
-        { char cb[160]; snprintf(cb, sizeof(cb), "Cobble detection: %s, roughness per speed %.2f (blend starts %.1f, full at %.1f), cobble feel %d%%",
-                                 Surf::g_cobbleDetect ? "on" : "off", (double)m_cobLevel.load(), (double)Surf::g_cobbleLo, (double)Surf::g_cobbleHi, (int)(m_cobScore.load() * 100.0f + 0.5f));
-          line(cb); }
         y += 6.0f;
 
         uint8_t pkt[2048]; int len;

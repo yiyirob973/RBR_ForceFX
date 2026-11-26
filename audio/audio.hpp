@@ -111,12 +111,12 @@ inline double targetRmsFor(const std::string& key) {
 }
 
 // Character of a sound by its name: wet, muddy, watery, snowy or icy sounds are deep and dull; dry stones, gravel,
-// rubble, dirt and cobbles are bright and crisp; tarmac is neutral. Returns -1 .. +1.
+// rubble and dirt are bright and crisp; tarmac is neutral. Returns -1 .. +1.
 inline float toneOfName(std::string n) {
     for (char& c : n) c = (char)std::tolower((unsigned char)c);
     auto has = [&](const char* k) { return n.find(k) != std::string::npos; };
     if (has("wet") || has("mud") || has("water") || has("puddle") || has("slush") || has("snow") || has("ice")) return -0.8f;
-    if (has("gravel") || has("stone") || has("rubble") || has("rock") || has("pebble") || has("dirt") || has("sand") || has("cobble") || has("rough")) return 0.7f;
+    if (has("gravel") || has("stone") || has("rubble") || has("rock") || has("pebble") || has("dirt") || has("sand") || has("rough")) return 0.7f;
     if (has("grass") || has("leaf") || has("forest")) return 0.15f;
     return 0.0f;
 }
