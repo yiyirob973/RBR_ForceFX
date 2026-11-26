@@ -20,6 +20,7 @@
 #include "core.hpp"
 #include "audio.hpp"
 #include "water_sounds.hpp"
+#include "cabin_sounds.hpp"
 #include "waveout.hpp"
 
 namespace ffx {
@@ -46,6 +47,7 @@ public:
     struct Hooks {
         std::function<bool(int ids[4])> readIds;
         std::function<bool(SurfaceModel::Tyre out[4])> readSurface;   // what the tyre reader decided about each tyre, the same as the road feel gets
+        std::function<int()> cameraType;                              // the game's camera type (-1 = not known): decides if the sound is heard from inside the car
         std::function<bool()> idsAvailable;
         std::function<std::string()> idsStatus;
         std::function<void(const std::string&)> log;
@@ -94,6 +96,15 @@ public:
         if (!s_) return;
         TelemetryFrame f;
         if (!parsePacket(d, (size_t)n, t, f, s_->settings.packet)) return;
+        if (hooks_.cameraType) {                                         // inside or outside the car: the sound follows the camera
+            const int ct = hooks_.cameraType();
+            s_->controller->setCameraType(ct);
+            if (ct != lastCamType_) {
+                lastCamType_ = ct;
+                const int v = cabin::ViewOf(ct, s_->settings.cabinTypeLo, s_->settings.cabinTypeHi);
+                log("Dynamic audio: camera type " + std::to_string(ct) + (v < 0 ? " (not known, heard from inside)" : v ? ": heard from inside the car" : ": heard from outside the car"));
+            }
+        }
         s_->controller->onFrame(f);
         if (s_->controller->debris.crashCount != crashesLogged_) {      // one line per crash, so the threshold can be tuned from the log
             crashesLogged_ = s_->controller->debris.crashCount;
@@ -137,6 +148,12 @@ public:
         liveWet_ = v;
         std::lock_guard<std::mutex> lk(mu_);
         if (s_) s_->controller->setWetLevel(v);
+    }
+    // Live level of the interior noises (fan, wind, panel buzz, rattles) from the menu: 0 = none, 1 = normal, 2 = twice. Safe from any thread.
+    void setCabinLevel(float v) {
+        liveCabin_ = v;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (s_) s_->controller->setCabinLevel(v);
     }
 
     // A tyre hit (or left) standing water: plays the splash, panned to that tyre, louder and lower the harder it hit (0..1).
@@ -218,7 +235,8 @@ private:
         st.drivetrain = drive_.load(); st.wheelbase = wheelbase_.load(); st.cgToFront = cgToFront_.load(); st.trackWidth = trackWidth_.load();
     }
     std::atomic<bool> speedKph_{true};
-    std::atomic<float> liveDebris_{1.0f}, liveImpacts_{1.0f}, liveSusp_{1.0f}, liveWet_{1.0f};
+    std::atomic<float> liveDebris_{1.0f}, liveImpacts_{1.0f}, liveSusp_{1.0f}, liveWet_{1.0f}, liveCabin_{1.0f};
+    int lastCamType_ = -2;
     std::atomic<long long> lastFrameNs_{0};
     long long nextDebugNs_ = 0;
     static long long nowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -252,6 +270,7 @@ private:
         s.controller.reset(new AudioController(s.settings, *s.sink));
         s.controller->setSurfaceMemory(&mem_);
         s.controller->setWetLevel(liveWet_.load());
+        s.controller->setCabinLevel(liveCabin_.load());
         s.controller->materials().loadOverrides(dir_ + "ForceFXAudio\\materials.csv");
         s.sink->silence();
     }
@@ -284,19 +303,21 @@ private:
             bool fromRbr = false;
             if (const int made = wsnd::addWaterFallbacks(*s->bank, &fromRbr)) log("Dynamic audio: made " + std::to_string(made) + " of splash / water_loop / water_hit that the sounds folder does not have" + (fromRbr ? " (the splash is built from RBR's own water sound)" : " in code") + " (add your own water_*.wav to replace them)");
             if (wsnd::addWetFallbacks(*s->bank)) log("Dynamic audio: made wet_hiss_loop (the spray of wet ground) in code");
+            if (const int made = wsnd::addCabinFallbacks(*s->bank)) log("Dynamic audio: made " + std::to_string(made) + " interior sound(s) (fan, wind, panel buzz, rattles) in code");
             log("Audio devices: " + WaveOutPlayer::describeDevices());
             for (const std::string& e : s->bank->errors) log("  sound problem: " + e);
 
             s->mixer.reset(new Mixer());
             s->mixer->master = st.masterVolume;
             s->mixer->total = st.totalGain;
-            s->mixer->cabin.configure(st.cabinEffect, st.cabinLowpassHz, st.cabinBassDb, st.cabinReverb);
+            s->mixer->cabin.configure(true, cabin::kLowpassHz, cabin::kBassDb, cabin::kReverb, cabin::kBoomDb);
+            s->mixer->cabin.setTrim(cabin::kTrim);
             s->matTable.loadOverrides(dataDir + "materials.csv");
             s->sets.reset(new SoundSetMap(*s->bank, s->matTable, st));
             s->sink.reset(new MixerSink(*s->mixer, *s->bank, st, s->sets.get()));
             s->sink->setLiveLevels(liveDebris_.load(), liveImpacts_.load(), liveSusp_.load());
             s->controller.reset(new AudioController(st, *s->sink));
-            s->controller->setSurfaceMemory(&mem_); s->controller->setWetLevel(liveWet_.load());
+            s->controller->setSurfaceMemory(&mem_); s->controller->setWetLevel(liveWet_.load()); s->controller->setCabinLevel(liveCabin_.load());
             s->controller->materials().loadOverrides(dataDir + "materials.csv");
 
             if (!wantOn_.load()) { state_ = Off; loading_ = false; return; }   // switched off again while loading

@@ -16,6 +16,7 @@ struct Layout {
     int velSurge = 88, velSway = 92, velHeave = 96, yawRate = 108;
     int accSurge = 112, accSway = 116, accHeave = 120;
     int rpm = 136, rpmMax = -1;                // rpmMax: -1 = this packet has no rev limit
+    float rpmScale = 1.0f;                     // multiplies the rpm field to get revs per minute
     int suspBase[4] = {152, 280, 408, 536};    // the four suspension blocks, LF, RF, LB, RB
     int suspStride = 128;                      // distance between two blocks (suspBase follows it when set with SetSuspension)
     // offsets inside one suspension block

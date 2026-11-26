@@ -210,6 +210,7 @@ struct Config {
     int   fxAudio = 0;               // dynamic audio (settings in the [Audio] section of ForceFX.ini); off until switched on
     float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in [Audio] of ForceFX.ini)
     float audioImpact = 1.0f;        // 0..4 live multiplier on impacts and landings (on top of EventLevel)
+    float audioCabin = 1.0f;         // 0..2 live multiplier on the interior noises (fan, wind, panel buzz, rattles), heard only from inside the car
     float audioWet = 1.0f;           // 0..2 live multiplier on how much damp and wet ground changes the tyre sounds (on top of the Wet* settings in [Audio])
     float audioSusp = 1.0f;          // 0..4 live multiplier on suspension creaks and bottoming out (on top of SqueakLevel / BottomOutLevel)
     int   fxCamera = 0;              // head movement in the cockpit camera (settings in the [Camera...] sections of ForceFX.ini)
@@ -291,7 +292,7 @@ Telem::Layout LayoutFromConfig(const Config& c) {
     l.steering = c.offSteering; l.throttle = c.offThrottle; l.brake = c.offBrake; l.handbrake = c.offHandbrake; l.gear = c.offGear; l.carRoll = c.offCarRoll;
     l.speed = c.offSpeed; l.velSurge = c.offVelSurge; l.velSway = c.offVelSway; l.velHeave = c.offVelHeave; l.yawRate = c.offYawRate;
     l.accSurge = c.offAccSurge; l.accSway = c.offAccSway; l.accHeave = c.offAccHeave;
-    l.rpm = c.offRpm; l.rpmMax = c.offRpmMax;
+    l.rpm = c.offRpm; l.rpmMax = c.offRpmMax; l.rpmScale = c.rpmScale;
     l.SetSuspension(c.offSuspBase, c.suspStride);
     l.strutForce = c.offStrut; l.pistonVelocity = c.offPiston; l.currentSegment = c.offSegment;
     return l;
@@ -316,7 +317,7 @@ void ClampConfig(Config& c) {
     c.crashBoost = clampf(c.crashBoost, 0.0f, 3.0f); c.crashAdd = clampf(c.crashAdd, 0.0f, 1.0f);
     c.maxForceMul = ForceScale::Cap(c.maxForceMul);
     c.fxAudio = c.fxAudio ? 1 : 0;
-    c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f); c.audioWet = clampf(c.audioWet, 0.0f, 2.0f);
+    c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f); c.audioWet = clampf(c.audioWet, 0.0f, 2.0f); c.audioCabin = clampf(c.audioCabin, 0.0f, 2.0f);
     c.fxCamera = c.fxCamera ? 1 : 0; c.fxWindscreen = c.fxWindscreen ? 1 : 0;
     c.fxWater = c.fxWater ? 1 : 0; c.waterGain = clampf(c.waterGain, 0.0f, 2.0f); c.waterHeavy = clampf(c.waterHeavy, 0.0f, 2.0f);
     c.fxAccelLight = c.fxAccelLight ? 1 : 0; c.accelLight = clampf(c.accelLight, 0.0f, 2.0f);
@@ -368,7 +369,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     I("OffsetGear", c.offGear); I("OffsetCarRoll", c.offCarRoll); I("OffsetVelHeave", c.offVelHeave);
     I("EnableWater", c.fxWater); F("WaterGain", c.waterGain); F("WaterHeaviness", c.waterHeavy);
     I("EnableAccelLight", c.fxAccelLight); F("AccelLightness", c.accelLight);
-    I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp); F("AudioWetLevel", c.audioWet);
+    I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp); F("AudioWetLevel", c.audioWet); F("AudioCabinLevel", c.audioCabin);
     I("EnableCamera", c.fxCamera); I("EnableWindscreen", c.fxWindscreen);
     I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
@@ -2733,6 +2734,7 @@ private:
         m_audio.setActive(base.fxAudio != 0);
         m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
         m_audio.setWetLevel(base.audioWet);
+        m_audio.setCabinLevel(base.audioCabin);
         while (m_run) {
             // Wait for a packet from either source (or 20 ms), then handle everything that has arrived.
             if (nWait) {
@@ -2770,6 +2772,7 @@ private:
                 m_audio.setActive(base.fxAudio != 0);
                 m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
                 m_audio.setWetLevel(base.audioWet);
+                m_audio.setCabinLevel(base.audioCabin);
             }
             {   // telemetry cobble detection: copy its state for the Diagnostics page and log when it switches on and off
                 m_cobScore = synth.cob.score; m_cobLevel = synth.cob.ema;
@@ -2951,6 +2954,7 @@ private:
             {"Audio: impact / landing level",    "AudioImpactLevel",   nullptr, &Config::audioImpact, 0.0f,   4.0f, 0.1f,  'x', false},
             {"Audio: suspension level",          "AudioSuspensionLevel", nullptr, &Config::audioSusp, 0.0f,   4.0f, 0.1f,  'x', false},
             {"Audio: wet ground level",          "AudioWetLevel",      nullptr, &Config::audioWet,     0.0f,   2.0f, 0.1f,  'x', false},
+            {"Audio: cabin noises level",        "AudioCabinLevel",    nullptr, &Config::audioCabin,   0.0f,   2.0f, 0.1f,  'x', false},
             {"Camera movement",                  "EnableCamera",       &Config::fxCamera,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Windscreen effects (restart)",     "EnableWindscreen",   &Config::fxWindscreen, nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             // effect switches (turn effects off to feel the others on their own)
@@ -3072,6 +3076,7 @@ private:
             {"EnableBrake",        "Turns the brake feel on or off: the braking judder, the scrub when the front wheels lock, and the steering going light when they do. It rides on RBR's own force like the road feel."},
             {"LockLightness",      "How much RBR's steering force drops while the front tyres are locked: they have stopped gripping, so the wheel goes light. x1.00 takes half of it away when both are fully locked. 0 = off."},
             {"BrakeHeaviness",     "Extra weight in the steering under hard braking, from the front load the telemetry measures. RBR already makes it heavier, so this is 0 (off) unless you want more."},
+            {"AudioCabinLevel",    "How loud the car's interior noises are: the heater fan, wind round the glass, panels buzzing with the engine and things rattling over bumps. They are made in code and heard only when the camera is inside the car; outside views are not affected. 0 = off, 1 = normal, 2 = twice as loud. (The muffled, boomy cabin sound itself is automatic: it follows the camera view.)"},
             {"AudioWetLevel",      "How much damp and wet ground changes the tyre sounds: duller, quieter loose-ground loops and a spray hiss that grows with speed, made from the dry loops unless you have real wet recordings (gravel_wet_loop.wav, ...). 0 = off, 1 = the Wet* settings in ForceFX.ini, 2 = twice as much."},
             {"EnableCrash",        "Turns the crash jolt on or off: when the car hits a tree, a rock or a wall, the wheel is yanked for a moment (RBR's own force, boosted)."},
             {"CrashBoost",         "How hard the wheel is yanked in a full-strength crash, as a multiple of RBR's own force (80% = 1.8x). Never more than the overall limit (MaxForceMultiplier in ForceFX.ini)."},
@@ -3203,6 +3208,7 @@ public:
             h.idsAvailable = []() { return Surf::Found(); };
             h.idsStatus = []() { return Surf::Status(); };
             h.readSurface = [](SurfaceModel::Tyre out[4]) { return Surf::Tyres(out); };   // the audio gets what the road feel gets
+            h.cameraType = []() { return ffx::cam::CameraType(); };                       // inside or outside the car: the sound follows the camera view
             h.log = [](const std::string& s) { Logf("%s", s.c_str()); };
             m_audio.setLayout(LayoutFromConfig(m_cfg));
             m_audio.configure(g_dir, h);

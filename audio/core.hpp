@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include "../materials.hpp"
+#include "cabin.hpp"
 #include "../surface_model.hpp"    // what the plugin knows about the ground under a tyre, shared with the road feel
 #include "../wet_surface.hpp"      // what damp and wet ground do to the tyre sounds
 #include "../telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
@@ -76,8 +77,9 @@ struct Settings {
     // sideways, or locked under braking. Any tyre can slide; only the driven ones can spin.
     double squealStart = Tyre::kSpinStart, slideStart = Tyre::kSlideStart;
     int drivetrain = Tyre::kDefaultDrivetrain;   // which tyres the engine drives (FWD, RWD, AWD); the plugin sets it per car (ForceFXCars.ini), with the car geometry below
-    bool cabinEffect = true;           // sound as heard from inside the car: muffled, bassy, with cabin reflections
-    double cabinLowpassHz = 2600, cabinBassDb = 6, cabinReverb = 0.2;
+    // Inside the car (cabin.hpp): follows the camera view by itself. Only the camera types that count as inside can be set, and the level of the interior noises.
+    int cabinTypeLo = cabin::kTypeLo, cabinTypeHi = cabin::kTypeHi;
+    double cabinAmbience = 1.0;        // level of the interior noises (fan, wind, panel buzz, rattles): 0 = none
     bool speedIsKph = true;
     // Two different speeds exist in the telemetry. The velocity vector (VelSurge/VelSway) is the car's true speed over the
     // ground, in m/s. The Speed field is the speedometer, a driven-wheel speed: it jumps up in wheelspin, drops in lock-up,
@@ -145,10 +147,9 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "SlideLevel") s.slideLevel = d();
     else if (key == "SquealStart") s.squealStart = clampd(d(), 0.1, 3.0);
     else if (key == "SlideStart") s.slideStart = clampd(d(), 0.2, 4.0);
-    else if (key == "CabinEffect") s.cabinEffect = toBool(v);
-    else if (key == "CabinLowpassHz") s.cabinLowpassHz = d();
-    else if (key == "CabinBassDb") s.cabinBassDb = d();
-    else if (key == "CabinReverb") s.cabinReverb = d();
+    else if (key == "CabinCameraMin") s.cabinTypeLo = (int)clampd(d(), 0.0, 99.0);
+    else if (key == "CabinCameraMax") s.cabinTypeHi = (int)clampd(d(), 0.0, 99.0);
+    else if (key == "CabinAmbience") s.cabinAmbience = clampd(d(), 0.0, 2.0);
     else if (key == "SpeedIsKph") s.speedIsKph = toBool(v);
     else if (key == "GroundSpeedSource") { std::string lv = v; for (char& ch : lv) ch = (char)std::tolower((unsigned char)ch); s.groundSource = (lv == "velocity" || lv == "1") ? 1 : (lv == "speed" || lv == "speedfield" || lv == "2") ? 2 : 0; }
     else if (key == "VelocityScale") s.velocityScale = clampd(d(), 0.01, 100.0);
@@ -222,6 +223,7 @@ struct TelemetryFrame {
     float speed = 0;          // raw game units (kph or mph)
     float steering = 0, throttle = 0, brake = 0, handbrake = 0;
     int gear = 0;
+    float rpm = 0;            // engine speed (the layout's RpmScale applied); 0 when the packet has none
     float velSurge = 0, velSway = 0, velHeave = 0, yawRate = 0;
     float accSurge = 0, accSway = 0, accHeave = 0;
     WheelSample wheels[4];
@@ -238,6 +240,7 @@ inline bool parsePacket(const uint8_t* d, size_t length, double time, TelemetryF
     f.haveSteps = L.steps >= 0; f.steps = f.haveSteps ? U(L.steps) : 0u;
     f.steering = F(L.steering); f.throttle = F(L.throttle); f.brake = F(L.brake); f.handbrake = F(L.handbrake);
     f.gear = (int)U(L.gear);
+    f.rpm = L.rpm >= 0 && (size_t)(L.rpm + 4) <= length ? std::max(0.0f, F(L.rpm) * L.rpmScale) : 0.0f;
     f.speed = std::fabs(F(L.speed));
     f.velSurge = F(L.velSurge); f.velSway = F(L.velSway); f.velHeave = F(L.velHeave); f.yawRate = F(L.yawRate);
     f.accSurge = F(L.accSurge); f.accSway = F(L.accSway); f.accHeave = F(L.accHeave);
@@ -630,6 +633,10 @@ public:
     virtual void setRumble(float gl, float gr) = 0;
     // Telemetry-driven tone for one tyre's sounds, -1 (deep, dull) .. +1 (bright, crisp). Optional.
     virtual void setWheelTone(int wheel, float tone) { (void)wheel; (void)tone; }
+    // The camera view: how inside the car the listener is, 0 (outside) .. 1 (the cockpit), and the interior noises (see cabin.hpp). Optional.
+    virtual void setInside(float a) { (void)a; }
+    virtual void setCabinLevel(float l) { (void)l; }
+    virtual void setCabin(float fan, float wind, float buzz, float buzzRate) { (void)fan; (void)wind; (void)buzz; (void)buzzRate; }
     // The spray hiss of wet ground under one tyre (made in code, see wet_surface.hpp). Optional.
     virtual void setWetHiss(int wheel, float gl, float gr, float rate) { (void)wheel; (void)gl; (void)gr; (void)rate; }
     virtual void trigger(SoundEvent kind, int cls, float gl, float gr, float rate) = 0;
@@ -876,6 +883,26 @@ class AudioController {
     double lastTime_ = -1;
     ISurfaceMemory* mem_ = nullptr;
     std::atomic<float> wetLevel_{1.0f};
+    std::atomic<int> cameraType_{-1};
+    std::atomic<float> cabinLevel_{1.0f};
+    cabin::Inside inside_;
+    // The camera view decides how inside the car the sound is, and the interior makes its own noise: the fan, the wind, panels buzzing with the engine.
+    void cabinStep(const TelemetryFrame& f, double dt) {
+        const int view = cabin::ViewOf(cameraType_.load(), s_.cabinTypeLo, s_.cabinTypeHi);
+        const float in = inside_.Step(view, dt);
+        const float lvl = (float)(cabinLevel_.load() * s_.cabinAmbience);
+        cabin::In ci;
+        ci.speedKph = (float)(analyzer.speedMs * 3.6);
+        ci.rpm = f.rpm; ci.throttle = f.throttle;
+        double rough = 0; for (int w = 0; w < 4; ++w) rough += analyzer.wheels[w].roughness / std::max(s_.roughThreshold, 1e-3);
+        ci.rough = (float)clampd(rough / 4.0 - 0.3, 0.0, 1.0);
+        ci.airborne = analyzer.airborne ? 1.0f : 0.0f;
+        ci.inside = in; ci.level = lvl;
+        const cabin::Ambience a = cabin::Make(ci);
+        sink_.setInside(in);
+        sink_.setCabinLevel(lvl);
+        sink_.setCabin(a.fan, a.wind, a.buzz, a.buzzRate);
+    }
     MaterialTable table_;
     MemoryHealth health_;
     ClassSoundSets defaultSets_;
@@ -893,6 +920,9 @@ public:
     void setSurfaceMemory(ISurfaceMemory* m) { mem_ = m; }
     // The live multiplier on the wet treatment (the menu), 0 .. 2. Safe from any thread.
     void setWetLevel(float v) { wetLevel_ = v; }
+    // The game's camera type (-1 = not known) and the live level of the interior noises, 0 .. 2. Safe from any thread.
+    void setCameraType(int t) { cameraType_ = t; }
+    void setCabinLevel(float v) { cabinLevel_ = v; }
     // Normally taken from the sink; override only in tests. Null = one set per coarse class.
     void setSoundSets(const ISoundSets* sets) {
         sets_ = sets ? sets : &defaultSets_;
@@ -942,6 +972,7 @@ public:
             analyzer.memClassFirst[w] = first;
         }
         analyzer.wetLevel = wetLevel_.load();
+        cabinStep(f, dt);
 
         analyzer.update(f, dt);
         if (useMem) health_.update(readOk, ids, table_);

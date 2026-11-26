@@ -2478,6 +2478,16 @@ void __fastcall hkRender(void* p) {
 
 } // namespace
 
+// The game's current camera type (the cockpit family is 3 to 6, 5 is the interior view), or -1 when it cannot be read: not the RallySimFans
+// executable, or the game has no car yet. Read-only, no hooks, so it works whether or not the camera module is on. The audio uses it to know
+// whether the sound is heard from inside the car.
+inline int CameraType() {
+    static const bool rsf = isRsfExe();
+    if (!rsf) return -1;
+    const uint32_t t = readCameraType();
+    return t == 0xFFFFFFFFu || t > 99u ? -1 : (int)t;
+}
+
 // ================================================================================================ the module
 class Camera {
 public:

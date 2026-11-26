@@ -98,6 +98,8 @@ Unit tests for the logic headers are in `tests` and `audio/tests`; each file has
 
 **Surface for road and audio.** The tyre reader decides what each tyre is on (the game's material id, its class with `Map=` corrections, wetness and how loose it is) and hands the same answer to the road feel and the audio. `ForceFXAudio\materials.csv` corrects both. Damp and wet ground change the tyre sounds from the dry recordings: duller, a little quieter loose-ground loops, a spray hiss that grows with speed and fewer stones (`[Audio]` `Wet*` settings, `AudioWetLevel` in the menu). A real recording named `..._wet_loop` / `..._damp_loop` is used as it is and gets none of that.
 
+**Inside the car.** The plugin reads the game's camera. In the cockpit view its sounds are heard through the cabin (muffled, boomy, with short reflections) and the interior makes its own noise, made in code: the heater fan, wind round the glass, panels buzzing with the engine, and rattles over bumps and landings. In an outside view none of it applies. It is automatic, not a setting; `AudioCabinLevel` in the menu sets how loud the interior noises are. `ForceFX.log` records which camera type counts as inside or outside whenever you change view (types 3 to 6 are assumed to be inside; `CabinCameraMin` / `CabinCameraMax` in `[Audio]` change that).
+
 All telemetry field offsets are the `Offset*` keys in `[ForceFX]` of `ForceFX.ini` (`telemetry_layout.hpp`): the force feedback, the audio and the camera read the packet through the same table. `ForceFX.log` starts fresh each run; the previous one is kept as `ForceFX.old.log`.
 
 ## Credits
