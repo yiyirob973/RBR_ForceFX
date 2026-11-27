@@ -127,7 +127,7 @@ constexpr int   kMinUpdateGapMs = 15;    // an effect is updated at most this of
 constexpr int   kPushMinForce = 300;     // RBR force magnitude (of 10000) below which the landing push is not added
 constexpr float kApplyPeriod  = 0.010f;  // seconds between effect updates (~100 Hz)
 
-inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+inline float clampf(float v, float lo, float hi) { return !(v >= lo) ? lo : (v > hi ? hi : v); }   // NaN comes out as lo, never passed on
 inline float clamp01(float v) { return clampf(v, 0.0f, 1.0f); }
 inline float smooth01(float e0, float e1, float x) { float t = clamp01((x - e0) / (e1 - e0)); return t * t * (3.0f - 2.0f * t); }
 inline float gauss(float x, float c, float w) { float d = (x - c) / w; return std::exp(-d * d); }
@@ -160,6 +160,8 @@ void Logf(const char* fmt, ...) {
     va_list ap; va_start(ap, fmt);
     vsnprintf(b, sizeof(b), fmt, ap);
     va_end(ap);
+    static std::mutex m;                                 // the worker, the vibration thread, the reader and the game's own thread all log
+    std::lock_guard<std::mutex> lk(m);
     FILE* f = fopen((g_dir + "ForceFX.log").c_str(), "a");
     if (f) { fprintf(f, "%s\n", b); fclose(f); }
 }
@@ -205,7 +207,6 @@ struct Config {
     float waterHeavy = 0.6f;         // 0..2: how much heavier the steering gets while the front tyres push through water (0 = off, 1 = double RBR's force)
     float lockLight = 1.0f;          // 0..2: how far RBR's force lightens while the front tyres are locked (0 = off, 1 = by half when both are fully locked)
     float brakeHeavy = 0.0f;         // 0..2: how much heavier the steering gets in hard braking (0 = off: RBR already makes it heavy)
-    int   legacyBrake = 0;           // 1 = the brake judder as a separate effect on the wheel, as it was before it moved onto RBR's force (to compare; no lock-up lightening). To be removed
     int   fxCrash = 1;               // a jolt on RBR's own force when the car hits something
     float crashBoost = 0.8f;         // 0..3: how much the force grows in a full-strength crash (0.8 = 1.8x)
     float crashAdd = 0.15f;          // 0..1: the minimum extra push of a full-strength crash, a share of full torque
@@ -315,7 +316,7 @@ void ClampConfig(Config& c) {
     c.wheelbase = clampf(c.wheelbase, 1.5f, 4.0f); c.trackWidth = clampf(c.trackWidth, 1.0f, 2.2f); c.cgToFront = clampf(c.cgToFront, 0.4f * c.wheelbase, 0.6f * c.wheelbase);
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
     c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0;
-    c.legacyBrake = c.legacyBrake ? 1 : 0; c.fxCrash = c.fxCrash ? 1 : 0;
+    c.fxCrash = c.fxCrash ? 1 : 0;
     c.lockLight = clampf(c.lockLight, 0.0f, 2.0f); c.brakeHeavy = clampf(c.brakeHeavy, 0.0f, 2.0f);
     c.crashBoost = clampf(c.crashBoost, 0.0f, 3.0f); c.crashAdd = clampf(c.crashAdd, 0.0f, 1.0f);
     c.maxForceMul = ForceScale::Cap(c.maxForceMul);
@@ -368,7 +369,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     F("BrakeHzScale", c.brakeHzScale); F("PriorityDuck", c.priorityDuck);
     I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("EnableBrake", c.fxBrake);
     I("EnableCrash", c.fxCrash); F("CrashBoost", c.crashBoost); F("CrashMinPush", c.crashAdd);
-    F("LockLightness", c.lockLight); F("BrakeHeaviness", c.brakeHeavy); I("LegacyBrake", c.legacyBrake);
+    F("LockLightness", c.lockLight); F("BrakeHeaviness", c.brakeHeavy);
     F("MaxForceMultiplier", c.maxForceMul);
     I("OffsetGear", c.offGear); I("OffsetCarRoll", c.offCarRoll); I("OffsetVelHeave", c.offVelHeave);
     I("EnableWater", c.fxWater); F("WaterGain", c.waterGain); F("WaterHeaviness", c.waterHeavy);
@@ -1745,9 +1746,30 @@ struct Synth {
     bool accWasRest = false; int accRestLogs = 0;          // the standing front share was known on the last step, and how many times it was logged
     unsigned waterEvents = 0; float waterEntry = 0.0f; int waterEntryTyre = -1; bool waterEntryIn = false;   // goes up for every splash; strength, tyre and whether it was going in (not out) for the last one (for sound and glass)
 
+    // The targets of the two engine sines (the strength each should reach), before the smoothing in Finish.
+    struct EngineOut { float low, lump; };
+    // What the road step hands on: the three band targets (road, then water on top), how strongly each side feels the road, and the ground feel per side.
+    struct RoadOut { float target[Road::kBands], water[Road::kBands], strength[2]; Surf::Feel fes[2]; };
+
+    // One step, about 100 times a second. The steps run in this order on purpose: they share the random numbers (rnd) and the trackers
+    // below, and a step may read what an earlier one left in the members (the water, the front load, the lock-up). Each step is one block
+    // of the effect, with its own comment.
     void Run(const Config& c, const Signals& s, double t, float dt, float userGain, int mag[S_COUNT], float hz[S_COUNT]) {
         thrSm += (s.throttle - thrSm) * alphaFor(dt, 0.12f);
+        const EngineOut eng = StepEngine(c, s, t, dt, hz);
+        StepWater(c, s, dt);
+        StepFrontLoad(c, s, t, dt);
+        StepSideLoad(c, s, t, dt);
+        StepTyres(c, s, dt);
+        const RoadOut road = StepRoad(c, s, t, dt, hz);
+        const float brake = StepBrake(c, s, road, hz);
+        StepForce(c, s, dt, userGain);
+        Finish(c, eng, road, brake, dt, userGain, mag);
+    }
 
+    static float WeightFeel(const Config& c) { return clampf(c.weightFeel, 0.5f, 2.0f); }   // how heavy the car feels: 1 = average
+
+    EngineOut StepEngine(const Config& c, const Signals& s, double t, float dt, float hz[S_COUNT]) {
         // ---------------- ENGINE: both strength and pitch follow the engine
         rpmPeak = revLearn.Update(s.rpm, dt);
         // rev limit: telemetry first, then the car profile or ini, then the highest rpm seen so far
@@ -1783,14 +1805,10 @@ struct Synth {
         const float A2 = (0.15f + 0.85f * idle) * (0.5f + 0.5f * thrSm) * (1.0f + 0.25f * lope * (0.2f + idle))
                        + 0.55f * grit * (0.6f + 0.4f * thrSm);
         float t2 = s.rpm > 200 ? c.engineMaxMag * 0.8f * clamp01(A2 * c.lumpScale) * engAir : 0.0f;
+        return {t1, t2};
+    }
 
-        // ---------------- ROAD: three sine bands (low, mid, high) of the road's spectrum. The pitch of each band follows the car's
-        // speed, the ground under each side decides how the strength is spread over the bands, and the tyre's contact patch takes
-        // the high bands away at low speed (road_bands.hpp). The sines are zero-mean, so they never shift RBR's own force, and the
-        // two sides add as energy, so they can not cancel each other. How the bands reach the wheel is decided in the worker loop.
-        const float spN = clamp01(s.speed / c.maxSpeed);
-        const float gSpd = smooth01(1.0f, 10.0f, s.speed);
-
+    void StepWater(const Config& c, const Signals& s, float dt) {
         // ---------------- WATER: which tyres are in standing water decides the splash on entry, the wading rumble and the planing.
         // Only the ground the surface scan found counts (Water_Surface and the ids in WaterIds=), so wet tarmac is left to the road feel.
         {
@@ -1802,7 +1820,9 @@ struct Synth {
             else wout = water.Update(wi, dt);
             if (wout.entry > 0.0f) { waterEntry = wout.entry; waterEntryTyre = wout.entryTyre; waterEntryIn = wout.entryTyre >= 0 && wi.depth[wout.entryTyre] >= 0.5f; ++waterEvents; }
         }
+    }
 
+    void StepFrontLoad(const Config& c, const Signals& s, double t, float dt) {
         // ---------------- LIGHT STEERING FROM THE FRONT LOAD: the share of the weight on the front tyres (from the four strut forces) against what it is standing still on the
         // start line. Hard acceleration moves weight to the rear, and the steering loses force in proportion. Scales RBR's own force down (see boost below).
         {
@@ -1821,7 +1841,9 @@ struct Synth {
                 Logf("Light steering: front load %.0f%% below standing (standing %.2f, now %.2f), accelerating %.2f g, %.0f km/h -> steering force x%.2f", (double)(100.0f * aout.rawDrop), (double)aout.base, (double)ai.frontShare, (double)aout.accelG, (double)(ai.speed * 3.6f), (double)AccelLight::Mul(aout, c.accelLight));
             }
         }
+    }
 
+    void StepSideLoad(const Config& c, const Signals& s, double t, float dt) {
         // ---------------- SIDE LOAD: the weight across the car, from the same strut-force shares. Scales RBR's force (swell in a corner, surge in a direction change).
         {
             WeightTransfer::In wi;
@@ -1834,7 +1856,9 @@ struct Synth {
                 Logf("Weight transfer: side load %+.0f%% of the weight, %.2f g sideways, swell %.2f, surge %.2f -> steering force x%.2f", (double)(100.0f * lout.load), (double)s.latG, (double)lout.swell, (double)lout.surge, (double)WeightTransfer::LateralMul(lout, c.weightGain));
             }
         }
+    }
 
+    void StepTyres(const Config& c, const Signals& s, float dt) {
         // ---------------- TYRE MOTION: wheelspin and slides, each tyre judged against the grip limit of the ground under it.
         //   Wheelspin: a driven tyre turning faster than the ground, throttle open. A rear-wheel-drive car only has it at the rear.
         //   Slide: a tyre moving the wrong way, sideways or locked up under braking or the handbrake. Any tyre can slide.
@@ -1864,9 +1888,19 @@ struct Synth {
             lockAmt = clamp01(0.5f * (lockSm[0] + lockSm[1]) + 0.25f * (lockSm[2] + lockSm[3]));
             lockFront = BrakeFx::FrontLock(lockSm);       // the front tyres only: that is what the steering loses
         }
+    }
+
+    RoadOut StepRoad(const Config& c, const Signals& s, double t, float dt, float hz[S_COUNT]) {
+        // ---------------- ROAD: three sine bands (low, mid, high) of the road's spectrum. The pitch of each band follows the car's
+        // speed, the ground under each side decides how the strength is spread over the bands, and the tyre's contact patch takes
+        // the high bands away at low speed (road_bands.hpp). The sines are zero-mean, so they never shift RBR's own force, and the
+        // two sides add as energy, so they can not cancel each other. How the bands reach the wheel is decided in the worker loop.
+        const float spN = clamp01(s.speed / c.maxSpeed);
+        const float gSpd = smooth01(1.0f, 10.0f, s.speed);
+
         const auto sideDyn = [](const float* a, int k2) { return std::max(a[k2], 0.6f * a[2 + k2]); };   // front tyre of the side is k2, rear tyre 2 + k2
         const float texMono = clamp01(s.texture + 0.9f * s.bump);
-        const float wf = clampf(c.weightFeel, 0.5f, 2.0f);
+        const float wf = WeightFeel(c);
         const float thump[2] = { s.thumpL, s.thumpR };
         const float sideTex[2] = { s.texL, s.texR };
         const float sideLoad[2] = { s.loadL, s.loadR };
@@ -1924,17 +1958,28 @@ struct Synth {
         if (c.fxWater) Water::BandMagnitudes(wout, c.waterGain, waterJit, waterTarget);
         for (int b = 0; b < Road::kBands; ++b)
             hz[S_ROAD1 + b] = clampf(plan.hz[b] * bandHzJit[b] / std::sqrt(wf), 20.0f, kHardMaxHz);   // heavier cars sound lower
+        RoadOut o;
+        for (int b = 0; b < Road::kBands; ++b) { o.target[b] = roadTarget[b]; o.water[b] = waterTarget[b]; }
+        for (int k2 = 0; k2 < 2; ++k2) { o.strength[k2] = rside[k2].strength; o.fes[k2] = fes[k2]; }
+        return o;
+    }
 
+    float StepBrake(const Config& c, const Signals& s, const RoadOut& road, float hz[S_COUNT]) {
         // ---------------- BRAKE: front-end judder, harsh on lock-up. It rides on RBR's force as one more band of the road vibration (see the worker loop), and
         // lock-up of the front tyres also lightens RBR's force (below). The weight on the front comes from the shared front-load tracker.
         const float gB = smooth01(2.0f, 8.0f, s.speed);
         // Lock-up shakes the wheel according to the ground: soft ground swallows it, hard ground passes it on.
-        const float lockU = std::max(s.lock, lockAmt) * (c.fxSurface ? clampf(0.5f * (fes[0].amp + fes[1].amp), 0.4f, 1.3f) : 1.0f);
+        const float lockU = std::max(s.lock, lockAmt) * (c.fxSurface ? clampf(0.5f * (road.fes[0].amp + road.fes[1].amp), 0.4f, 1.3f) : 1.0f);
         const float Ab = BrakeFx::JudderAmp(s.brake, std::max(s.dive, aout.dive), lockU);
         const float gHard = c.fxSurface ? 0.5f * (gnd[0].hard + gnd[1].hard) : 0.4f, gLoose = c.fxSurface ? 0.5f * (gnd[0].loose + gnd[1].loose) : 0.6f;   // the ground under the front tyres sets the pitch of a lock-up scrub
         hz[S_BRAKE] = BrakeFx::JudderHz(lockU, s.frontRev, gHard, gLoose, lockU > 0.1f ? rnd() : 0.0f, c.brakeHzScale);
         float t4 = c.brakeMaxMag * Ab * gB * clampf(0.65f + 0.35f * s.loadF, 0.5f, 1.3f);   // more load on the fronts means more judder
+        return t4;
+    }
 
+    // Every scaling of RBR's own force: landing, water, front load, side load, lock-up, crash (combined and bounded by force_scale.hpp).
+    void StepForce(const Config& c, const Signals& s, float dt, float userGain) {
+        const float wf = WeightFeel(c);
         // ---------------- LANDING: no effect of its own. A detected landing boosts RBR's own steering force (see EffectTap):
         // a fast attack, a short hold, then a decay, scaled by how severe the landing was and by the live level.
         // A jump is rare, rough ground is not: bumps and washboard fire hit events one after another, and boosting RBR's force for each
@@ -1961,8 +2006,8 @@ struct Synth {
             fp.waterHeavy = Water::HeavyMul(wout, c.waterHeavy * ugc);
         }
         // The front load: lighter while hard acceleration unloads the front, heavier in hard braking (off unless wanted: RBR already does this).
-        fp.frontLoad = WeightTransfer::FrontMul(aout, c.fxAccelLight ? c.accelLight * ugc : 0.0f, c.fxBrake && !c.legacyBrake ? c.brakeHeavy * ugc : 0.0f);
-        if (c.fxBrake && !c.legacyBrake) fp.brakeLock = BrakeFx::LockMul(lockFront, c.lockLight * ugc);   // lighter while the front tyres are locked
+        fp.frontLoad = WeightTransfer::FrontMul(aout, c.fxAccelLight ? c.accelLight * ugc : 0.0f, c.fxBrake ? c.brakeHeavy * ugc : 0.0f);
+        if (c.fxBrake) fp.brakeLock = BrakeFx::LockMul(lockFront, c.lockLight * ugc);   // lighter while the front tyres are locked
         if (c.fxWeight) fp.lateral = WeightTransfer::LateralMul(lout, c.weightGain * ugc);               // heavier as the weight builds up on the outside and swings across the car
         if (c.fxCrash) {                                                              // a jolt when the car hits something
             const float lev = crashEnv.Step(s.crashSeq, s.crashSev, dt, ugc);
@@ -1971,7 +2016,12 @@ struct Synth {
         } else crashEnv.Reset();
         boostMul = fscale.Step(ForceScale::Product(fp), dt, c.maxForceMul);
         boostAdd = ForceScale::Add(addRaw);
+    }
 
+    // Smooths the targets, lets the road take priority over the engine, applies the ceiling, the thermal derate and the live level.
+    void Finish(const Config& c, const EngineOut& eng, const RoadOut& road, float t4, float dt, float userGain, int mag[S_COUNT]) {
+        const float wf = WeightFeel(c);
+        float t1 = eng.low, t2 = eng.lump;
         // attack and release: road is deliberately quick (for sharpness), engine is rounder
         auto follow = [&](int i, float target, float up, float down) {
             sm[i] += (target - sm[i]) * (target > sm[i] ? up : down);
@@ -1981,13 +2031,13 @@ struct Synth {
         follow(S_ENG2, t2, 0.25f, 0.12f);
         const float roadDown = clampf(0.40f / wf, 0.15f, 0.70f);                     // heavier cars let the thump ring out longer
         // The road follows the ground under the side that is feeling more of it (equal weight when both are silent).
-        const float sumSt = rside[0].strength + rside[1].strength, w0 = sumSt > 1e-6f ? rside[0].strength / sumSt : 0.5f;
-        const float roadAtk = w0 * fes[0].atk + (1.0f - w0) * fes[1].atk;
-        const float roadRel = clampf(roadDown * (w0 * fes[0].rel + (1.0f - w0) * fes[1].rel), 0.05f, 0.95f);   // gravel and ice let go fast, snow slowly
+        const float sumSt = road.strength[0] + road.strength[1], w0 = sumSt > 1e-6f ? road.strength[0] / sumSt : 0.5f;
+        const float roadAtk = w0 * road.fes[0].atk + (1.0f - w0) * road.fes[1].atk;
+        const float roadRel = clampf(roadDown * (w0 * road.fes[0].rel + (1.0f - w0) * road.fes[1].rel), 0.05f, 0.95f);   // gravel and ice let go fast, snow slowly
         const float waterAtk = std::max(roadAtk, 0.55f * std::max(wout.splash[0], wout.splash[1]));   // a splash comes in hard
         for (int b = 0; b < Road::kBands; ++b) {
-            const float rt = c.fxRoad ? roadTarget[b] : 0.0f;
-            follow(S_ROAD1 + b, std::sqrt(rt * rt + waterTarget[b] * waterTarget[b]), waterAtk, roadRel);
+            const float rt = c.fxRoad ? road.target[b] : 0.0f;
+            follow(S_ROAD1 + b, std::sqrt(rt * rt + road.water[b] * road.water[b]), waterAtk, roadRel);
         }
         follow(S_BRAKE, c.fxBrake ? t4 : 0.0f, 0.50f, 0.20f);
         // Priority: road beats engine. A lower layer backs off while a higher one is active.
@@ -2851,10 +2901,9 @@ private:
             // effects. Only without RBR's constant-force updates (no hook yet, test mode, menus) is the road merged into one sine
             // effect of its own, so that the wheel test can still play it.
             const bool viaRbr = RoadVib::Ready();
-            // The brake judder rides along as the fourth band (one effect fewer on the wheel). Only the wheel test, or LegacyBrake=1, plays it as an effect of its own.
-            const bool brakeViaRbr = viaRbr && !base.legacyBrake;
-            RoadVib::g_mag[3] = brakeViaRbr ? mag[S_BRAKE] : 0; RoadVib::g_hz[3] = hz[S_BRAKE];
-            if (brakeViaRbr) mag[S_BRAKE] = 0;
+            // The brake judder rides along as the fourth band (one effect fewer on the wheel). Only the wheel test plays it as an effect of its own.
+            RoadVib::g_mag[3] = viaRbr ? mag[S_BRAKE] : 0; RoadVib::g_hz[3] = hz[S_BRAKE];
+            if (viaRbr) mag[S_BRAKE] = 0;
             if (viaRbr) {
                 for (int b = 0; b < Road::kBands; ++b) { RoadVib::g_mag[b] = mag[S_ROAD1 + b]; RoadVib::g_hz[b] = hz[S_ROAD1 + b]; mag[S_ROAD1 + b] = 0; }
             } else {                                          // the road as one effect of its own: all three bands merged into one sine

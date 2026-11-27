@@ -93,7 +93,7 @@ When reporting a problem, attach `ForceFX.log` (beside the DLL), plus `ForceFXCa
 
 32-bit Windows DLL, built with MSVC. From an x86 Visual Studio command prompt run `build.bat`; it writes `out\RBR_ForceFX.dll`.
 
-The version shown in the game and in `ForceFX.log` is the git tag the build was made from (the release workflow passes it to `build.bat` as `FORCEFX_VERSION`, for example `v0.7.0`). A plain `build.bat` run shows `dev`.
+The version shown in the game and in `ForceFX.log` is the git tag the build was made from (the release workflow passes it to `build.bat` as `FORCEFX_VERSION`, for example `v0.7.0`). A plain `build.bat` run shows "Dev build" and the date it was compiled.
 
 Unit tests for the logic headers are in `tests` and `audio/tests`; each file has its build line at the top. The release workflow runs them (with g++) before it builds anything; `camera_packet_test` needs the Windows headers and runs only on a Windows machine.
 
