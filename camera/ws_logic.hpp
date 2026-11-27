@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
-#include "../materials.hpp"
+#include "road/materials.hpp"
 
 namespace ffx {
 namespace cam {

@@ -6,15 +6,9 @@
 #include <limits>
 #include <vector>
 
-#include "../rev_limit.hpp"
+#include "effects/rev_limit.hpp"
 #include <cstring>
-
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
+#include "tests/mini_test.hpp"
 
 static const float kNaN = std::numeric_limits<float>::quiet_NaN();
 using RevLimit::Learner;
@@ -58,9 +52,5 @@ TEST(candidates_respect_the_scale_and_the_output_size) {
     CHECK(RevLimit::FindCandidates(nullptr, 40, -1, 1.0f, 0.0f, out, 3) == 0); CHECK(RevLimit::FindCandidates(pk, 40, -1, 10.0f, 0.0f, out, 0) == 0);
 }
 
-int main() {
-    for (auto& r : regs()) { int before = g_fail; r.fn(); std::printf("%s %s\n", before == g_fail ? "ok  " : "FAIL", r.name); }
-    std::printf("\n%d checks, %d failed\n", g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }
 

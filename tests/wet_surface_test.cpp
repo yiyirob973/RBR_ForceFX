@@ -5,14 +5,9 @@
 #include <functional>
 #include <limits>
 #include <vector>
-#include "../wet_surface.hpp"
+#include "road/wet_surface.hpp"
+#include "tests/mini_test.hpp"
 
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
 static const float kNaN = std::numeric_limits<float>::quiet_NaN();
 using WetSurface::Make; using WetSurface::Params; using WetSurface::Plan;
 
@@ -69,8 +64,4 @@ TEST(bad_numbers_give_a_finite_plan) {
     CHECK(std::isfinite(p.tone) && std::isfinite(p.gain) && std::isfinite(p.hiss) && std::isfinite(p.stones) && std::isfinite(p.wetStone));
 }
 
-int main() {
-    for (auto& r : regs()) { int before = g_fail; r.fn(); std::printf("%s %s\n", before == g_fail ? "ok  " : "FAIL", r.name); }
-    std::printf("\n%d checks, %d failed\n", g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

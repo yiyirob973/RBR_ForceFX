@@ -6,16 +6,10 @@
 #include <functional>
 #include <string>
 #include <vector>
-#include "../materials.hpp"
-#include "../surface_feel.hpp"
-#include "../road_feel.hpp"
-
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
+#include "road/materials.hpp"
+#include "road/surface_feel.hpp"
+#include "road/road_feel.hpp"
+#include "tests/mini_test.hpp"
 
 static int apply(const char* csv) {
     const std::string path = "material_overrides_test.csv";
@@ -63,8 +57,4 @@ TEST(an_override_that_changes_nothing_changes_nothing) {
     Road::Ground g; CHECK(Road::GroundOfId(17, g));
 }
 
-int main() {
-    for (auto& r : regs()) { int before = g_fail; r.fn(); std::printf("%s %s\n", before == g_fail ? "ok  " : "FAIL", r.name); }
-    std::printf("\n%d checks, %d failed\n", g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

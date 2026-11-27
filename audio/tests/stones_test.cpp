@@ -1,5 +1,5 @@
 // Tests for the telemetry-driven stone spray. Self-contained; build and run from this folder:
-//   g++ -std=c++17 -O1 -I.. stones_test.cpp -o stones_test && ./stones_test
+//   g++ -std=c++17 -O1 -I../.. stones_test.cpp -o stones_test && ./stones_test
 #include <cstdio>
 #include <functional>
 #include <random>
@@ -7,15 +7,9 @@
 #include <fstream>
 #include "core.hpp"
 #include "audio.hpp"
+#include "tests/mini_test.hpp"
 
 using namespace ffx;
-
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 struct FakeSink : IAudioSink {
     int stones = 0, leftStones = 0, rightStones = 0;
@@ -236,8 +230,4 @@ TEST(settings_are_read_only_from_the_named_section) {
     std::filesystem::remove(p);
 }
 
-int main() {
-    for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
-    std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

@@ -3,15 +3,9 @@
 #include <cstdio>
 #include <functional>
 #include <vector>
-#include "../surface_feel.hpp"
-#include "../surface_model.hpp"
-
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
+#include "road/surface_feel.hpp"
+#include "road/surface_model.hpp"
+#include "tests/mini_test.hpp"
 
 TEST(the_numbers_in_the_mapping_are_the_readers_classes) {
     CHECK(SurfaceModel::AudioClassOf(Surf::C_TARMAC) == 0);
@@ -36,8 +30,4 @@ TEST(a_tyre_with_nothing_known_says_so) {
     SurfaceModel::Tyre t; CHECK(t.id == -1 && t.audioClass == -1 && t.wet == 0 && t.loose < 0.0f);
 }
 
-int main() {
-    for (auto& r : regs()) { int before = g_fail; r.fn(); std::printf("%s %s\n", before == g_fail ? "ok  " : "FAIL", r.name); }
-    std::printf("\n%d checks, %d failed\n", g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

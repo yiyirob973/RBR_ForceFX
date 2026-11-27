@@ -1,19 +1,13 @@
 // Tests for the suspension creaks and bottoming-out thumps: rare events that follow the telemetry, never a stream.
-//   g++ -std=c++17 -O1 -I.. suspension_test.cpp -o suspension_test && ./suspension_test
+//   g++ -std=c++17 -O1 -I../.. suspension_test.cpp -o suspension_test && ./suspension_test
 #include <cstdio>
 #include <functional>
 #include <random>
 #include <vector>
 #include "core.hpp"
+#include "tests/mini_test.hpp"
 
 using namespace ffx;
-
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
 
 struct Ev { SoundEvent kind; double t; float gl, gr; };
 struct FakeSink : IAudioSink {
@@ -132,8 +126,4 @@ TEST(default_levels_keep_them_under_the_loops) {
     Settings s; CHECK(s.squeakLevel <= 0.7 && s.bottomLevel <= 1.0);
 }
 
-int main() {
-    for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
-    std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

@@ -18,6 +18,10 @@ namespace detail {
 inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 }
 
+// Set from the ini ([Surface] FrontWeight and FadeSeconds) by the plugin.
+inline float g_front = 0.90f;   // how much of the road comes from the front tyres (0..1)
+inline float g_fade = 0.25f;    // seconds to cross-fade between two surfaces
+
 enum Cls { C_NONE = 0, C_TARMAC, C_GRAVEL, C_SNOW, C_ICE, C_SOFT, C_COUNT };
 inline const char* ClsName(int c) {
     static const char* const n[C_COUNT] = {"unknown", "tarmac", "gravel", "snow", "ice", "soft"};

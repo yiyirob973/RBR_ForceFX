@@ -1,19 +1,14 @@
 // Tests for the surface classes, the Map= overrides and the class names (surface_feel.hpp). Self-contained:
-//   g++ -std=c++17 -O1 surface_feel_test.cpp -o surface_feel_test && ./surface_feel_test
+//   g++ -std=c++17 -O1 -I.. surface_feel_test.cpp -o surface_feel_test && ./surface_feel_test
 #include <cstdio>
 #include <functional>
 #include <string>
 #include <vector>
-#include "../surface_feel.hpp"
+#include "road/surface_feel.hpp"
+#include "tests/mini_test.hpp"
 
 using namespace Surf;
 
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
 static bool near(float a, float b, float e = 1e-4f) { return std::fabs(a - b) <= e; }
 static void resetMap() { for (int i = 0; i < 256; ++i) IdMap()[i] = 0; }
 
@@ -99,8 +94,4 @@ TEST(map_without_a_report_list_still_works_and_blank_entries_are_not_errors) {
     CHECK(ParseIdMap("90:soft") == 1);
 }
 
-int main() {
-    for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
-    std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

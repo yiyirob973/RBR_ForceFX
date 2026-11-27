@@ -5,14 +5,8 @@
 #include <functional>
 #include <limits>
 #include <vector>
-#include "../landing.hpp"
-
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
+#include "effects/landing.hpp"
+#include "tests/mini_test.hpp"
 
 // A car driving at 20 m/s whose total strut load is replayed at 100 Hz.
 struct Rig {
@@ -106,8 +100,4 @@ TEST(severity_function_is_monotonic_and_bounded) {
     CHECK(Landing::Detector::Severity(0, 0.5f, 0, 0) >= 0.99f);
 }
 
-int main() {
-    for (auto& r : regs()) { int before = g_fail; r.fn(); std::printf("%s %s\n", before == g_fail ? "ok  " : "FAIL", r.name); }
-    std::printf("\n%d checks, %d failed\n", g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

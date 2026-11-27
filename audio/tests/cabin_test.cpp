@@ -1,6 +1,6 @@
 // Tests for the inside of the car: the camera view deciding how inside the sound is, the cabin filter, the interior noises made in code, and
 // how the controller and the mixer put them together. Self-contained; build and run from this folder:
-//   g++ -std=c++17 -O1 -I.. cabin_test.cpp -o cabin_test && ./cabin_test
+//   g++ -std=c++17 -O1 -I../.. cabin_test.cpp -o cabin_test && ./cabin_test
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -9,15 +9,10 @@
 #include "core.hpp"
 #include "audio.hpp"
 #include "cabin_sounds.hpp"
+#include "tests/mini_test.hpp"
 
 using namespace ffx;
 
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
 static const float kNaN = std::numeric_limits<float>::quiet_NaN();
 
 // ---------------------------------------------------------------------------------------------------- the view
@@ -264,8 +259,4 @@ TEST(the_mixer_plays_the_interior_voices_and_rattles_only_inside) {
     sink.setCabin(0.0f, 0.0f, 0.0f, 1.0f);
 }
 
-int main() {
-    for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
-    std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

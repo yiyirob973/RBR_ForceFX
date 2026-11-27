@@ -10,13 +10,13 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include "../materials.hpp"
+#include "road/materials.hpp"
 #include "cabin.hpp"
-#include "../surface_model.hpp"    // what the plugin knows about the ground under a tyre, shared with the road feel
-#include "../wet_surface.hpp"      // what damp and wet ground do to the tyre sounds
-#include "../telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
-#include "../wheel_slip.hpp"   // wheel slip from the segment counter (shared with the road feel)
-#include "../tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slide (shared with the road feel)
+#include "road/surface_model.hpp"    // what the plugin knows about the ground under a tyre, shared with the road feel
+#include "road/wet_surface.hpp"      // what damp and wet ground do to the tyre sounds
+#include "telemetry/telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
+#include "telemetry/wheel_slip.hpp"   // wheel slip from the segment counter (shared with the road feel)
+#include "telemetry/tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slide (shared with the road feel)
 #include <atomic>
 #include "crash.hpp"             // crashes (trees, rocks, walls) from the body acceleration
 

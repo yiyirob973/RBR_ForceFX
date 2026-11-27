@@ -19,10 +19,13 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include "road/road_feel.hpp"      // Road::SideIn and the ground model
+#include "road/road_guard.hpp"     // kBands
+#include "road/surface_feel.hpp"   // Surf::Feel
 
 namespace Road {
 
-// kBands is declared in road_guard.hpp
+// kBands is declared in road_guard.hpp (included above)
 constexpr float kPatchLen = 0.13f;    // length of a tyre's contact patch in metres
 constexpr float kRefSpeed = 20.0f;    // m/s: the speed at which each band sits in the middle of its third
 constexpr float kPatchMin = 0.05f;    // the least a band is let through by the contact patch, so no band is ever completely dead

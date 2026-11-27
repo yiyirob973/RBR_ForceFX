@@ -16,8 +16,8 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
-#include "accel_light.hpp"
-#include "brake_fx.hpp"
+#include "effects/accel_light.hpp"
+#include "effects/brake_fx.hpp"
 
 namespace WeightTransfer {
 

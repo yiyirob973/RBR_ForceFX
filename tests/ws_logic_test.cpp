@@ -1,6 +1,6 @@
 // Tests for the Windscreen logic that needs no Windows or Direct3D (camera/ws_logic.hpp): what the tyres throw at the glass,
 // the colours of the dirt, the area a wiper blade sweeps and the measuring of a wiper mesh. Build it with any C++17 compiler:
-//   g++ -std=c++17 -O1 ws_logic_test.cpp -o ws_logic_test && ./ws_logic_test
+//   g++ -std=c++17 -O1 -I.. ws_logic_test.cpp -o ws_logic_test && ./ws_logic_test
 //   cl /std:c++17 /EHsc ws_logic_test.cpp && ws_logic_test.exe
 #include <cmath>
 #include <cstdio>
@@ -8,15 +8,10 @@
 #include <functional>
 #include <vector>
 #include "../camera/ws_logic.hpp"
+#include "tests/mini_test.hpp"
 
 using namespace ffx::cam::wsl;
 
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
 static bool near(float a, float b, float e = 0.01f) { return std::fabs(a - b) <= e; }
 
 static const ffx::MaterialTable& tab() { static ffx::MaterialTable t; return t; }
@@ -248,7 +243,6 @@ TEST(smoothing_drops_out_when_the_target_is_not_ok) {
     CHECK(!cur.ok);
 }
 
-
 // ---------------------------------------------------------------- mud between stages
 static StageHistory hist(bool finished = true, int map = 10, const char* who = "Bob", float since = 120.f) { StageHistory h; h.have = true; h.finished = finished; h.map = map; h.player = who; h.secondsSinceFinish = since; return h; }
 TEST(next_stage_of_the_same_rally_keeps_the_mud) { CHECK(cleanReason(true, hist(), 11, "Bob", 10.f) == nullptr); }
@@ -264,8 +258,4 @@ TEST(car_change_needs_two_known_cars) {
     CHECK(!carChanged("", "Sunny|3|0")); CHECK(!carChanged("Sunny|3|0", ""));
 }
 
-int main() {
-    for (const Reg& r : regs()) { const int before = g_fail; r.fn(); std::printf("%s  %s\n", g_fail == before ? "ok  " : "FAIL", r.name); }
-    std::printf("\n%d checks, %d failed\n", g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

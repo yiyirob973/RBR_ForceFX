@@ -6,14 +6,8 @@
 #include <limits>
 #include <vector>
 
-#include "../brake_fx.hpp"
-
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
+#include "effects/brake_fx.hpp"
+#include "tests/mini_test.hpp"
 
 static const float kNaN = std::numeric_limits<float>::quiet_NaN();
 
@@ -74,9 +68,5 @@ TEST(judder_pitch_is_the_wheel_rate_until_lock_up_then_the_scrub) {
     CHECK(BrakeFx::JudderHz(0.0f, kNaN, 1, 0, 0, kNaN) == 12.0f);
 }
 
-int main() {
-    for (auto& r : regs()) { int before = g_fail; r.fn(); std::printf("%s %s\n", before == g_fail ? "ok  " : "FAIL", r.name); }
-    std::printf("\n%d checks, %d failed\n", g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }
 

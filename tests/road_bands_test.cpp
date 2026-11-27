@@ -1,22 +1,17 @@
 // Tests for the road bands (road_bands.hpp): the road vibration as three sine effects. Self-contained:
-//   g++ -std=c++17 -O1 road_bands_test.cpp -o road_bands_test && ./road_bands_test
+//   g++ -std=c++17 -O1 -I.. road_bands_test.cpp -o road_bands_test && ./road_bands_test
 #include <cmath>
 #include <cstdio>
 #include <functional>
 #include <string>
 #include <vector>
-#include "../materials.hpp"
-#include "../surface_feel.hpp"
-#include "../road_feel.hpp"
-#include "../road_guard.hpp"
-#include "../road_bands.hpp"
+#include "road/materials.hpp"
+#include "road/surface_feel.hpp"
+#include "road/road_feel.hpp"
+#include "road/road_guard.hpp"
+#include "road/road_bands.hpp"
+#include "tests/mini_test.hpp"
 
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
 static bool near(float a, float b, float e = 1e-3f) { return std::fabs(a - b) <= e; }
 
 static const float kMin = 25.0f, kMax = 100.0f;
@@ -255,8 +250,4 @@ TEST(gravel_is_flatter_than_snow_and_ice_is_brighter_than_both) {
     CHECK(leanGr > leanIc);                    // ice leans to the high end
 }
 
-int main() {
-    for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
-    std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

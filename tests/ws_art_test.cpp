@@ -1,5 +1,5 @@
 // Checks on the water-drop artwork (camera/ws_art.hpp): no heavy dark fill, round standing drops, runners without a tail.
-//   g++ -std=c++17 -O1 ws_art_test.cpp -o ws_art_test && ./ws_art_test
+//   g++ -std=c++17 -O1 -I.. ws_art_test.cpp -o ws_art_test && ./ws_art_test
 #include <cmath>
 #include <cstdio>
 #include "../camera/ws_art.hpp"

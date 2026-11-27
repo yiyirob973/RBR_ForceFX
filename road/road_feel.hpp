@@ -14,7 +14,9 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
-#include "surface_model.hpp"
+#include "road/materials.hpp"       // the material table (ffx::kMaterials)
+#include "road/surface_feel.hpp"    // Surf::Cls and Surf::Feel
+#include "road/surface_model.hpp"
 
 namespace Road {
 

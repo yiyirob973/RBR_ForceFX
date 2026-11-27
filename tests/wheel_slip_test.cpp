@@ -1,18 +1,13 @@
 // Tests for the wheel slip estimator (wheel_slip.hpp). Self-contained:
-//   g++ -std=c++17 -O1 wheel_slip_test.cpp -o wheel_slip_test && ./wheel_slip_test
+//   g++ -std=c++17 -O1 -I.. wheel_slip_test.cpp -o wheel_slip_test && ./wheel_slip_test
 #include <cmath>
 #include <cstdio>
 #include <functional>
 #include <random>
 #include <vector>
-#include "../wheel_slip.hpp"
+#include "telemetry/wheel_slip.hpp"
+#include "tests/mini_test.hpp"
 
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
 static bool within(double a, double b, double e) { return std::fabs(a - b) <= e; }
 
 // A wheel on a road: packets leave NGP at `rate` Hz and reach us with some timing jitter. The wheel turns at
@@ -301,8 +296,4 @@ TEST(a_dead_vector_after_a_learned_scale_gives_the_scaled_field) {
     CHECK(!g.fromVelocity() && std::fabs(v - 25.0) < 0.3);
 }
 
-int main() {
-    for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
-    std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

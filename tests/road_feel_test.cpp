@@ -1,20 +1,15 @@
 // Tests for the road feel model (road_feel.hpp). Self-contained:
-//   g++ -std=c++17 -O1 road_feel_test.cpp -o road_feel_test && ./road_feel_test
+//   g++ -std=c++17 -O1 -I.. road_feel_test.cpp -o road_feel_test && ./road_feel_test
 #include <cmath>
 #include <cstdio>
 #include <functional>
 #include <string>
 #include <vector>
-#include "../materials.hpp"
-#include "../surface_feel.hpp"
-#include "../road_feel.hpp"
+#include "road/materials.hpp"
+#include "road/surface_feel.hpp"
+#include "road/road_feel.hpp"
+#include "tests/mini_test.hpp"
 
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
 static bool near(float a, float b, float e = 1e-4f) { return std::fabs(a - b) <= e; }
 static void resetMap() { for (int i = 0; i < 256; ++i) Surf::IdMap()[i] = 0; }
 static int idOf(const char* name) { for (const ffx::MaterialInfo& m : ffx::kMaterials) if (std::string(m.name) == name) return m.id; return -1; }
@@ -196,8 +191,4 @@ TEST(spin_and_slide_inputs_are_safe_for_bad_numbers) {
     CHECK(std::isfinite(f.amp) && std::isfinite(f.hz) && f.amp > 0.0f);
 }
 
-int main() {
-    for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
-    std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

@@ -95,14 +95,31 @@ When reporting a problem, attach `ForceFX.log` (beside the DLL), plus `ForceFXCa
 
 The version shown in the game and in `ForceFX.log` is the git tag the build was made from (the release workflow passes it to `build.bat` as `FORCEFX_VERSION`, for example `v0.7.0`). A plain `build.bat` run shows "Dev build" and the date it was compiled.
 
-Unit tests for the logic headers are in `tests` and `audio/tests`; each file has its build line at the top. The release workflow runs them (with g++) before it builds anything; `camera_packet_test` needs the Windows headers and runs only on a Windows machine.
+Unit tests for the logic headers are in `tests` and `audio/tests`; each file has its build line at the top, and they share the small framework in `tests/mini_test.hpp`. `tests/synth_golden_test.cpp` runs the whole synthesis through scripted drives and compares the result with the last accepted behaviour, so a refactor that changes the feel fails it (the failure prints the new hash). The release workflow runs them (with g++) before it builds anything; `camera_packet_test` needs the Windows headers and runs only on a Windows machine.
 
 **Surface for road and audio.** The tyre reader decides what each tyre is on (the game's material id, its class with `Map=` corrections, wetness and how loose it is) and hands the same answer to the road feel and the audio. `ForceFXAudio\materials.csv` corrects both. Damp and wet ground change the tyre sounds from the dry recordings: duller, a little quieter loose-ground loops, a spray hiss that grows with speed and fewer stones (`[Audio]` `Wet*` settings, `AudioWetLevel` in the menu). A real recording named `..._wet_loop` / `..._damp_loop` is used as it is and gets none of that.
 
 **Inside the car.** The plugin reads the game's camera. In the cockpit view its sounds are heard through the cabin (muffled, boomy, with short reflections) and the interior makes its own noise, made in code: the heater fan, wind round the glass, panels buzzing with the engine, and rattles over bumps and landings. In an outside view none of it applies. It is automatic, not a setting; `AudioCabinLevel` in the menu sets how loud the interior noises are. `ForceFX.log` records which camera type counts as inside or outside whenever you change view (types 3 to 6 are assumed to be inside; `CabinCameraMin` / `CabinCameraMax` in `[Audio]` change that).
 
-All telemetry field offsets are the `Offset*` keys in `[ForceFX]` of `ForceFX.ini` (`telemetry_layout.hpp`): the force feedback, the audio and the camera read the packet through the same table. `ForceFX.log` starts fresh each run; the previous one is kept as `ForceFX.old.log`.
+All telemetry field offsets are the `Offset*` keys in `[ForceFX]` of `ForceFX.ini` (`telemetry/telemetry_layout.hpp`): the force feedback, the audio and the camera read the packet through the same table. `ForceFX.log` starts fresh each run; the previous one is kept as `ForceFX.old.log`.
+
+## Source layout
+
+| Folder | What is in it |
+|---|---|
+| `src/` | The Windows plugin: `RBR_ForceFX.cpp` (hooks, telemetry parsing, the force feedback device, the menu) and its export list. |
+| `core/` | The portable core, no Windows needed: `config.hpp` (every setting, its default and its clamp), `synth.hpp` (the synthesis from analysed telemetry to effects and force scalings), `common.hpp` (hard ceilings, small helpers). |
+| `effects/` | One header per effect on the force: landing, water, light and heavy steering, brake judder, crash, rev limiter, weight transfer, and `force_scale.hpp`, which combines and bounds all the scalings of RBR's own force. |
+| `road/` | The ground: material table, surface classes, the road vibration bands and what shapes them. |
+| `telemetry/` | Where the fields are in an NGP packet, tyre motion and slip. |
+| `audio/` | The dynamic audio (logic, mixer, cabin) and its tools. |
+| `camera/` | The camera and windscreen module. `camera_fx.hpp` includes the parts in `camera/fx/` in order (they share one namespace); `ws_logic.hpp` and `ws_art.hpp` are the testable parts. |
+| `sdk/` | The RBR SDK plugin interface headers. |
+| `tests/`, `audio/tests/` | Unit tests, built with g++ from the repository root with `-I. -Iaudio -Itests`. |
+| `thirdparty/` | MinHook. |
+
+The headers in `road/`, `effects/landing.hpp` and `core/` are included inside the plugin's anonymous namespace, so everything stays private to the DLL; the tests include them at global scope.
 
 ## Credits
 
-`IRBRGame.h` and `IPlugin.h` are plugin interface headers from the RBR SDK. The camera module uses [MinHook](https://github.com/TsudaKageyu/minhook) by Tsuda Kageyu (BSD 2-Clause, see `thirdparty/minhook/LICENSE.txt`).
+`sdk/IRBRGame.h` and `sdk/IPlugin.h` are plugin interface headers from the RBR SDK. The camera module uses [MinHook](https://github.com/TsudaKageyu/minhook) by Tsuda Kageyu (BSD 2-Clause, see `thirdparty/minhook/LICENSE.txt`).

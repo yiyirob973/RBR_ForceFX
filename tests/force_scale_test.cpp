@@ -6,14 +6,8 @@
 #include <limits>
 #include <vector>
 
-#include "../force_scale.hpp"
-
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
+#include "effects/force_scale.hpp"
+#include "tests/mini_test.hpp"
 
 static const float kNaN = std::numeric_limits<float>::quiet_NaN();
 using namespace ForceScale;
@@ -58,9 +52,5 @@ TEST(bad_dt_and_target_stay_finite) {
 }
 TEST(extra_push_is_capped) { CHECK(Add(0.2f) == 0.2f); CHECK(Add(5.0f) == kHardAddMax); CHECK(Add(-1.0f) == 0.0f); CHECK(Add(kNaN) == 0.0f); }
 
-int main() {
-    for (auto& r : regs()) { int before = g_fail; r.fn(); std::printf("%s %s\n", before == g_fail ? "ok  " : "FAIL", r.name); }
-    std::printf("\n%d checks, %d failed\n", g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }
 
