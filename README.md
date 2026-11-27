@@ -15,6 +15,7 @@ Extra force feedback for Richard Burns Rally. ForceFX reads NGP telemetry and ad
 - **Landings:** after a real jump, RBR's own steering force pulls harder for a moment. Bumps never trigger it.
 - **Water:** a thump and a tug when a tyre hits standing water, a rumble while you wade, heavier steering while the front tyres push through.
 - **Light steering under hard acceleration:** the steering loses force in proportion to the weight the front tyres lose (never more than 60%).
+- **Sideways weight:** the steering gets a little heavier as the weight builds up on the outside tyres in a corner, and swells while the weight swings across the car in a direction change. It only scales RBR's own force.
 - **Dynamic audio (off by default):** tyre squeal, slides, rolling noise, stones, bumps, landings, water and crashes, following each wheel.
 - **Camera movement (off by default):** your head moves with the car in the cockpit view.
 - **Windscreen effects (alpha, off by default):** rain, snow and mud on the glass, with wipers.
