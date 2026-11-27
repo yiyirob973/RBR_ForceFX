@@ -1,0 +1,91 @@
+name: Hardware compatibility report
+description: Report whether ForceFX works with your specific wheel or other hardware.
+title: "[Hardware compatibility]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to share a hardware compatibility result with other RBR/ForceFX users. Please submit one report per hardware setup. For problems, include relevant details from `ForceFX.log` and remove personal information first.
+  - type: dropdown
+    id: result
+    attributes:
+      label: Compatibility result
+      description: What happened when you tested ForceFX with this hardware?
+      options:
+        - Works
+        - Does not work
+        - Partially works
+        - Not tested yet (question)
+    validations:
+      required: true
+  - type: dropdown
+    id: hardware_type
+    attributes:
+      label: Hardware type
+      options:
+        - Force feedback wheel
+        - Wheel base
+        - Pedals
+        - Shifter or handbrake
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: manufacturer
+    attributes:
+      label: Manufacturer
+      placeholder: e.g. Logitech, Thrustmaster, Fanatec, Moza
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Exact model
+      description: Include the wheel/base model and any relevant firmware version.
+      placeholder: e.g. G29
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection method
+      options:
+        - USB / DirectInput
+        - Other
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: force_feedback
+    attributes:
+      label: Force feedback status
+      description: For wheels, say whether RBR's own force feedback works with this device.
+      placeholder: e.g. RBR FFB works / RBR FFB does not work / not applicable
+  - type: input
+    id: plugin_version
+    attributes:
+      label: ForceFX version
+      placeholder: e.g. v0.7.0
+    validations:
+      required: true
+  - type: input
+    id: setup
+    attributes:
+      label: RBR and NGP setup
+      description: Include your RBR distribution (for example RSF), NGP version, and Windows version if known.
+      placeholder: e.g. RSF, NGP7, Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: test_details
+    attributes:
+      label: Test details
+      description: Describe what you tested and what worked or failed. For failures, include relevant error messages and troubleshooting steps already tried.
+      placeholder: What happened? Which ForceFX effects or menu options did you test?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or additional notes
+      description: Paste relevant log lines, but remove usernames, file paths, and other personal information. Do not upload unrelated full logs.
