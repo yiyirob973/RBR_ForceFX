@@ -14,15 +14,18 @@
 //     are therefore weak; the cut-off is where the bump length equals the patch length (speed / patch length).
 //   - Both sides add up as energy, never as plus and minus, so left and right can not cancel each other out.
 //
-// Include after surface_feel.hpp (Surf::Feel, Surf::RidgeHz). In RBR_ForceFX.cpp it is included inside the anonymous namespace,
+// Include after surface_feel.hpp (Surf::Feel). In RBR_ForceFX.cpp it is included inside the anonymous namespace,
 // right after road_feel.hpp.
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include "road/road_feel.hpp"      // Road::SideIn and the ground model
+#include "road/road_guard.hpp"     // kBands
+#include "road/surface_feel.hpp"   // Surf::Feel
 
 namespace Road {
 
-// kBands is declared in road_guard.hpp
+// kBands is declared in road_guard.hpp (included above)
 constexpr float kPatchLen = 0.13f;    // length of a tyre's contact patch in metres
 constexpr float kRefSpeed = 20.0f;    // m/s: the speed at which each band sits in the middle of its third
 constexpr float kPatchMin = 0.05f;    // the least a band is let through by the contact patch, so no band is ever completely dead
@@ -94,32 +97,14 @@ struct Targets {
     float share[2][kBands] = {};      // per side, how much of its strength each band carries
 };
 
-// Pitch and shares for the two sides ([0] = left, [1] = right) at this speed. Ridged ground (cobbles, planks) also pulls the band
-// whose third holds the ridge pitch (speed / spacing) onto exactly that pitch, and makes that band stronger and the others weaker, so the
-// hits come at the rate the ridges pass under the tyre.
+// Pitch and shares for the two sides ([0] = left, [1] = right) at this speed.
 inline Targets Plan(const SideIn side[2], float speed, float minHz, float maxHz) {
     Targets t;
     float lo0, hi0, lo2, hi2;
     BandRange(minHz, maxHz, 0, lo0, hi0); BandRange(minHz, maxHz, kBands - 1, lo2, hi2);
     const float fc = std::sqrt(lo0 * hi2);
     for (int b = 0; b < kBands; ++b) t.hz[b] = BandPitch(speed, minHz, maxHz, b);
-
-    // Ridges: the side that feels them most decides the ridge pitch.
-    auto mixOf = [&](int s) { const float m = side[s].fe.ridgeMix; return std::isfinite(m) ? std::max(0.0f, std::min(1.0f, m)) : 0.0f; };
-    auto strOf = [&](int s) { const float v = side[s].strength; return std::isfinite(v) && v > 0.0f ? v : 0.0f; };
-    const int rs = strOf(0) * mixOf(0) >= strOf(1) * mixOf(1) ? 0 : 1;
-    int lock = -1; float ridgeHz = 0.0f;
-    if (strOf(rs) * mixOf(rs) > 0.0f && side[rs].fe.ridge > 0.0f) {
-        ridgeHz = Surf::RidgeHz(speed, side[rs].fe.ridge, lo0, hi2);
-        lock = kBands - 1;                                              // the band whose third the ridge pitch falls in
-        for (int b = 0; b < kBands - 1; ++b) { float lo, hi; BandRange(minHz, maxHz, b, lo, hi); if (ridgeHz < hi) { lock = b; break; } }
-    }
-    for (int s = 0; s < 2; ++s) {
-        BandShares(side[s].fe, t.hz, speed, fc, t.share[s]);
-        if (lock >= 0 && mixOf(s) > 0.0f)
-            for (int b = 0; b < kBands; ++b) t.share[s][b] *= (b == lock) ? 1.0f + 1.5f * mixOf(s) : 1.0f - 0.5f * mixOf(s);
-    }
-    if (lock >= 0) t.hz[lock] += (ridgeHz - t.hz[lock]) * mixOf(rs);
+    for (int s = 0; s < 2; ++s) BandShares(side[s].fe, t.hz, speed, fc, t.share[s]);
     return t;
 }
 

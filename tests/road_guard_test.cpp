@@ -1,9 +1,9 @@
 // Tests for the road guard (road_guard.hpp). Self-contained:
-//   g++ -std=c++17 -O1 road_guard_test.cpp -o road_guard_test && ./road_guard_test
+//   g++ -std=c++17 -O1 -I.. road_guard_test.cpp -o road_guard_test && ./road_guard_test
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include "../road_guard.hpp"
+#include "road/road_guard.hpp"
 
 static int g_fail = 0, g_checks = 0;
 #define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)

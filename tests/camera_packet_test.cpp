@@ -10,15 +10,10 @@
 #include <thread>
 #include <vector>
 #include "../camera/camera_fx.hpp"
+#include "tests/mini_test.hpp"
 
 using namespace ffx::cam;
 
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
 static bool near(float a, float b, float e = 0.01f) { return std::fabs(a - b) <= e; }
 
 // NGP packet offsets (see the header comment of camera_fx.hpp)
@@ -134,8 +129,4 @@ TEST(a_packet_without_suspension_data_never_flags_a_jump) {
     CHECK(!g_airborne.load() && g_evLand.load() == 0.0f);
 }
 
-int main() {
-    for (const Reg& r : regs()) { int before = g_fail; r.fn(); std::printf("[%s] %s\n", g_fail == before ? " ok " : "FAIL", r.name); }
-    std::printf("\n%zu tests, %d checks, %d failures\n", regs().size(), g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

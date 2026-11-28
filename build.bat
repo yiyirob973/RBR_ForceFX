@@ -9,7 +9,7 @@ cd /d "%~dp0"
 set "DEFS="
 if defined FORCEFX_VERSION set "DEFS=/DFORCEFX_VERSION=\"%FORCEFX_VERSION%\""
 if not exist out mkdir out
-cl /std:c++17 /O2 /MD /EHsc /LD %DEFS% /Fo:out\ RBR_ForceFX.cpp thirdparty\lib\libminhook.x86.lib /link /DEF:RBR_ForceFX.def dinput8.lib dxguid.lib user32.lib ws2_32.lib winmm.lib /OUT:out\RBR_ForceFX.dll
+cl /std:c++17 /O2 /MD /EHsc /LD /I. %DEFS% /Fo:out\ src\RBR_ForceFX.cpp thirdparty\lib\libminhook.x86.lib /link /DEF:src\RBR_ForceFX.def dinput8.lib dxguid.lib user32.lib ws2_32.lib winmm.lib /OUT:out\RBR_ForceFX.dll
 if errorlevel 1 (
     echo Build failed.
     exit /b 1

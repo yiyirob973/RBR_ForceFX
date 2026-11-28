@@ -1,0 +1,12 @@
+# build output and logs
+out/
+out_t/
+*.obj
+*.dll
+*.exp
+*.lib
+!thirdparty/lib/*.lib
+*.log
+# test binaries
+*_test
+*_test.exe

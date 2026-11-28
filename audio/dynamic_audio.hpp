@@ -29,10 +29,12 @@ namespace ffx {
 class ForceFXSurfaceMemory : public ISurfaceMemory {
 public:
     std::function<bool(int ids[4])> read;      // false = no usable ids right now
+    std::function<bool(SurfaceModel::Tyre out[4])> surface;   // class and looseness per tyre from the plugin; false = not available
     std::function<bool()> available;           // true once the reader has found the tyres
     std::function<std::string()> status;
 
     bool readMaterials(int ids[4]) override { return read && read(ids); }
+    bool readSurface(SurfaceModel::Tyre out[4]) override { return surface && surface(out); }
     bool configured() const override { return available && available(); }
     std::string statusText() const override { return status ? status() : std::string("no reader"); }
 };
@@ -43,6 +45,8 @@ public:
 
     struct Hooks {
         std::function<bool(int ids[4])> readIds;
+        std::function<bool(SurfaceModel::Tyre out[4])> readSurface;   // what the tyre reader decided about each tyre, the same as the road feel gets
+        std::function<int()> cameraType;                              // the game's camera type (-1 = not known): decides if the sound is heard from inside the car
         std::function<bool()> idsAvailable;
         std::function<std::string()> idsStatus;
         std::function<void(const std::string&)> log;
@@ -54,6 +58,7 @@ public:
         dir_ = pluginDir;
         hooks_ = std::move(hooks);
         mem_.read = hooks_.readIds;
+        mem_.surface = hooks_.readSurface;
         mem_.available = hooks_.idsAvailable;
         mem_.status = hooks_.idsStatus;
     }
@@ -90,6 +95,15 @@ public:
         if (!s_) return;
         TelemetryFrame f;
         if (!parsePacket(d, (size_t)n, t, f, s_->settings.packet)) return;
+        if (hooks_.cameraType) {                                         // inside or outside the car: the sound follows the camera
+            const int ct = hooks_.cameraType();
+            s_->controller->setCameraType(ct);
+            if (ct != lastCamType_) {
+                lastCamType_ = ct;
+                const int v = cabin::ViewOf(ct, s_->settings.cabinTypeLo, s_->settings.cabinTypeHi);
+                log("Dynamic audio: camera type " + std::to_string(ct) + (v < 0 ? " (not known, heard from inside)" : v ? ": heard from inside the car" : ": heard from outside the car"));
+            }
+        }
         s_->controller->onFrame(f);
         if (s_->controller->debris.crashCount != crashesLogged_) {      // one line per crash, so the threshold can be tuned from the log
             crashesLogged_ = s_->controller->debris.crashCount;
@@ -155,6 +169,13 @@ public:
         if (s_) applyCar(s_->settings);
     }
 
+    // Where the fields are in the packet: the plugin's one telemetry layout (from [ForceFX] of ForceFX.ini). Safe from any thread.
+    void setLayout(const Telem::Layout& l) {
+        std::lock_guard<std::mutex> lk(mu_);
+        layout_ = l;
+        if (s_) s_->settings.packet = l;
+    }
+
     State state() const { return state_.load(); }
 
     std::string status() {
@@ -187,7 +208,8 @@ private:
     std::string dir_;
     Hooks hooks_;
     ForceFXSurfaceMemory mem_;
-    std::mutex mu_;                             // guards s_ between the telemetry thread and the loader / menu
+    std::mutex mu_;                             // guards s_ and layout_ between the telemetry thread and the loader / menu
+    Telem::Layout layout_;                      // the plugin's packet layout (see setLayout)
     int crashesLogged_ = 0;                     // crashes already written to the log
     std::unique_ptr<Session> s_;
     std::thread loader_;
@@ -200,6 +222,7 @@ private:
     }
     std::atomic<bool> speedKph_{true};
     std::atomic<float> liveDebris_{1.0f}, liveImpacts_{1.0f}, liveSusp_{1.0f};
+    int lastCamType_ = -2;
     std::atomic<long long> lastFrameNs_{0};
     long long nextDebugNs_ = 0;
     static long long nowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -250,6 +273,7 @@ private:
             Settings& st = s->settings;
             const std::string ini = dir_ + "ForceFX.ini";
             if (!loadSettings(ini, st, "Audio")) log("Dynamic audio: no ForceFX.ini found, using defaults");
+            { std::lock_guard<std::mutex> lk(mu_); st.packet = layout_; }
             applyCar(st);
 
             const std::string dataDir = dir_ + "ForceFXAudio\\";
@@ -268,7 +292,8 @@ private:
             s->mixer.reset(new Mixer());
             s->mixer->master = st.masterVolume;
             s->mixer->total = st.totalGain;
-            s->mixer->cabin.configure(st.cabinEffect, st.cabinLowpassHz, st.cabinBassDb, st.cabinReverb);
+            s->mixer->cabin.configure(true, cabin::kLowpassHz, cabin::kBassDb, cabin::kReverb, cabin::kBoomDb);
+            s->mixer->cabin.setTrim(cabin::kTrim);
             s->matTable.loadOverrides(dataDir + "materials.csv");
             s->sets.reset(new SoundSetMap(*s->bank, s->matTable, st));
             s->sink.reset(new MixerSink(*s->mixer, *s->bank, st, s->sets.get()));

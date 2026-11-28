@@ -1,5 +1,5 @@
 // Tests for crash detection and the crash sounds (crash.hpp, and the events through the controller). Self-contained; build and run from this folder:
-//   g++ -std=c++17 -O1 -I.. crash_test.cpp -o crash_test && ./crash_test
+//   g++ -std=c++17 -O1 -I../.. crash_test.cpp -o crash_test && ./crash_test
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -7,14 +7,9 @@
 #include <vector>
 #include "core.hpp"
 #include "audio.hpp"
+#include "tests/mini_test.hpp"
 
 using namespace ffx;
-static int g_fail = 0, g_checks = 0;
-struct Reg { const char* name; std::function<void()> fn; };
-static std::vector<Reg>& regs() { static std::vector<Reg> r; return r; }
-struct Adder { Adder(const char* n, std::function<void()> f) { regs().push_back({n, f}); } };
-#define TEST(name) static void name(); static Adder add_##name(#name, name); static void name()
-#define CHECK(c) do { ++g_checks; if (!(c)) { ++g_fail; std::printf("  FAIL line %d  %s\n", __LINE__, #c); } } while (0)
 
 constexpr double G = crash::kG;
 constexpr double dt = 1.0 / 60.0;
@@ -259,8 +254,4 @@ TEST(own_crash_sounds_win_and_the_level_scales_them) {
     CHECK(m2.activeShots() == 1);                                                           // still started, at zero gain (a level of 0 mutes, it does not skip)
 }
 
-int main() {
-    for (const Reg& r : regs()) { const int before = g_fail; r.fn(); std::printf("%s %s\n", g_fail == before ? "ok  " : "FAIL", r.name); }
-    std::printf("\n%d tests, %d checks, %d failures\n", (int)regs().size(), g_checks, g_fail);
-    return g_fail ? 1 : 0;
-}
+int main() { return mini::RunAll(); }

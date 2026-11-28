@@ -1,5 +1,5 @@
 // Dynamic audio: WAV loading, sound bank, mixer and the sink that connects the controller to it.
-// Portable (no Windows APIs); the waveOut device lives in win_platform.hpp.
+// Portable (no Windows APIs); the waveOut device lives in waveout.hpp.
 #pragma once
 #include <atomic>
 #include <cctype>
@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include "core.hpp"
+#include "cabin.hpp"
 
 namespace ffx {
 
@@ -110,12 +111,12 @@ inline double targetRmsFor(const std::string& key) {
 }
 
 // Character of a sound by its name: wet, muddy, watery, snowy or icy sounds are deep and dull; dry stones, gravel,
-// rubble, dirt and cobbles are bright and crisp; tarmac is neutral. Returns -1 .. +1.
+// rubble and dirt are bright and crisp; tarmac is neutral. Returns -1 .. +1.
 inline float toneOfName(std::string n) {
     for (char& c : n) c = (char)std::tolower((unsigned char)c);
     auto has = [&](const char* k) { return n.find(k) != std::string::npos; };
     if (has("wet") || has("mud") || has("water") || has("puddle") || has("slush") || has("snow") || has("ice")) return -0.8f;
-    if (has("gravel") || has("stone") || has("rubble") || has("rock") || has("pebble") || has("dirt") || has("sand") || has("cobble") || has("rough")) return 0.7f;
+    if (has("gravel") || has("stone") || has("rubble") || has("rock") || has("pebble") || has("dirt") || has("sand") || has("rough")) return 0.7f;
     if (has("grass") || has("leaf") || has("forest")) return 0.15f;
     return 0.0f;
 }
@@ -163,7 +164,8 @@ private:
 };
 
 // What the car's interior does to the sound: tyre noise arrives muffled and bassy, through floor, seats and bodywork,
-// with short reflections inside the cabin. Low-pass (4th order) + low shelf + a tiny damped comb/all-pass "room".
+// with short reflections inside the cabin. Low-pass (4th order) + low shelf + the cabin's boxy resonance + a tiny damped comb/all-pass "room".
+// How much of it is heard follows the camera view (setInside): fully in the cockpit, not at all outside, a short crossfade between. See cabin.hpp.
 struct Biquad {
     float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
     float process(float x) { float y = b0 * x + z1; z1 = b1 * x - a1 * y + z2; z2 = b2 * x - a2 * y; return y; }
@@ -173,6 +175,10 @@ struct Biquad {
     void lowpass(double fc, double q) {
         double w = 2 * 3.14159265358979 * fc / kSampleRate, c = std::cos(w), al = std::sin(w) / (2 * q);
         set((1 - c) / 2, 1 - c, (1 - c) / 2, 1 + al, -2 * c, 1 - al);
+    }
+    void peak(double fc, double gainDb, double q) {
+        double A = std::pow(10.0, gainDb / 40), w = 2 * 3.14159265358979 * fc / kSampleRate, c = std::cos(w), al = std::sin(w) / (2 * q);
+        set(1 + al * A, -2 * c, 1 - al * A, 1 + al / A, -2 * c, 1 - al / A);
     }
     void lowShelf(double fc, double gainDb) {
         double A = std::pow(10.0, gainDb / 40), w = 2 * 3.14159265358979 * fc / kSampleRate, c = std::cos(w);
@@ -194,32 +200,45 @@ struct Allpass {
 class CabinFilter {
 public:
     bool enabled = false;
-    void configure(bool on, double lowpassHz, double bassDb, double reverb) {
+    void configure(bool on, double lowpassHz, double bassDb, double reverb, double boomDb = 0.0) {
         enabled = on; wet_ = (float)std::min(std::max(reverb, 0.0), 0.8);
         for (int c = 0; c < 2; ++c) {
             lp1_[c].lowpass(std::max(lowpassHz, 500.0), 0.5412); lp2_[c].lowpass(std::max(lowpassHz, 500.0), 1.3066);
-            shelf_[c].lowShelf(220.0, bassDb);
+            shelf_[c].lowShelf(250.0, bassDb);
+            boom_[c].peak(140.0, boomDb, 1.1);
             const double d[2][3] = {{9.7, 13.1, 16.9}, {10.7, 14.3, 18.1}};   // slightly different per ear: a little width
             for (int k = 0; k < 3; ++k) comb_[c][k].init(d[c][k], 0.34f);
             ap_[c].init(3.1 + c * 0.7);
         }
     }
+    // How inside the car the listener is, 0..1 (the camera view): 0 leaves the sound alone, 1 is the full cabin. Safe from any thread.
+    void setInside(float a) { target_ = std::min(1.0f, std::max(0.0f, std::isfinite(a) ? a : 1.0f)); }
+    float inside() const { return amt_; }
     void process(float* out, int frames) {
         if (!enabled) return;
+        const float tgt = target_.load();
+        if (amt_ <= 0.0005f && tgt <= 0.0005f) { amt_ = 0.0f; return; }          // outside the car: the sound is left alone
+        const float k = 1.0f - std::exp(-1.0f / (0.12f * (float)kSampleRate));    // a camera switch crossfades over about a third of a second
         for (int i = 0; i < frames; ++i) {
-            float dry[2];
-            for (int c = 0; c < 2; ++c) dry[c] = lp2_[c].process(lp1_[c].process(shelf_[c].process(out[2 * i + c])));
+            amt_ += (tgt - amt_) * k;
+            float dry[2], x[2] = {out[2 * i], out[2 * i + 1]};
+            for (int c = 0; c < 2; ++c) dry[c] = lp2_[c].process(lp1_[c].process(boom_[c].process(shelf_[c].process(x[c]))));
             float send = 0.5f * (dry[0] + dry[1]);
             for (int c = 0; c < 2; ++c) {
-                float r = 0; for (int k = 0; k < 3; ++k) r += comb_[c][k].process(send);
+                float r = 0; for (int q = 0; q < 3; ++q) r += comb_[c][q].process(send);
                 r = ap_[c].process(r * 0.33f);
-                out[2 * i + c] = dry[c] + wet_ * r;
+                const float proc = (dry[c] + wet_ * r) * (float)trim_;
+                out[2 * i + c] = x[c] + (proc - x[c]) * amt_;
             }
         }
     }
+    void setTrim(double t) { trim_ = t; }
 private:
     float wet_ = 0.2f;
-    Biquad lp1_[2], lp2_[2], shelf_[2];
+    double trim_ = 1.0;
+    float amt_ = 1.0f;                       // until the camera view is known the cockpit is assumed
+    std::atomic<float> target_{1.0f};
+    Biquad lp1_[2], lp2_[2], shelf_[2], boom_[2];
     Comb comb_[2][3];
     Allpass ap_[2];
 };
@@ -452,6 +471,7 @@ public:
         for (LoopVoice* v : slide_[w]) v->toneDyn = tone;
         for (LoopVoice* v : squeal_[w]) v->toneDyn = 0.3f * tone;
     }
+    void setInside(float a) override { mixer_.cabin.setInside(a); }
     void setSlideLoop(int w, int i, float gl, float gr, float rate) override { set(slide_[w], i, gl, gr, rate); }
     void setSquealLoop(int w, int i, float gl, float gr, float rate) override { set(squeal_[w], i, gl, gr, rate); }
     void setRumble(float gl, float gr) override { rumble_->tgtL = gl * rumbleLevel_; rumble_->tgtR = gr * rumbleLevel_; rumble_->rate = 1.f; }

@@ -89,44 +89,63 @@
 #include <algorithm>
 
 #define __SUPPORT_PLUGIN__ 1
-#include "IRBRGame.h"
-#include "IPlugin.h"
-#include "materials.hpp"      // ground material table, shared by the road feel, the audio and the windscreen
-#include "audio_module.hpp"   // dynamic audio (off until the menu switch is turned on)
-#include "camera_module.hpp"  // head movement and windscreen effects (off until switched on)
-#include "wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
-#include "tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slides (shared with the audio module)
-#include "water_fx.hpp"     // splash, wading and heavy steering when the tyres are in standing water
-#include "accel_light.hpp"  // lighter steering under hard acceleration, from the measured front load
+#include "sdk/IRBRGame.h"
+#include "sdk/IPlugin.h"
+#include "road/materials.hpp"      // ground material table, shared by the road feel, the audio and the windscreen
+#include "audio/module.hpp"   // dynamic audio (off until the menu switch is turned on)
+#include "camera/module.hpp"  // head movement and windscreen effects (off until switched on)
+#include "telemetry/wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
+#include "telemetry/tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slides (shared with the audio module)
+#include "effects/water_fx.hpp"     // splash, wading and heavy steering when the tyres are in standing water
+#include "effects/weight_transfer.hpp"  // weight transfer: one tracker of the load along and across the car, one function for RBR's steering force
+#include "road/surface_model.hpp"       // what the plugin knows about the ground under a tyre: one form for the road feel and the audio
+#include "telemetry/telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
+#include "effects/brake_fx.hpp"     // brake judder and lock-up lightening
+#include "effects/force_scale.hpp"  // combines the scalings of RBR's force and keeps them in bounds
+#include "effects/crash_fx.hpp"     // the wheel's jolt when the car hits something
+#include "effects/rev_limit.hpp"    // learned rev limit and a finder for a rev-limit field in the packet
+#include "audio/crash.hpp"  // crash detector (also drives the crash sounds)
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dinput8.lib")
 #pragma comment(lib, "dxguid.lib")
 
+// These headers are included inside the anonymous namespace on purpose: the plugin's own code below extends their namespaces (Surf, Road)
+// and everything stays private to the DLL. The standard headers they need are all included above.
 namespace {
-#include "road_guard.hpp"   // keeps the road vibration from pushing or pulling the wheel (low cut, headroom, ceiling)
+#include "road/road_guard.hpp"      // keeps the road vibration from pushing or pulling the wheel (low cut, headroom, ceiling)
+#include "road/surface_feel.hpp"    // the surface classes and the id-to-class table; the surface reader below extends the same Surf namespace
+#include "road/road_feel.hpp"       // how the ground and what the car is doing shape the road vibration
+#include "road/road_bands.hpp"      // the road vibration as three sine bands: pitch from speed, strength spread by the ground
+#include "effects/landing.hpp"      // landing detector: one event per real jump (uses road_guard.hpp, so it is included here, in the same namespace)
+#include "core/common.hpp"          // the hard ceilings, the small math helpers, the log call
+#include "core/config.hpp"          // every setting and its clamp (reading the ini is SyncConfig below)
+#include "core/synth.hpp"           // the analysed signals and the synthesis that turns them into effects and force scalings
+using namespace ForceFX;
 
 typedef std::chrono::steady_clock Clock;
 
-// Hard ceilings: the .ini can never push past these, whatever it says.
-constexpr int   kHardTotalMax = 5000;    // sum of all layer magnitudes (0..10000 DirectInput units)
-constexpr float kHardMinHz    = 12.0f;   // below this a vibration becomes a visible wheel swing
-constexpr float kHardMaxHz    = 120.0f;
 constexpr int   kMagDeadband  = 60;      // skip USB updates for changes smaller than this
 constexpr int   kMinUpdateGapMs = 15;    // an effect is updated at most this often (about every other 10 ms step), so the wheel has room for RBR's own force updates
 constexpr int   kPushMinForce = 300;     // RBR force magnitude (of 10000) below which the landing push is not added
 constexpr float kApplyPeriod  = 0.010f;  // seconds between effect updates (~100 Hz)
 
-inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
-inline float clamp01(float v) { return clampf(v, 0.0f, 1.0f); }
-inline float smooth01(float e0, float e1, float x) { float t = clamp01((x - e0) / (e1 - e0)); return t * t * (3.0f - 2.0f * t); }
-inline float gauss(float x, float c, float w) { float d = (x - c) / w; return std::exp(-d * d); }
-inline float alphaFor(float dt, float tau) { return 1.0f - std::exp(-dt / tau); }   // EMA coefficient
-inline float hpCoef(float dt, float tau) { return tau / (tau + dt); }               // 1st order high-pass
-inline float rnd() { return (rand() % 2001 - 1000) / 1000.0f; }                    // -1..1
 
 // ---------------------------------------------------------------- paths/log
 std::string g_dir;
+
+namespace ForceFX {
+void Logf(const char* fmt, ...) {
+    char b[512];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    static std::mutex m;                                 // the worker, the vibration thread, the reader and the game's own thread all log
+    std::lock_guard<std::mutex> lk(m);
+    FILE* f = fopen((g_dir + "ForceFX.log").c_str(), "a");
+    if (f) { fprintf(f, "%s\n", b); fclose(f); }
+}
+}  // namespace ForceFX
 
 std::string pluginDirectory() {
     HMODULE h = nullptr;
@@ -145,14 +164,6 @@ void PinThisDll() {
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCSTR)&pluginDirectory, &h);
 }
 
-void Logf(const char* fmt, ...) {
-    char b[512];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(b, sizeof(b), fmt, ap);
-    va_end(ap);
-    FILE* f = fopen((g_dir + "ForceFX.log").c_str(), "a");
-    if (f) { fprintf(f, "%s\n", b); fclose(f); }
-}
 
 // ------------------------------------------------------------------- version
 // The git tag the build was made from: the release workflow passes it to build.bat, which defines FORCEFX_VERSION. A build
@@ -174,142 +185,6 @@ const std::string& VersionText() {
     return v;
 }
 
-// ------------------------------------------------------------------- config
-struct Config {
-    // These defaults match the shipped ForceFX.ini, so "Reset" in the menu gives you a fresh-install setup.
-
-    // telemetry connection
-    int   telemetrySource = 0;       // 0 = auto (NGP's send hook, UDP port as backup), 1 = send hook only, 2 = UDP port only
-    int   udpPort = 6778;            // backup listening port (0 = never open one). SimHub usually uses 6776: never share a port
-    int   minPacket = 664;
-    int   cylinders = 4;             // engine pulses per rev = cylinders / 2
-
-    // effect switches (menu): 1 = on, 0 = off
-    int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandBoost = 1, fxSurface = 1;
-    int   fxWater = 1;               // splash, wading and (optionally) aquaplaning when the tyres are in standing water
-    float waterGain = 1.0f;          // 0..2: strength of the splash thump, the wading rumble and the kick on entry
-    int   fxAccelLight = 1;          // lighter steering under hard acceleration, from the measured front load and the measured acceleration
-    float accelLight = 1.0f;         // 0..2: 1 = the steering loses force in proportion to the front load lost (never more than 60%); 0 = off
-    float waterHeavy = 0.6f;         // 0..2: how much heavier the steering gets while the front tyres push through water (0 = off, 1 = double RBR's force)
-    int   roadViaRbr = 1;            // 1 = the road vibration is added to RBR's own force updates, so the wheel gets no extra road effect; 0 = one sine effect of its own
-    int   probe = 0;                 // 1 = write ForceFX_probe.csv (ground ids and road signals ten times a second) for tuning surfaces; read at start only
-    int   fxAudio = 0;               // dynamic audio (settings in the [Audio] section of ForceFX.ini); off until switched on
-    float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in [Audio] of ForceFX.ini)
-    float audioImpact = 1.0f;        // 0..4 live multiplier on impacts and landings (on top of EventLevel)
-    float audioSusp = 1.0f;          // 0..4 live multiplier on suspension creaks and bottoming out (on top of SqueakLevel / BottomOutLevel)
-    int   fxCamera = 0;              // head movement in the cockpit camera (settings in the [Camera...] sections of ForceFX.ini)
-    int   fxWindscreen = 0;          // rain, snow and mud on the windscreen; off by default. Its hooks are installed at startup, so switching it on needs a restart
-
-    // per-layer ceilings (DirectInput units 0..10000), a combined ceiling, and one live level (userGain)
-    int   engineMaxMag = 1200, roadMaxMag = 500, brakeMaxMag = 2000;
-    int   totalMaxMag = 4000;        // all layers together are scaled down to this (never above kHardTotalMax)
-    float priorityDuck = 0.85f;      // 0..1: how far lower layers back off while a higher one is active (landing > road > engine)
-    float sustainedLimit = 0.10f;    // thermal derate: long-term mean-square level (0.10 is roughly 32% RMS)
-
-    // landings
-    float impactGain = 0.7f;         // landing sensitivity 0..3 (0 = off)
-    float airLevel = 0.2f;           // 0.2..0.8: total strut load (fraction of static) below which the car counts as airborne; raise it to catch smaller jumps
-    float landingBoost = 1.1f;       // 0..4: extra RBR steering torque at the peak of a full-severity landing (2 = +200%)
-    float landingAdd = 0.15f;        // 0..1: minimum extra push (share of full torque) in the direction RBR is already pushing
-    float thumpGain = 1.4f;          // compression / landing thump added to the road layer
-
-    // brake
-    float brakeHzScale = 1.0f;       // judder pitch multiplier 0.5..2
-    float tyreCircumference = 1.95f; // metres, until the plugin has measured it while coasting
-
-    // engine
-    float engineMinHz = 14.0f, engineMaxHz = 100.0f;
-    float rpmMax = 0.0f;             // fallback rev limit for when telemetry has none (0 = learn it from the data, starting at rpmMaxInit)
-    float rpmMaxInit = 7500.0f;
-    float engineGrit = 0.5f;         // 0 = clean sine at high revs, 1 = rough, beating, irregular
-
-    // road
-    float roadMinHz = 25.0f, roadMaxHz = 100.0f;
-    float roughLow = 0.03f, roughHigh = 0.35f, roughGamma = 1.0f;   // tyre roughness -> 0..1 level (tarmac sits below roughLow)
-    float pistonScale = 1.0f;        // damper piston velocity -> 0..1 (hard hits, kerbs)
-    float bumpScale = 0.25f;         // heave acceleration spikes -> 0..1
-    float maxSpeed = 40.0f;          // m/s that counts as full speed
-
-    // weight and suspension load (relative to the car's own static load, so units never matter)
-    float loadInfluence = 0.6f;      // 0 = ignore tyre load, 1 = strongly favour the more heavily loaded side
-    float airborneFade = 1.0f;       // 1 = road and engine go quiet when the wheels are off the ground
-
-    // per-car character (these are the global values; a car profile can override them)
-    float weightFeel = 1.2f;         // >1 heavier: stronger thump, slower decay, lower road pitch
-    float lumpScale = 1.0f;          // idle lump / beat strength
-    float unevenness = 0.0f;         // uneven firing (boxer, five-cylinder, cross-plane V8)
-    int   carProfiles = 1;           // use ForceFXCars.ini
-    // Which tyres the engine drives (Tyre::FWD / RWD / AWD). Only driven tyres can have wheelspin. RWD unless the car's profile in
-    // ForceFXCars.ini says otherwise. Car geometry for the per-tyre slip angles (a profile can set it per car).
-    int   drivetrain = Tyre::kDefaultDrivetrain;
-    float wheelbase = 2.5f, cgToFront = 1.25f, trackWidth = 1.5f;   // metres
-
-    // NGP packet offsets (float32 unless noted)
-    int   offCarIndex = 56;
-    int   offSteps = 0;              // totalSteps_: NGP's own step counter, a clean clock for counting wheel turns (-1 = not used)
-    int   offVelSurge = 88, offVelSway = 92;   // the car's velocity over the ground, m/s: what wheel speed is compared with
-    int   offThrottle = 28, offBrake = 32, offSpeed = 60, offAccHeave = 120, offRpm = 136;
-    int   offHandbrake = 36, offSteering = 24, offYawRate = 108, offAccSurge = 112, offAccSway = 116;   // for the per-tyre motion (slip angle, lock-up, grip)
-    int   offRpmMax = -1;            // float32 rev limit in the packet (-1 = this packet doesn't have one)
-    int   offSuspBase = 152, suspStride = 128, offStrut = 16, offPiston = 28, offSegment = 60;   // segment = uint32
-    int   speedIsKph = 0;
-    float rpmScale = 1.0f;
-
-    // live level and hotkeys (polled while RBR is the foreground window). Keys are VK codes, 0 = disabled.
-    float userGain = 0.85f;          // saved live level 0..1 (it can only turn things down)
-    float gainRatio = 0.85f;         // each key press multiplies or divides the level by this (about 1.4 dB per step)
-    int   keyGainUp = 0x6B, keyGainDown = 0x6D, keyMute = 0x6A;   // Numpad + / - / *
-    int   keyModifier = 0;           // 0 = no modifier (0x11 = Ctrl)
-    int   gainBeep = 1;
-
-    int         autoConnect = 0;
-    std::string wheel;               // name of the wheel to use, saved by the menu
-};
-
-// Pulls every setting back into its safe range. Runs after the ini is read and after every menu edit.
-void ClampConfig(Config& c) {
-    c.telemetrySource = std::max(0, std::min(c.telemetrySource, 2));
-    c.udpPort = std::max(0, std::min(c.udpPort, 65535));
-    c.minPacket = std::max(64, std::min(c.minPacket, 1024));
-    c.cylinders = std::max(1, std::min(c.cylinders, 16));
-    c.engineMaxMag = std::max(0, std::min(c.engineMaxMag, 10000));
-    c.roadMaxMag = std::max(0, std::min(c.roadMaxMag, 10000));
-    c.brakeMaxMag = std::max(0, std::min(c.brakeMaxMag, 10000));
-    c.impactGain = clampf(c.impactGain, 0.0f, 3.0f);
-    c.brakeHzScale = clampf(c.brakeHzScale, 0.5f, 2.0f);
-    c.drivetrain = std::max((int)Tyre::FWD, std::min(c.drivetrain, (int)Tyre::AWD));
-    c.wheelbase = clampf(c.wheelbase, 1.5f, 4.0f); c.trackWidth = clampf(c.trackWidth, 1.0f, 2.2f); c.cgToFront = clampf(c.cgToFront, 0.4f * c.wheelbase, 0.6f * c.wheelbase);
-    c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
-    c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0; c.roadViaRbr = c.roadViaRbr ? 1 : 0;
-    c.fxAudio = c.fxAudio ? 1 : 0;
-    c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f);
-    c.fxCamera = c.fxCamera ? 1 : 0; c.fxWindscreen = c.fxWindscreen ? 1 : 0;
-    c.fxWater = c.fxWater ? 1 : 0; c.waterGain = clampf(c.waterGain, 0.0f, 2.0f); c.waterHeavy = clampf(c.waterHeavy, 0.0f, 2.0f);
-    c.fxAccelLight = c.fxAccelLight ? 1 : 0; c.accelLight = clampf(c.accelLight, 0.0f, 2.0f);
-    c.landingBoost = clampf(c.landingBoost, 0.0f, 4.0f);
-    c.landingAdd = clampf(c.landingAdd, 0.0f, 1.0f);
-    c.airLevel = clampf(c.airLevel, 0.2f, 0.8f);
-    c.totalMaxMag = std::max(500, std::min(c.totalMaxMag, kHardTotalMax));
-    c.userGain   = clampf(c.userGain,   0.0f, 1.0f);
-    c.engineGrit = clampf(c.engineGrit, 0.0f, 1.0f);
-    c.loadInfluence = clampf(c.loadInfluence, 0.0f, 1.0f);
-    c.thumpGain = clampf(c.thumpGain, 0.0f, 2.0f);
-    c.airborneFade = clampf(c.airborneFade, 0.0f, 1.0f);
-    c.weightFeel = clampf(c.weightFeel, 0.5f, 2.0f);
-    c.lumpScale = clampf(c.lumpScale, 0.0f, 2.0f);
-    c.unevenness = clampf(c.unevenness, 0.0f, 1.0f);
-    c.gainRatio  = clampf(c.gainRatio, 0.5f, 0.95f);
-    c.sustainedLimit = clampf(c.sustainedLimit, 0.02f, 0.20f);
-    c.engineMinHz = clampf(c.engineMinHz, kHardMinHz, kHardMaxHz);
-    c.engineMaxHz = clampf(c.engineMaxHz, kHardMinHz, kHardMaxHz);
-    c.roadMinHz = clampf(c.roadMinHz, 20.0f, 150.0f);
-    c.roadMaxHz = clampf(c.roadMaxHz, c.roadMinHz + 5.0f, 150.0f);
-    if (c.engineMaxHz < c.engineMinHz + 5.0f) { c.engineMaxHz = std::min(c.engineMinHz + 5.0f, kHardMaxHz); c.engineMinHz = c.engineMaxHz - 5.0f; }
-    if (c.roughHigh < c.roughLow + 0.05f) c.roughHigh = c.roughLow + 0.05f;
-    if (c.maxSpeed < 1.0f) c.maxSpeed = 1.0f;
-    if (c.tyreCircumference < 0.5f) c.tyreCircumference = 1.95f;
-}
-
 void SyncConfig(Config& c, const std::string& path, bool write) {
     const char* S = "ForceFX";
     auto F = [&](const char* k, float& v) {
@@ -322,25 +197,27 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
         if (write) { snprintf(b, sizeof(b), "%d", v); WritePrivateProfileStringA(S, k, b, path.c_str()); }
         else { GetPrivateProfileStringA(S, k, "", b, sizeof(b), path.c_str()); if (b[0]) v = atoi(b); }
     };
-    I("TelemetrySource", c.telemetrySource);  I("UdpPort", c.udpPort);  I("MinPacketBytes", c.minPacket);  I("Cylinders", c.cylinders);
+    I("TelemetrySource", c.telemetrySource);  I("UdpPort", c.udpPort);  I("MinPacketBytes", c.minPacket);
     I("EngineMaxMagnitude", c.engineMaxMag); I("RoadMaxMagnitude", c.roadMaxMag);
     I("BrakeMaxMagnitude", c.brakeMaxMag); I("TotalMaxMagnitude", c.totalMaxMag);
     F("ImpactGain", c.impactGain);
     F("BrakeHzScale", c.brakeHzScale); F("PriorityDuck", c.priorityDuck);
-    I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("RoadViaRbr", c.roadViaRbr); I("EnableBrake", c.fxBrake);
-    I("SurfaceProbe", c.probe);
+    I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("EnableBrake", c.fxBrake);
+    I("EnableCrash", c.fxCrash); F("CrashBoost", c.crashBoost); F("CrashMinPush", c.crashAdd);
+    F("LockLightness", c.lockLight);
+    F("MaxForceMultiplier", c.maxForceMul);
+    I("OffsetGear", c.offGear); I("OffsetCarRoll", c.offCarRoll); I("OffsetVelHeave", c.offVelHeave);
     I("EnableWater", c.fxWater); F("WaterGain", c.waterGain); F("WaterHeaviness", c.waterHeavy);
-    I("EnableAccelLight", c.fxAccelLight); F("AccelLightness", c.accelLight);
+    I("EnableWeightTransfer", c.fxWeight); F("WeightLightness", c.weightLight); F("WeightHeaviness", c.weightHeavy); F("WeightCornering", c.weightCorner);
     I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp);
     I("EnableCamera", c.fxCamera); I("EnableWindscreen", c.fxWindscreen);
     I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
-    F("RpmMax", c.rpmMax); F("RpmMaxInit", c.rpmMaxInit);
     F("RoadMinHz", c.roadMinHz); F("RoadMaxHz", c.roadMaxHz);
     F("RoughLow", c.roughLow); F("RoughHigh", c.roughHigh); F("RoughGamma", c.roughGamma);
     F("EngineGrit", c.engineGrit);
     F("LoadInfluence", c.loadInfluence); F("ThumpGain", c.thumpGain); F("AirborneFade", c.airborneFade);
-    F("WeightFeel", c.weightFeel); F("LumpScale", c.lumpScale); F("Unevenness", c.unevenness);
+    F("WeightFeel", c.weightFeel);
     I("CarProfiles", c.carProfiles); I("OffsetCarIndex", c.offCarIndex); I("OffsetSteps", c.offSteps); I("OffsetVelSurge", c.offVelSurge); I("OffsetVelSway", c.offVelSway);
     F("PistonScale", c.pistonScale); F("BumpScale", c.bumpScale); F("MaxSpeed", c.maxSpeed);
     F("TyreCircumference", c.tyreCircumference);
@@ -575,7 +452,10 @@ CarIdent ResolveCarIdentity(int telemSlot) {
 
 void ApplyProfile(const Config& base, const CarProfile& p, Config& e) {
     e = base;
-    if (!p.found) return;
+    if (!p.found) {                                      // every car has a profile; one that has none gets a quiet engine rather than a guessed pitch
+        if (base.carProfiles) e.engineMaxMag = (int)(base.engineMaxMag * 0.35f);
+        return;
+    }
     if (p.cylinders > 0) e.cylinders = std::max(1, std::min(p.cylinders, 16));
     if (p.rpmMax > 500.0f) e.rpmMax = p.rpmMax;
     e.engineMaxMag = std::max(0, std::min((int)(base.engineMaxMag * clampf(p.engineScale, 0.0f, 2.0f)), 10000));
@@ -599,7 +479,7 @@ void ApplyProfile(const Config& base, const CarProfile& p, Config& e) {
 std::atomic<float> g_boostMul{1.0f}, g_boostAdd{0.0f};
 std::atomic<int>   g_fxUpdates{0};                              // effect updates sent to the wheel; the Diagnostics page shows them per second
 std::atomic<int>   g_rbrSeen{0}, g_rbrRaw{0}, g_rbrOut{0};      // for the diagnostics page: updates seen, last magnitude in and out
-// Road vibration through RBR's own force: the sine bands are computed here and added to the magnitude RBR sends, so the wheel
+// Road vibration (and the brake judder, as a fourth band) through RBR's own force: the sine bands are computed here and added to the magnitude RBR sends, so the wheel
 // sees RBR's one constant-force effect and nothing extra for the road. RBR only updates its force every so often, so a small
 // thread (RoadVib, below) repeats the last force plus the vibration on that same effect a few hundred times a second.
 inline long long SteadyMs() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -672,8 +552,9 @@ void** EffectTap::vtbl = nullptr;
 void*  EffectTap::orig = nullptr;
 
 namespace RoadVib {
-std::atomic<int>   g_mag[3];                                    // sine amplitude of each road band, wheel units (set by the worker thread)
-std::atomic<float> g_hz[3];
+constexpr int kVibBands = 4;                                    // the three road bands and, as the fourth, the brake judder
+std::atomic<int>   g_mag[kVibBands];                            // sine amplitude of each band, wheel units (set by the worker thread)
+std::atomic<float> g_hz[kVibBands];
 std::atomic<bool>  g_run{false};
 std::thread        g_thread;
 constexpr int       kStreamMs = 3;                              // one send about every 3 ms
@@ -698,7 +579,7 @@ void Loop() {
     PFN_Period begin = wm ? (PFN_Period)GetProcAddress(wm, "timeBeginPeriod") : nullptr;
     PFN_Period end   = wm ? (PFN_Period)GetProcAddress(wm, "timeEndPeriod") : nullptr;
     if (begin) begin(1);                                        // 1 ms timer, otherwise Sleep(3) would take 15 ms
-    float ph[3] = {0.0f, 0.0f, 0.0f};
+    float ph[kVibBands] = {0.0f, 0.0f, 0.0f, 0.0f};
     Road::LowCut lowCut;
     auto last = Clock::now();
     int lastSent = 0;
@@ -715,7 +596,7 @@ void Loop() {
             continue;
         }
         float v = 0.0f;
-        for (int b = 0; b < 3; ++b) {
+        for (int b = 0; b < kVibBands; ++b) {
             const float f = clampf(g_hz[b].load(), 0.0f, 200.0f), m = (float)g_mag[b].load();
             ph[b] = std::fmod(ph[b] + 6.2831853f * f * dt, 6.2831853f);
             v += m * std::sin(ph[b]);
@@ -1282,9 +1163,7 @@ BOOL CALLBACK FindFFAxisCb(const DIDEVICEOBJECTINSTANCEA* o, VOID* ref) {
 // The road is computed as three bands, low to high (road_bands.hpp), so the synth keeps three road slots. Only S_ROAD2 is ever a wheel
 // effect: when the road is played as an effect of its own, the three bands are merged into that one sine (Road::Consolidate). Normally
 // the bands are added to RBR's own force instead and the wheel gets no road effect at all.
-enum Slot { S_ENG1 = 0, S_ENG2, S_ROAD1, S_ROAD2, S_ROAD3, S_BRAKE, S_COUNT };
-const bool kSlotIsEffect[S_COUNT] = {true, true, false, true, false, true};
-const char* const kSlotName[S_COUNT] = {"engine", "lump", "road-low", "road", "road-high", "brake"};
+
 
 class FFLayer {
 public:
@@ -1420,39 +1299,6 @@ inline bool readF(const uint8_t* b, int len, int off, float& out) {
 
 // The share of each side's ground and texture that comes from its front tyre (the rear tyre gets the rest). The front tyre is what the
 // steering feels, so it dominates: 90:10. Overridden by FrontWeight in [Surface].
-namespace Surf { float g_front = 0.90f; }
-
-struct Signals {
-    float rpm = 0, speed = 0 /* m/s */, throttle = 0, brake = 0;
-    float rpmMaxTelem = 0;   // rev limit straight from the telemetry (0 = not available)
-    float rough = 0;      // raw front-weighted tyre roughness
-    float piston = 0;     // damper piston velocity level
-    float texture = 0;    // combined road texture 0..1
-    float texL = 0, texR = 0;   // the same, per side (left / right tyres)
-    float bump = 0;       // heave acceleration spike envelope
-    float dive = 0;       // front load transfer under braking 0..1
-    float lock = 0;       // lock-up 0..1 (the synth works it out per tyre; only the test mode sets it here)
-    float frontRev = 0;   // front wheel revolutions per second
-    int   carIndex = -1;  // NGP Car.Index (-1 = unknown)
-    // weight / suspension load, relative to this car's own static load (1 = at rest)
-    float loadL = 1, loadR = 1, loadF = 1;
-    float airborne = 0;   // 0 = wheels loaded, 1 = off the ground
-    int   surf[4] = {0, 0, 0, 0};   // ground class under each tyre, in the order FL, FR, RL, RR (Surf::Cls); 0 = unknown
-    int   mat[4] = {-1, -1, -1, -1};   // game material id under each tyre, same order (-1 = unknown); the ground's properties come from its name
-    // Per tyre, same order (FL, FR, RL, RR): the raw material for wheelspin and slides. The synth judges them against the grip of the ground under each tyre.
-    float ratio[4] = {0, 0, 0, 0};  // slip ratio past the uncertainty of the count: + the tyre turns faster than the ground along its own direction, - slower
-    bool  ratioOk[4] = {false, false, false, false};
-    float angle[4] = {0, 0, 0, 0};  // slip angle, rad (from body motion and steering)
-    bool  angleOk = false;
-    float handbrake = 0;
-    float wload[4] = {0, 0, 0, 0};  // share of the car's weight on each tyre (sums to 1)
-    float accMag = 0; bool accOk = false;   // the car's acceleration over the ground in m/s^2, if the units are known
-    float ground = 0;               // the car's speed over the ground, m/s (0 = not known)
-    float thumpL = 0, thumpR = 0;   // compression / landing envelope per side
-    unsigned evtSeq = 0;  // goes up by one for every landing; the synth starts one boost per event
-    float evtSev = 0;     // severity of the current event 0..1 (refined upward while a landing is still compressing)
-    float staticLoad = 0; // learned static strut load, all four wheels (units of the telemetry)
-};
 
 struct Hp  { float y = 0, x = 0; bool init = false;
              float step(float in, float a) { if (!init) { x = in; init = true; y = 0; return 0; } y = a * (y + in - x); x = in; return y; } };
@@ -1464,19 +1310,18 @@ struct Ema { float v = 0; bool init = false;
 struct Dsp {
     Hp  sfHp[4], pistonHp[4], accHp;
     Ema sfVar[4], pistonVar[4], loadShort[4];
-    Ema loadRef, baseFront;
+    Ema loadRef;
     // Wheel turns, counted over a window with enough steps, against the ground speed (wheel_slip.hpp)
     Slip::Timebase tbase; Slip::RevCounter revc[4]; Slip::WheelSlip wslip[4]; Slip::GroundSpeed gspeed;
     unsigned timeGen = ~0u; double tArr = 0; bool slipInit = false;
     Tyre::Kinematics kin;   // each tyre's own slip angle and ground speed
-    float bumpEnv = 0, diveSm = 0;
+    float bumpEnv = 0;
     Ema statRef[4], rLsm, rRsm, rFsm;
     float thumpL = 0, thumpR = 0;
-    // landing / impact detector (works on raw, unsmoothed load so the spike doesn't get averaged away)
+    // landing / impact detector (works on raw, unsmoothed load so the spike doesn't get averaged away); landing.hpp
     float peakRw = 0, totRatio = 1;
-    float airT = 0, landWin = 0, landAir = 0, landPeak = 0, landBump = 0, landJump = 0;
-    unsigned evtSeq = 0; float evtSev = 0;
-    float totLow = 1.0f;   // running minimum of the total strut load (relative): a sudden rise above it means something hit the car
+    Landing::Detector land; float landSince = 99.0f;   // seconds since the last landing started or the car was in the air
+    ffx::crash::Detector crash; unsigned crashSeq = 0; float crashSev = 0;   // the car hitting something (audio/crash.hpp)
 };
 
 void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, float dt) {
@@ -1574,66 +1419,18 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
     }
     s.bump = clamp01(d.bumpEnv);
 
-    // ---- landings. Only a real jump counts: the car has to be off the ground for Road::kBoostMinAir first, so bumps, washboard and
-    //      weight transfer never start one. Three cues are combined, so any one strong cue gives a full-strength landing:
-    //      peak   the highest strut load on any wheel (relative to its static load)
-    //      jump   how fast the TOTAL strut load rose from its recent minimum
-    //      air    how long the wheels were unloaded before the landing, plus the heave acceleration spike
-    //      Severity is continuous (no on/off threshold), so a small hop is a small tap and a big jump is violent.
+    // ---- landings: one event per real jump, with a severity (landing.hpp). The synth turns it into a boost of RBR's own force.
     {
-        const float rawTot = d.totRatio;
-        d.totLow = std::min(rawTot, d.totLow + (rawTot - d.totLow) * alphaFor(dt, 0.12f));
-        const float jump = std::max(0.0f, rawTot - d.totLow);
-        const bool off = s.speed > 3.0f && rawTot < c.airLevel;
-
-        auto severity = [&](float peak, float air, float bump, float jmp) {
-            const float peakT = clamp01((peak - 1.15f) / 1.3f);
-            const float jumpT = clamp01((jmp - 0.25f) / 1.0f);
-            const float airT2 = clamp01(air / 0.5f);
-            const float bumpT = clamp01(bump);
-            const float top = std::max(std::max(peakT, jumpT), std::max(0.85f * airT2, 0.7f * bumpT));
-            const float sum = peakT + jumpT + airT2 + bumpT;
-            const float sev = clamp01(top + 0.15f * (sum - top));
-            return std::max(sev, 0.55f + 0.45f * airT2);                    // anything that really left the ground is always felt
-        };
-
-        // Every landing fires ONE event with a severity. The synth turns it into a boost of RBR's own force.
-        auto fire = [&](float sev) { ++d.evtSeq; d.evtSev = sev; };
-
-        if (off) {
-            d.airT += dt;
-        } else {
-            if (Road::LandingBoostWorthy(d.airT) && d.landWin <= 0.0f) {   // only a real jump boosts the wheel, a bump never does
-                d.landWin = 0.10f; d.landAir = d.airT; d.landPeak = 0; d.landBump = 0; d.landJump = 0;
-                fire(severity(0.0f, d.landAir, 0.0f, 0.0f));
-            }
-            d.airT = 0;
-        }
-        if (d.landWin > 0.0f) {                                   // refine the estimate while the suspension compresses
-            d.landPeak = std::max(d.landPeak, d.peakRw);
-            d.landBump = std::max(d.landBump, clamp01(d.bumpEnv));
-            d.landJump = std::max(d.landJump, jump);
-            const float sev = severity(d.landPeak, d.landAir, d.landBump, d.landJump);
-            d.evtSev = std::max(d.evtSev, sev);
-            d.landWin -= dt;
-            if (d.landWin <= 0.0f) {
-                d.landWin = 0.0f;
-                Logf("landing: severity %.2f  (air %.2fs, peak load %.2f, load jump %.2f, heave %.2f)", d.evtSev, d.landAir, d.landPeak, d.landJump, d.landBump);
-            }
-        }
-        s.evtSeq = d.evtSeq;
-        s.evtSev = clamp01(d.evtSev * c.impactGain);      // an impactGain above 1 lets mid-size hits reach full strength
+        Landing::In li;
+        li.totRatio = d.totRatio; li.peakRw = d.peakRw; li.bumpEnv = d.bumpEnv; li.speed = s.speed; li.airLevel = c.airLevel;
+        const Landing::Out lo = d.land.Step(li, dt);
+        d.landSince = lo.sinceEvent;
+        if (lo.finished) Logf("landing: severity %.2f  (air %.2fs, peak load %.2f, load jump %.2f, heave %.2f)", lo.evtSev, lo.air, lo.peak, lo.jump, lo.bump);
+        s.evtSeq = lo.evtSeq;
+        s.evtSev = clamp01(lo.evtSev * c.impactGain);      // an impactGain above 1 lets mid-size hits reach full strength
     }
 
-    // ---- braking: weight moving onto the front tyres ("dive") and front wheel lock-up
-    const float tot = absSf[0] + absSf[1] + absSf[2] + absSf[3];
-    if (tot > 1e-3f) {
-        float share = (absSf[0] + absSf[1]) / tot;
-        if (s.brake < 0.05f && s.speed > 3.0f) d.baseFront.step(share, alphaFor(dt, 2.0f));
-        float target = (s.brake > 0.1f && d.baseFront.init) ? clamp01((share - d.baseFront.v) / 0.10f) : 0.0f;
-        d.diveSm += (target - d.diveSm) * alphaFor(dt, 0.1f);
-    }
-    s.dive = d.diveSm;
+    // (Braking: the weight moving onto the front tyres is measured by the weight transfer tracker, effects/weight_transfer.hpp, in the synth.)
 
     // ---- wheel spin and slip. NGP has no slip value, only a segment counter per wheel, so the spin is counted over a window with
     //      enough steps and compared with the car's real speed over the ground (wheel_slip.hpp). Slip only counts past the
@@ -1664,7 +1461,16 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
         const double accScale = d.kin.accelScale(kp);
         s.accMag = (float)(std::sqrt((double)aSurge * aSurge + (double)aSway * aSway) * accScale);
         s.accOk = d.kin.unitsConfirmed();
+        s.latG = s.accOk ? (float)(std::fabs(d.kin.latAccel) / 9.81) : 0.0f;
         s.angleOk = d.kin.valid;
+
+        // ---- a crash: the car hitting a tree, a rock, a wall. Needs the acceleration units; nothing counts in the air or just after a landing.
+        if (s.accOk) {
+            const ffx::crash::Result cr = d.crash.update(dt, (double)aSurge * accScale, (double)aSway * accScale, s.ground > 0.0f ? s.ground : s.speed,
+                                                           s.airborne > 0.3f || d.landSince < 0.6f);
+            if (cr.hit) { ++d.crashSeq; d.crashSev = (float)cr.severity; Logf("crash: severity %.2f  (%.1f g peak, lost %.1f m/s, %s)", cr.severity, cr.peakG, cr.dv, cr.frontal ? "along the car" : "from the side"); }
+        } else d.crash.reset();
+        s.crashSeq = d.crashSeq; s.crashSev = d.crashSev;
 
         const bool coasting = s.throttle < 0.12f && s.brake < 0.03f && s.handbrake < 0.03f &&
                               std::fabs(aSway * accScale) < kp.coastAccelLimit && std::fabs(aSurge * accScale) < kp.coastAccelLimit;
@@ -1681,307 +1487,6 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
     }
 }
 
-// -------------------------------------------------------------- synthesis
-// Turns the analysed signals into effect strengths and frequencies. Runs on the worker thread, about 100 times a second.
-// ====================================================================================================================
-// ROAD FEEL: how the road vibration is shaped by the ground and by what the car is doing.
-//
-// There is no list of "gravel feels like this, tarmac like that". The game's contact data names the material under each tyre
-// (for example Gravel_Coarse_Deep_Wet), and road_feel.hpp turns that name into a few physical properties: how hard the ground
-// is, how much loose material lies on it, how coarse it is and how slippery. The road effect then follows from those together
-// with the telemetry: the measured roughness of the tyres sets how strong it is, speed and wheel slip decide how hard loose
-// ground is worked (stones flung, grain), and tyres that shake in a regular pattern on hard ground are cobbles. Everything
-// reshapes the existing road effect, so no new effects are added and the force stays zero-mean. Unknown ground is plain hard
-// ground. The one setting for all of it is the road gain; the switch is in the menu (Plugins > ForceFX).
-// ====================================================================================================================
-// The surface classes and the id-to-class table live in surface_feel.hpp, the ground model in road_feel.hpp (both testable on
-// their own). surface_feel.hpp is included here, inside the anonymous namespace, because the surface reader below extends the
-// same Surf namespace.
-#include "surface_feel.hpp"
-#include "road_feel.hpp"   // how the ground and what the car is doing shape the road vibration
-#include "road_bands.hpp"  // the road vibration as three sine bands: pitch from speed, strength spread by the ground
-static_assert(Water::kBands == Road::kBands, "the water effects ride on the same bands as the road");
-namespace Surf {
-float g_fade = 0.25f;                // seconds to cross-fade between two surfaces
-int   g_cobbleDetect = 1;            // 1 = hard ground that shakes in a regular pattern gets the cobble feel (detected from the telemetry)
-float g_cobbleLo = 0.5f;             // rough-per-speed level (x100) where that blend starts ...
-float g_cobbleHi = 1.0f;             // ... and where it is complete
-}  // namespace Surf
-
-// How far each side's road strength follows its own tyres (0 = both sides identical, 1 = left and right fully separate).
-constexpr float kRoadDirectional = 0.7f;
-
-struct Synth {
-    float sm[S_COUNT] = {};
-    Surf::CobbleDetector cob;                              // telemetry check for hard ground made of regular ridges
-    Road::Ground gnd[4];                                   // the ground under each tyre (FL, FR, RL, RR), moved gradually towards what was read
-    Tyre::GripLearner grip;                                // how hard the car can accelerate on each kind of ground (reset with the car)
-    float spinSm[4] = {}, slideSm[4] = {}, lockSm[4] = {};   // wheelspin, sliding and lock-up of each tyre (FL, FR, RL, RR), 0..1, smoothed
-    float lockAmt = 0;                                     // lock-up for the brake effect, 0..1
-    float thrSm = 0, lope = 0, rpmPeak = 0, heat = 0;
-    float jAge = 5.0f, evAmp = 0.0f;                       // age and severity of the current landing event
-    unsigned seenEvt = 0;
-    float evBusy = 0.0f, evGov = 1.0f;                     // how many landings and hits came lately, and how much the current one is held back because of them
-    float boostMul = 1.0f, boostAdd = 0.0f;                // landing boost for RBR's own force (the worker thread hands it to the hook)
-    float bandHzJit[Road::kBands] = {1.0f, 1.0f, 1.0f}, bandAmpJit[2][Road::kBands] = {{1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}};   // random pitch per band, random strength per side and band
-    float engJit = 1.0f, engHzJit = 1.0f, unevPhase = 0;
-    double nextJit = 0;
-    Water::Tracker water;                                  // splash, wading and aquaplaning from the standing water under each tyre
-    Water::Out wout;                                       // its result for the current step
-    unsigned waterSeenEvt = 0;                             // last landing event the water tracker has seen
-    float waterJit[2][Water::kBands] = {{1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}};   // random strength per side and band for the wading: slaps, not a hum
-    AccelLight::Tracker accel; AccelLight::Out aout;       // front load under acceleration: how light the steering should go
-    double accLogT = -10.0; int accLogN = 0;               // when the last light-steering line was logged, and how many were
-    bool accWasRest = false; int accRestLogs = 0;          // the standing front share was known on the last step, and how many times it was logged
-    unsigned waterEvents = 0; float waterEntry = 0.0f; int waterEntryTyre = -1; bool waterEntryIn = false;   // goes up for every splash; strength, tyre and whether it was going in (not out) for the last one (for sound and glass)
-
-    void Run(const Config& c, const Signals& s, double t, float dt, float userGain, int mag[S_COUNT], float hz[S_COUNT]) {
-        thrSm += (s.throttle - thrSm) * alphaFor(dt, 0.12f);
-
-        // ---------------- ENGINE: both strength and pitch follow the engine
-        rpmPeak = std::max(rpmPeak, s.rpm);
-        // rev limit: telemetry first, then the car profile or ini, then the highest rpm seen so far
-        const float rmax = s.rpmMaxTelem > 0 ? s.rpmMaxTelem : (c.rpmMax > 0 ? c.rpmMax : std::max(rpmPeak, c.rpmMaxInit));
-        const float x = clamp01(s.rpm / rmax);
-        const float fire = s.rpm / 60.0f * c.cylinders * 0.5f;
-        const float fireMax = rmax / 60.0f * c.cylinders * 0.5f;
-        const float k = fireMax > c.engineMaxHz ? c.engineMaxHz / fireMax : 1.0f;     // squeeze the whole range linearly so the pitch never jumps
-        const float buzzW = smooth01(0.50f, 1.0f, x);                                 // how far into the high-rev range we are
-        const float grit = c.engineGrit * buzzW;
-        hz[S_ENG1] = clampf(fire * k * (1.0f + 0.04f * grit * engHzJit), c.engineMinHz, c.engineMaxHz);
-
-        const float idle = 1.0f - smooth01(0.08f, 0.45f, x);                          // lumpy idle
-        const float res = gauss(x, 0.55f, 0.08f) + 0.8f * gauss(x, 0.80f, 0.07f);    // engine resonances
-        const float buzz = smooth01(0.60f, 1.0f, x);                                  // high-rev buzz
-        const float A1 = clamp01(0.22f + 0.45f * idle + 0.35f * res + 0.30f * buzz);
-        const float loadF = 0.45f + 0.55f * thrSm;                                    // an engine under load shakes more
-        const float comp = clampf(1.4f - 0.009f * (hz[S_ENG1] - c.engineMinHz), 0.55f, 1.4f);   // wheels are weaker at high frequencies, so compensate
-        const float engAir  = 1.0f - 0.35f * c.airborneFade * s.airborne;                       // an engine revving in the air feels lighter
-        const float unevMod = 1.0f - 0.35f * c.unevenness * (0.5f + 0.5f * std::sin(unevPhase)); // uneven firing makes the strength sway
-        float t1 = s.rpm > 200 ? c.engineMaxMag * clamp01(A1 * loadF * comp * unevMod * engAir * (1.0f - 0.45f * grit * (0.5f - 0.5f * engJit))) : 0.0f;   // grit makes the strength irregular
-        if (s.rpm > 200 && x > 0.985f && thrSm > 0.8f) t1 *= (std::fmod(t, 0.08) < 0.04 ? 1.0f : 0.25f);   // rev limiter
-
-        lope += (rnd() - lope) * 0.05f;                                               // slow random wander for uneven low-rpm firing
-        // At low revs this is a half-order lump. At high revs the same layer becomes a detuned second tone (x1.37)
-        // whose beating against the main one makes a high-rev engine feel rough instead of like a clean sine.
-        const float xover = smooth01(0.45f, 0.75f, x) * c.engineGrit;
-        const float hzLump = clampf(fire * 0.5f, 7.0f, 42.0f);
-        const float hzBeat = clampf(hz[S_ENG1] * 1.37f, c.engineMinHz, kHardMaxHz);
-        hz[S_ENG2] = hzLump + (hzBeat - hzLump) * xover;
-        unevPhase += 6.2831853f * hzLump * dt;
-        if (unevPhase > 6.2831853f) unevPhase -= 6.2831853f;
-        const float A2 = (0.15f + 0.85f * idle) * (0.5f + 0.5f * thrSm) * (1.0f + 0.25f * lope * (0.2f + idle))
-                       + 0.55f * grit * (0.6f + 0.4f * thrSm);
-        float t2 = s.rpm > 200 ? c.engineMaxMag * 0.8f * clamp01(A2 * c.lumpScale) * engAir : 0.0f;
-
-        // ---------------- ROAD: three sine bands (low, mid, high) of the road's spectrum. The pitch of each band follows the car's
-        // speed, the ground under each side decides how the strength is spread over the bands, and the tyre's contact patch takes
-        // the high bands away at low speed (road_bands.hpp). The sines are zero-mean, so they never shift RBR's own force, and the
-        // two sides add as energy, so they can not cancel each other. How the bands reach the wheel is decided in the worker loop.
-        const float spN = clamp01(s.speed / c.maxSpeed);
-        const float gSpd = smooth01(1.0f, 10.0f, s.speed);
-
-        // ---------------- WATER: which tyres are in standing water decides the splash on entry, the wading rumble and the planing.
-        // Only the ground the surface scan found counts (Water_Surface and the ids in WaterIds=), so wet tarmac is left to the road feel.
-        {
-            Water::In wi;
-            for (int w = 0; w < 4; ++w) wi.depth[w] = c.fxWater ? Water::DepthOfId(s.mat[w]) : 0.0f;
-            wi.speed = s.speed; wi.maxSpeed = c.maxSpeed; wi.airborne = s.airborne;
-            if (s.evtSeq != 0) { wi.landed = s.evtSeq != waterSeenEvt; wi.landSev = s.evtSev; waterSeenEvt = s.evtSeq; }   // no telemetry reads as sequence 0: not a landing
-            if (!c.fxWater) { water.Reset(); wout = Water::Out(); }   // off: forget everything, so switching it on in the middle of a ford is not a splash
-            else wout = water.Update(wi, dt);
-            if (wout.entry > 0.0f) { waterEntry = wout.entry; waterEntryTyre = wout.entryTyre; waterEntryIn = wout.entryTyre >= 0 && wi.depth[wout.entryTyre] >= 0.5f; ++waterEvents; }
-        }
-
-        // ---------------- LIGHT STEERING FROM THE FRONT LOAD: the share of the weight on the front tyres (from the four strut forces) against what it is standing still on the
-        // start line. Hard acceleration moves weight to the rear, and the steering loses force in proportion. Scales RBR's own force down (see boost below).
-        {
-            AccelLight::In ai;
-            ai.frontShare = s.wload[0] + s.wload[1]; ai.throttle = s.throttle; ai.brake = s.brake; ai.speed = s.ground > 0.0f ? s.ground : s.speed;
-            ai.airborne = s.airborne; ai.accMag = s.accMag; ai.accOk = s.accOk;
-            if (!c.fxAccelLight) { accel.Reset(); aout = AccelLight::Out(); }
-            else aout = accel.Update(ai, dt);
-            if (aout.fromRest && !accWasRest && accRestLogs < 10) {   // the car stood still long enough: say what it read, so a start on a slope shows in the log
-                ++accRestLogs;
-                Logf("Light steering: standing front share %.3f (acceleration reads %.2f m/s^2 standing%s)", (double)aout.base, (double)ai.accMag, ai.accOk ? "" : ", units not known yet");
-            }
-            accWasRest = aout.fromRest;
-            if (c.fxAccelLight && aout.rawDrop > 0.04f && aout.drop > 0.02f && t - accLogT > 1.5 && accLogN < 60) {   // how much the front really unloads, to tune AccelLightness by
-                accLogT = t; ++accLogN;
-                Logf("Light steering: front load %.0f%% below standing (standing %.2f, now %.2f), accelerating %.2f g, %.0f km/h -> steering force x%.2f", (double)(100.0f * aout.rawDrop), (double)aout.base, (double)ai.frontShare, (double)aout.accelG, (double)(ai.speed * 3.6f), (double)AccelLight::Mul(aout, c.accelLight));
-            }
-        }
-
-        // ---------------- TYRE MOTION: wheelspin and slides, each tyre judged against the grip limit of the ground under it.
-        //   Wheelspin: a driven tyre turning faster than the ground, throttle open. A rear-wheel-drive car only has it at the rear.
-        //   Slide: a tyre moving the wrong way, sideways or locked up under braking or the handbrake. Any tyre can slide.
-        // How much of the grip the car is using (learned per ground from how hard it has accelerated on it) confirms a slide.
-        {
-            double share[Tyre::GripLearner::kClasses] = {0, 0, 0, 0, 0, 0, 0, 0};
-            for (int w = 0; w < 4; ++w) { const int cl = s.surf[w]; if (cl > 0 && cl < Tyre::GripLearner::kClasses) share[cl] += s.wload[w]; }
-            double sum = 0; for (double v : share) sum += v;
-            if (sum > 1e-6) for (double& v : share) v /= sum;
-            grip.update(s.accMag, share, s.accOk && s.airborne < 0.5f && s.speed > 5.0f && sum > 1e-6, dt);
-            const double gate = Tyre::GripGate(grip.use());
-            for (int w = 0; w < 4; ++w) {
-                Tyre::TyreIn in;
-                in.driven = Tyre::Driven(c.drivetrain, w);
-                in.ratioValid = s.ratioOk[w]; in.ratio = s.ratio[w];
-                in.angleValid = s.angleOk && s.speed > 1.0f && std::fabs(s.angle[w]) < 0.7f; in.angle = s.angle[w];
-                in.throttle = s.throttle; in.brake = s.brake; in.handbrake = s.handbrake; in.gate = gate;
-                Tyre::PeaksFromGround(gnd[w].loose, gnd[w].slick, in.peakRatio, in.peakAngleDeg);   // the grip limit of the ground under this tyre
-                const Tyre::TyreOut o = Tyre::Classify(in);
-                const float aSp = alphaFor(dt, 0.05f);
-                const float tSpin = (float)Tyre::SpinAmount(o.spin), tSlide = (float)Tyre::SlideAmount(o.slide), tLock = (float)Tyre::SlideAmount(o.lock, 1.0);
-                spinSm[w]  += (tSpin  - spinSm[w])  * aSp;
-                slideSm[w] += (tSlide - slideSm[w]) * aSp;
-                lockSm[w]  += (tLock  - lockSm[w])  * alphaFor(dt, tLock > lockSm[w] ? 0.05f : 0.15f);
-            }
-            // what the steering feels: the front tyres first, the rear ones a little less (they are felt through the car)
-            lockAmt = clamp01(0.5f * (lockSm[0] + lockSm[1]) + 0.25f * (lockSm[2] + lockSm[3]));
-        }
-        const auto sideDyn = [](const float* a, int k2) { return std::max(a[k2], 0.6f * a[2 + k2]); };   // front tyre of the side is k2, rear tyre 2 + k2
-        const float texMono = clamp01(s.texture + 0.9f * s.bump);
-        const float wf = clampf(c.weightFeel, 0.5f, 2.0f);
-        const float thump[2] = { s.thumpL, s.thumpR };
-        const float sideTex[2] = { s.texL, s.texR };
-        const float sideLoad[2] = { s.loadL, s.loadR };
-        // The ground under each tyre moves gradually towards what was read, so crossing from tarmac to gravel fades in over a
-        // fraction of a second. Each side of the road effect mixes its front and rear tyre, the front weighing more because it is
-        // what the steering feels, so left tyres on grass and right tyres on tarmac feel different. With the switch off, or with
-        // nothing known about the ground, every value is neutral.
-        Surf::Feel fes[2] = {Surf::kNeutral, Surf::kNeutral};                        // [0] = left, [1] = right
-        if (c.fxSurface) {
-            const float aw = alphaFor(dt, Surf::g_fade);
-            const float cobScore = Surf::g_cobbleDetect ? cob.update(s.rough, s.speed, s.airborne > 0.5f, dt, Surf::g_cobbleLo, Surf::g_cobbleHi) : 0.0f;
-            for (int w = 0; w < 4; ++w) gnd[w] = Road::Mix(gnd[w], Road::GroundForTyre(s.mat[w], s.surf[w]), aw);
-            const float fw = Surf::g_front;
-            for (int k2 = 0; k2 < 2; ++k2) {                                          // front tyre of this side is wheel k2, rear tyre is wheel 2 + k2
-                Road::Drive dr;
-                dr.spin = sideDyn(spinSm, k2); dr.slide = sideDyn(slideSm, k2);
-                dr.activity = Road::Activity(spN, std::max(dr.spin, dr.slide));
-                dr.ridge = cobScore;
-                fes[k2] = Road::Derive(Road::Mix(gnd[2 + k2], gnd[k2], fw), dr);
-            }
-        }
-        float texSide[2], loadGain[2];                                                // [0] = left, [1] = right
-        for (int k2 = 0; k2 < 2; ++k2) {
-            const float tm = texMono + (clamp01(sideTex[k2] + 0.9f * s.bump) - texMono) * kRoadDirectional;
-            texSide[k2] = clamp01(tm + c.thumpGain * wf * thump[k2]);                 // a heavier car thumps harder on landing
-            texSide[k2] = std::max(texSide[k2], fes[k2].floor);                            // smooth ground still gives a faint feel (snow, ice)
-            loadGain[k2] = 1.0f + c.loadInfluence * (clampf(sideLoad[k2], 0.4f, 1.8f) - 1.0f);   // a more heavily loaded tyre transmits more
-        }
-        const float roadAir = 1.0f - c.airborneFade * s.airborne;                     // wheels off the ground: no road feel
-        Road::SideIn rside[2];                                                        // [0] = left, [1] = right
-        for (int k2 = 0; k2 < 2; ++k2) {
-            rside[k2].fe = fes[k2];
-            rside[k2].strength = c.roadMaxMag * 0.7f * texSide[k2] * gSpd * loadGain[k2] * roadAir * fes[k2].amp;
-        }
-        const Road::Targets plan = Road::Plan(rside, s.speed, c.roadMinHz, c.roadMaxHz);
-        if (t >= nextJit) {                                                           // every ~12 ms, pick a new random strength per side and band, and a new pitch per band
-            float grMix = 0.0f, txMax = 0.0f;
-            for (int k2 = 0; k2 < 2; ++k2) {
-                const Surf::Feel& fe = fes[k2];
-                const float gr = clamp01(Road::kBaseGrain + fe.grainAdd);
-                grMix += 0.5f * gr; txMax = std::max(txMax, texSide[k2]);
-                const float lo = std::max(0.02f, 1.0f - 0.65f * gr - fe.dropout);     // strength varies between lo and 1
-                const bool hit = fe.spark > 0.0f && rnd() * 0.5f + 0.5f < fe.spark;   // a stone, a crack: one hard hit, felt in every band
-                for (int b = 0; b < Road::kBands; ++b)
-                    bandAmpJit[k2][b] = hit ? fe.sparkMul : (lo + (1.0f - lo) * (rnd() * 0.5f + 0.5f)) * fe.base;
-            }
-            for (int b = 0; b < Road::kBands; ++b) bandHzJit[b] = 1.0f + (0.10f + 0.40f * grMix * (txMax > 0.3f ? 1.0f : 0.5f)) * rnd();
-            engJit = rnd(); engHzJit = rnd();
-            for (int k2 = 0; k2 < 2; ++k2) for (int b = 0; b < Water::kBands; ++b) waterJit[k2][b] = 0.35f + 0.65f * (rnd() * 0.5f + 0.5f);
-            nextJit = t + 0.012;
-        }
-        float roadTarget[Road::kBands];
-        Road::Combine(rside, plan.share, bandAmpJit, roadTarget);
-        { const float cs = Road::CeilingScale(roadTarget, (float)c.roadMaxMag); for (int b = 0; b < Road::kBands; ++b) roadTarget[b] *= cs; }   // very rough ground can not make the road grow without limit
-        // Water rides on the same three bands, after the road's ceiling: a splash is a hit and wading is capped well below one, and both add to the road as energy.
-        float waterTarget[Road::kBands] = {0.0f, 0.0f, 0.0f};
-        if (c.fxWater) Water::BandMagnitudes(wout, c.waterGain, waterJit, waterTarget);
-        for (int b = 0; b < Road::kBands; ++b)
-            hz[S_ROAD1 + b] = clampf(plan.hz[b] * bandHzJit[b] / std::sqrt(wf), 20.0f, kHardMaxHz);   // heavier cars sound lower
-
-        // ---------------- BRAKE: front-end judder, harsh on lock-up
-        const float gB = smooth01(2.0f, 8.0f, s.speed);
-        // Lock-up shakes the wheel according to the ground: soft ground swallows it, hard ground and cobbles pass it on.
-        const float lockU = std::max(s.lock, lockAmt) * (c.fxSurface ? clampf(0.5f * (fes[0].amp + fes[1].amp), 0.4f, 1.3f) : 1.0f);
-        const float Ab = clamp01(std::pow(s.brake, 1.2f) * (0.3f + 0.7f * s.dive) * 0.6f + lockU);
-        hz[S_BRAKE] = lockU > 0.1f ? clampf(38.0f + 25.0f * rnd(), 25.0f, 70.0f) : clampf(s.frontRev * 2.0f, 12.0f, 60.0f);
-        hz[S_BRAKE] *= c.brakeHzScale;
-        float t4 = c.brakeMaxMag * Ab * gB * clampf(0.65f + 0.35f * s.loadF, 0.5f, 1.3f);   // more load on the fronts means more judder
-
-        // ---------------- LANDING: no effect of its own. A detected landing boosts RBR's own steering force (see EffectTap):
-        // a fast attack, a short hold, then a decay, scaled by how severe the landing was and by the live level.
-        // A jump is rare, rough ground is not: bumps and washboard fire hit events one after another, and boosting RBR's force for each
-        // of them makes the wheel heavy to turn. So the more events came in the last second or two, the less a new one counts. A single
-        // jump is not held back at all; a second hit soon after is, and on rough ground the boost fades to almost nothing.
-        evBusy *= (float)std::exp(-dt / 1.5f);
-        if (s.evtSeq != seenEvt) { seenEvt = s.evtSeq; jAge = 0.0f; evGov = 1.0f / (1.0f + 1.2f * evBusy); evBusy += 1.0f; evAmp = s.evtSev * evGov; }
-        if (jAge < 0.08f) evAmp = std::max(evAmp, s.evtSev * evGov);                 // the detector keeps refining a landing for its first ~100 ms
-        jAge = std::min(jAge + dt, 5.0f);
-        {
-            const float ts = std::sqrt(wf);                                           // a heavier car holds the boost longer
-            const float hold = 0.06f * ts, dec = 0.30f * ts;
-            const float env = jAge < hold ? 1.0f : (float)std::exp(-(jAge - hold) / dec);
-            const float lev = (c.fxLandBoost && jAge < 1.5f) ? clamp01(evAmp) * env * clampf(userGain, 0.0f, 1.0f) : 0.0f;
-            boostMul = 1.0f + c.landingBoost * lev;
-            boostAdd = c.landingAdd * lev;
-        }
-        // Water scales RBR's own force the same way: a kick on a splash (a moment of more), and heavy steering for as long as the front tyres are in the water.
-        if (c.fxWater) {
-            const float ugw = clampf(userGain, 0.0f, 1.0f);
-            boostMul *= Water::KickMul(wout, c.waterGain * ugw) * Water::HeavyMul(wout, c.waterHeavy * ugw);
-        }
-        if (c.fxAccelLight) boostMul *= AccelLight::Mul(aout, c.accelLight * clampf(userGain, 0.0f, 1.0f));   // and lighter while hard acceleration unloads the front
-
-        // attack and release: road is deliberately quick (for sharpness), engine is rounder
-        auto follow = [&](int i, float target, float up, float down) {
-            sm[i] += (target - sm[i]) * (target > sm[i] ? up : down);
-        };
-        if (!c.fxEngine) { t1 = 0.0f; t2 = 0.0f; }
-        follow(S_ENG1, t1, 0.35f, 0.15f);
-        follow(S_ENG2, t2, 0.25f, 0.12f);
-        const float roadDown = clampf(0.40f / wf, 0.15f, 0.70f);                     // heavier cars let the thump ring out longer
-        // The road follows the ground under the side that is feeling more of it (equal weight when both are silent).
-        const float sumSt = rside[0].strength + rside[1].strength, w0 = sumSt > 1e-6f ? rside[0].strength / sumSt : 0.5f;
-        const float roadAtk = w0 * fes[0].atk + (1.0f - w0) * fes[1].atk;
-        const float roadRel = clampf(roadDown * (w0 * fes[0].rel + (1.0f - w0) * fes[1].rel), 0.05f, 0.95f);   // gravel and ice let go fast, snow slowly
-        const float waterAtk = std::max(roadAtk, 0.55f * std::max(wout.splash[0], wout.splash[1]));   // a splash comes in hard
-        for (int b = 0; b < Road::kBands; ++b) {
-            const float rt = c.fxRoad ? roadTarget[b] : 0.0f;
-            follow(S_ROAD1 + b, std::sqrt(rt * rt + waterTarget[b] * waterTarget[b]), waterAtk, roadRel);
-        }
-        follow(S_BRAKE, c.fxBrake ? t4 : 0.0f, 0.50f, 0.20f);
-        // Priority: road beats engine. A lower layer backs off while a higher one is active.
-        const float roadRms = std::sqrt(sm[S_ROAD1] * sm[S_ROAD1] + sm[S_ROAD2] * sm[S_ROAD2] + sm[S_ROAD3] * sm[S_ROAD3]);
-        const float pR = c.roadMaxMag > 0 ? clamp01(roadRms / (float)c.roadMaxMag) : 0.0f;
-        const float dk = clampf(c.priorityDuck, 0.0f, 1.0f);
-        float duck[S_COUNT];
-        duck[S_ROAD1] = duck[S_ROAD2] = duck[S_ROAD3] = duck[S_BRAKE] = 1.0f;
-        duck[S_ENG1] = duck[S_ENG2] = 1.0f - dk * pR;
-        float sumO = 0;
-        for (int i = 0; i < S_COUNT; ++i) sumO += std::fabs(sm[i]) * duck[i];
-        const float room = (float)c.totalMaxMag;
-        const float scale = sumO > room && sumO > 0.0f ? room / sumO : 1.0f;
-        const float sum = sumO * scale;
-
-        // Slow thermal derate, based on the level actually delivered to the wheel (live gain included), so turning the
-        // live gain down relieves the derate instead of stacking with it.
-        const float ug = clampf(userGain, 0.0f, 1.0f);
-        const float lvl = std::min(sum, (float)kHardTotalMax) / 10000.0f * ug;
-        heat += (lvl * lvl - heat) * alphaFor(dt, 20.0f);
-        const float derate = heat > c.sustainedLimit ? std::sqrt(c.sustainedLimit / heat) : 1.0f;
-
-        const float g = ug * derate;
-        for (int i = 0; i < S_COUNT; ++i) {
-            float m = sm[i] * duck[i] * scale * g;
-            if (!std::isfinite(m)) { m = 0.0f; sm[i] = 0.0f; }          // never let a NaN get stuck in the filters
-            mag[i] = std::max(0, std::min((int)m, kHardTotalMax));
-        }
-    }
-};
 
 // ----------------------------------------------------------------- plugin
 // ====================================================================================================================
@@ -2079,7 +1584,6 @@ private:
             GetPrivateProfileStringA(K, k, "", b, sizeof(b), ini_.c_str()); if (b[0]) v = (float)atof(b);
         };
         F("FadeSeconds", g_fade); F("FrontWeight", g_front);
-        I("CobbleDetect", g_cobbleDetect); F("CobbleDetectLow", g_cobbleLo); F("CobbleDetectHigh", g_cobbleHi);
         I("ReadHz", readHz_); I("CommitMs", commitMs_); I("TyreVtable", vtableCfg_, true);
         {   // which wheel each tyre object is, in the order the scan finds them (measured on test drives: rear pair first, then front pair)
             std::string order = "RL,RR,FL,FR";
@@ -2102,7 +1606,6 @@ private:
         if (fresh) Wr("Map", ""); else { GetPrivateProfileStringA(K, "Map", "", b, sizeof(b), ini_.c_str()); map = b; }
         ParseMap(map);
         g_fade = clampf(g_fade, 0.05f, 3.0f); g_front = clampf(g_front, 0.0f, 1.0f);
-        g_cobbleDetect = g_cobbleDetect ? 1 : 0; g_cobbleLo = clampf(g_cobbleLo, 0.0f, 20.0f); g_cobbleHi = clampf(g_cobbleHi, g_cobbleLo + 0.05f, 40.0f);
         readHz_ = std::max(5, std::min(readHz_, 100)); commitMs_ = std::max(0, std::min(commitMs_, 2000));
     }
     // "88:snow,92:none,129:soft": correct the class of single ids
@@ -2110,7 +1613,7 @@ private:
         std::vector<std::string> bad;
         const int n = ParseIdMap(m, &bad);
         if (n > 0) Log("Map: %d surface override(s) applied", n);
-        for (const std::string& b : bad) Log("Map: ignored '%s'. Types: tarmac, gravel, snow, ice, soft, cobble, wood, none", b.c_str());
+        for (const std::string& b : bad) Log("Map: ignored '%s'. Types: tarmac, gravel, snow, ice, soft, none", b.c_str());
     }
 
     // ---------------------------------------------------------------- memory
@@ -2183,20 +1686,19 @@ private:
     }
 
     // The first time the car drives on a ground that has no class, say which id it is, so it can be assigned with Map=.
-    // (The game's own table has no cobblestone or wooden bridge entry, so this is how those ids are found.)
     bool unmappedSeen_[256] = {};
     void NoteUnmapped(int id) {
         if (id < 0 || id > 255 || unmappedSeen_[id]) return;
         const ffx::MaterialInfo* known = nullptr;
         for (const ffx::MaterialInfo& m : ffx::kMaterials) if (m.id == id) { known = &m; break; }
         unmappedSeen_[id] = true;
-        if (known && known->cls < 0) { Log("tyre contact id %d (%s) is an object or undefined, not ground; if this is a bridge or another special surface add Map=%d:wood (or cobble, gravel...) in [Surface]", id, known->name, id); return; }
-        if (known) Log("ground material id %d (%s) has no surface class; add Map=%d:gravel (or tarmac, snow, ice, soft, cobble, wood) in [Surface] to give it one", id, known->name, id);
-        else Log("ground material id %d is not in the game's table and has no surface class; if this is cobblestone or a wooden bridge add Map=%d:cobble (or wood) in [Surface]", id, id);
+        if (known && known->cls < 0) { Log("tyre contact id %d (%s) is an object or undefined, not ground", id, known->name); return; }
+        if (known) Log("ground material id %d (%s) has no surface class; add Map=%d:gravel (or tarmac, snow, ice, soft) in [Surface] to give it one", id, known->name, id);
+        else Log("ground material id %d is not in the game's table and has no surface class; add Map=%d:gravel (or tarmac, snow, ice, soft) in [Surface] to give it one", id, id);
     }
 
     // Every ground id the tyres touch is listed once with the class it got, so a surface that is being read as the wrong class
-    // (cobbles that share a tarmac id, say) shows up in the log as well as one that isn't known at all.
+    // shows up in the log as well as one that isn't known at all.
     bool idSeen_[256] = {};
     void NoteIdSeen(int id, int cls) {
         if (id < 0 || id > 255 || idSeen_[id]) return;
@@ -2371,9 +1873,23 @@ bool Ids(int out[4]) {
     return true;
 }
 bool Found() { return g_reader && g_reader->nTyres.load() >= 4; }
-// The raw ids and classes of the four tyres for the probe log (-1 = none).
-void Raw(int id[4], int cls[4]) {
-    for (int i = 0; i < 4; ++i) { id[i] = g_reader ? g_reader->ids[i].load() : -1; cls[i] = g_reader ? g_reader->clsWheel[i].load() : 0; }
+// What the reader decided about each tyre, in the form the audio takes: the same class and ground the road feel works with
+// (Map= corrections and materials.csv overrides included). False until the reader knows a class for at least one tyre.
+bool Tyres(SurfaceModel::Tyre out[4]) {
+    if (!g_reader) return false;
+    bool any = false;
+    for (int w = 0; w < 4; ++w) {
+        SurfaceModel::Tyre& t = out[w];
+        t = SurfaceModel::Tyre();
+        const int id = CurrentId(w), cls = Current(w);
+        t.id = id;
+        if (cls == C_NONE || id < 0) continue;
+        t.audioClass = SurfaceModel::AudioClassOf(cls);
+        const Road::Ground g = Road::GroundForTyre(id, cls);
+        t.loose = g.loose;
+        any = true;
+    }
+    return any;
 }
 
 }  // namespace Surf
@@ -2411,9 +1927,6 @@ private:
     std::atomic<int>   m_cfgRev{0};         // bumped by the menu whenever m_cfg changes
     std::atomic<float> m_dStat{0}, m_dLoadL{1}, m_dLoadR{1}, m_dAir{0};
     std::atomic<bool>  m_stageReset{false};
-    std::atomic<float> m_cobScore{0.0f}, m_cobLevel{0.0f};   // telemetry cobble detection, for the Diagnostics page, the log and the probe file
-    FILE*              m_probe = nullptr;   // ForceFX_probe.csv, only while SurfaceProbe=1
-    std::chrono::steady_clock::time_point m_probeT{};
     ffx::Audio         m_audio;            // sounds for the ground under each tyre; off until the menu switch is on
     ffx::Camera        m_camera;           // head movement and windscreen effects
     static ffx::Camera*& CameraSlot() { static ffx::Camera* p = nullptr; return p; }
@@ -2492,7 +2005,7 @@ private:
         m_connectedIdx = -1;
     }
 
-    void DumpPacket(const uint8_t* b, int n) {
+    void DumpPacket(const uint8_t* b, int n, const Config& c) {
         FILE* f = fopen((g_dir + "ForceFX_packet.txt").c_str(), "w");
         if (!f) return;
         fprintf(f, "packet length = %d bytes\noffset  float32          raw hex     raw uint32\n", n);
@@ -2502,6 +2015,13 @@ private:
             fprintf(f, "0x%03X   %-16.6g 0x%08X  %u\n", i, (double)v, u, u);
         }
         fclose(f);
+        // Is there a rev limit in the packet? Floats of 3000..20000 at or above the current rpm: if one of them is the limit, set OffsetRpmMax to it.
+        if (c.offRpmMax < 0) {
+            float rpmNow = 0; readF(b, n, c.offRpm, rpmNow); rpmNow *= c.rpmScale;
+            int cand[12]; const int k = RevLimit::FindCandidates(b, n, c.offRpm, c.rpmScale, rpmNow, cand, 12);
+            if (k == 0) Logf("Rev limit: no float in the first packet looks like one (OffsetRpmMax is -1), so car profiles supply it");
+            for (int i = 0; i < k; ++i) { float v; std::memcpy(&v, b + cand[i], 4); Logf("Rev limit candidate: offset %d holds %.0f (if that is the rev limit, set OffsetRpmMax=%d)", cand[i], (double)(v * c.rpmScale), cand[i]); }
+        }
     }
 
     // Made-up signals for the test mode: a 13 second loop through the engine, road and brake effects, no telemetry needed.
@@ -2627,7 +2147,6 @@ private:
 
         const auto t0 = Clock::now();
         auto lastRx = t0 - std::chrono::seconds(10);
-        bool cobOn = false; int cobLogs = 0;     // cobble detection state, for the log
         unsigned lastWaterEvents = 0; int waterLogs = 0;   // splashes already handed on to the audio and the windscreen, and how many were logged
         bool audioQuiet = false;               // the audio has been told that telemetry stopped
         auto lastPkt = t0, lastApply = t0, nextTry = t0, tapLastRx = t0 - std::chrono::seconds(10), nextRescan = t0, nextUpdCount = t0 + std::chrono::seconds(1);
@@ -2649,11 +2168,11 @@ private:
                 if (const CarProfile* m = carDb.Match(id.name, id.rsfId, score)) prof = *m;
             ApplyProfile(base, prof, eff);
             m_audio.setCar(eff.drivetrain, eff.wheelbase, eff.cgToFront, eff.trackWidth);
-            if (!sameCar) { dsp = Dsp(); synth.rpmPeak = 0; synth.grip = Tyre::GripLearner(); }           // a different car, so forget what the last one taught us
+            if (!sameCar) { dsp = Dsp(); synth.rpmPeak = 0; synth.revLearn.Reset(); synth.grip = Tyre::GripLearner(); }           // a different car, so forget what the last one taught us
             char lab[200];
             if (prof.found) snprintf(lab, sizeof(lab), "-> %s%s%s (match %.2f)", prof.name.empty() ? prof.section.c_str() : prof.name.c_str(),
                                      prof.preset.empty() ? "" : ", ", prof.preset.c_str(), score);
-            else snprintf(lab, sizeof(lab), "-> no matching profile in ForceFXCars.ini");
+            else snprintf(lab, sizeof(lab), "-> no matching profile in ForceFXCars.ini (engine effect reduced)");
             { std::lock_guard<std::mutex> lk(m_mtx);
               m_carName = id.name.empty() ? "(name unknown)" : id.name; m_carKey = kb;
               m_carPreset = lab; }
@@ -2674,7 +2193,7 @@ private:
                 m_audio.newStage();
                 for (int i = 0; i < 4; ++i) dsp.statRef[i] = Ema();
                 dsp.thumpL = dsp.thumpR = 0;
-                dsp.airT = 0; dsp.landWin = 0; dsp.totLow = 1.0f;
+                dsp.land.NewStage(); dsp.crash.reset();
             }
             ParsePacket(eff, data, n, live, dsp, pdt);
             m_audio.feed(data, n, std::chrono::duration<double>(ts.time_since_epoch()).count());
@@ -2685,7 +2204,7 @@ private:
                 m_pktLen = n;
                 std::memcpy(m_pkt, data, n);
             }
-            if (!dumped) { DumpPacket(data, n); dumped = true; }
+            if (!dumped) { DumpPacket(data, n, eff); dumped = true; }
         };
 
         m_audio.setActive(base.fxAudio != 0);
@@ -2727,17 +2246,6 @@ private:
                 m_audio.setActive(base.fxAudio != 0);
                 m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
             }
-            {   // telemetry cobble detection: copy its state for the Diagnostics page and log when it switches on and off
-                m_cobScore = synth.cob.score; m_cobLevel = synth.cob.ema;
-                if (!cobOn && synth.cob.score > 0.6f) {
-                    cobOn = true;
-                    if (++cobLogs <= 200) Logf("Cobbles detected from the telemetry (roughness per speed %.2f, %.0f km/h): tarmac tyres now get the cobble feel", (double)synth.cob.ema, (double)(live.speed * 3.6f));
-                } else if (cobOn && synth.cob.score < 0.3f) {
-                    cobOn = false;
-                    if (++cobLogs <= 200) Logf("Cobbles no longer detected (roughness per speed %.2f)", (double)synth.cob.ema);
-                }
-            }
-            if (base.probe) WriteProbe(live, now);
             if (m_audio.msSinceFrame() > 500) { if (!audioQuiet) { audioQuiet = true; m_audio.telemetryLost(); } }   // menus, pause, stage end, or packets that are not real telemetry: let the loops fade out
             else audioQuiet = false;
             if (m_carRescan.exchange(false)) carForce = true;
@@ -2763,7 +2271,7 @@ private:
 
             m_dRpm = sig.rpm; m_dSpeed = sig.speed; m_dThr = sig.throttle; m_dBrk = sig.brake;
             m_dTex = sig.texture; m_dRough = sig.rough; m_dBump = sig.bump;
-            m_dDive = sig.dive; m_dLock = std::max(sig.lock, synth.lockAmt);
+            m_dDive = std::max(sig.dive, synth.wt.dive); m_dLock = std::max(sig.lock, synth.lockAmt);
             m_dStat = sig.staticLoad; m_dLoadL = sig.loadL; m_dLoadR = sig.loadR; m_dAir = sig.airborne;
             {   // the ground class is only read while telemetry is flowing (a stage is running)
                 const bool telemLive = !m_test && std::chrono::duration<double>(now - lastRx).count() < 0.4;
@@ -2803,10 +2311,13 @@ private:
                 m_mag[i] = (float)mag[i]; m_hz[i] = hz[i];
                 per[i] = (DWORD)(1000000.0f / hz[i]);
             }
-            // Road vibration through RBR's own force: hand the three bands to the vibration thread and keep them off the wheel's own
+            // Road vibration through RBR's own force: hand the bands to the vibration thread and keep them off the wheel's own
             // effects. Only without RBR's constant-force updates (no hook yet, test mode, menus) is the road merged into one sine
             // effect of its own, so that the wheel test can still play it.
             const bool viaRbr = RoadVib::Ready();
+            // The brake judder rides along as the fourth band (one effect fewer on the wheel). Only the wheel test plays it as an effect of its own.
+            RoadVib::g_mag[3] = viaRbr ? mag[S_BRAKE] : 0; RoadVib::g_hz[3] = hz[S_BRAKE];
+            if (viaRbr) mag[S_BRAKE] = 0;
             if (viaRbr) {
                 for (int b = 0; b < Road::kBands; ++b) { RoadVib::g_mag[b] = mag[S_ROAD1 + b]; RoadVib::g_hz[b] = hz[S_ROAD1 + b]; mag[S_ROAD1 + b] = 0; }
             } else {                                          // the road as one effect of its own: all three bands merged into one sine
@@ -2908,19 +2419,24 @@ private:
             // effect switches (turn effects off to feel the others on their own)
             {"Effect: Engine",                   "EnableEngine",       &Config::fxEngine,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Road feel",                "EnableRoad",         &Config::fxRoad,       nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
-            {"Road feel delivery",               "RoadViaRbr",         &Config::roadViaRbr,   nullptr,  0.0f,   1.0f, 1.0f, 'r', false},
             {"Effect: Surface feel",             "EnableSurfaceFeel",  &Config::fxSurface,    nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Braking",                  "EnableBrake",        &Config::fxBrake,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Landing boost",            "EnableLandingBoost", &Config::fxLandBoost,  nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Water",                    "EnableWater",        &Config::fxWater,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
-            {"Effect: Light steering (accel)",   "EnableAccelLight",   &Config::fxAccelLight, nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
+            {"Effect: Weight transfer",          "EnableWeightTransfer", &Config::fxWeight,   nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
+            {"Effect: Crash jolt",               "EnableCrash",        &Config::fxCrash,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             // gains
             {"Live level (Numpad +/- in game)", "UserGain",           nullptr, &Config::userGain,      0.0f,  1.0f, 0.05f, '%', true },
             {"Total ceiling",                    "TotalMaxMagnitude",  &Config::totalMaxMag, nullptr,   500.0f, M,    100.0f, 'g', false},
             {"Engine gain",                      "EngineMaxMagnitude", &Config::engineMaxMag, nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Road gain",                        "RoadMaxMagnitude",   &Config::roadMaxMag,   nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Brake gain",                       "BrakeMaxMagnitude",  &Config::brakeMaxMag,  nullptr,  0.0f,   M,    100.0f, 'g', false},
-            {"Light steering gain",              "AccelLightness",     nullptr, &Config::accelLight,    0.0f,  2.0f, 0.1f,  'x', false},
+            {"Weight: lighter (acceleration)",   "WeightLightness",    nullptr, &Config::weightLight,   0.0f,  2.0f, 0.1f,  'x', false},
+            {"Weight: heavier (braking)",        "WeightHeaviness",    nullptr, &Config::weightHeavy,   0.0f,  2.0f, 0.1f,  'x', false},
+            {"Weight: cornering",                "WeightCornering",    nullptr, &Config::weightCorner,  0.0f,  2.0f, 0.1f,  'x', false},
+            {"Brake: lock-up lightening",        "LockLightness",      nullptr, &Config::lockLight,     0.0f,  2.0f, 0.1f,  'x', false},
+            {"Crash jolt (x RBR force)",         "CrashBoost",         nullptr, &Config::crashBoost,    0.0f,  3.0f, 0.1f,  '%', false},
+            {"Crash minimum push",               "CrashMinPush",       nullptr, &Config::crashAdd,      0.0f,  1.0f, 0.05f, '%', false},
             {"Water gain",                       "WaterGain",          nullptr, &Config::waterGain,     0.0f,  2.0f, 0.1f,  'x', false},
             {"Water: heavy steering",            "WaterHeaviness",     nullptr, &Config::waterHeavy,    0.0f,  2.0f, 0.05f, '%', false},
             {"Landing boost (x RBR force)",      "LandingBoost",       nullptr, &Config::landingBoost,  0.0f,  4.0f, 0.1f,  '%', false},
@@ -2947,7 +2463,6 @@ private:
             case '%': snprintf(out, n, "%.0f%%", v * 100.0f); break;
             case 'H': snprintf(out, n, "%.0f Hz", v); break;
             case 'o': snprintf(out, n, "%s", v >= 0.5f ? "ON" : "OFF"); break;
-            case 'r': snprintf(out, n, "%s", v >= 0.5f ? "Through RBR's force" : "Own effect"); break;
             default:  snprintf(out, n, "x%.2f", v); break;
         }
     }
@@ -3018,12 +2533,17 @@ private:
             {"EnableWindscreen",   "Rain, snow and mud on the windscreen of the cockpit view, with wipers. It is off by default and is read at startup, so after switching it on restart RBR. Settings are in the [Windscreen] section of ForceFX.ini."},
             {"EnableEngine",       "Turns the engine vibration on or off. Handy for feeling what each effect does on its own."},
             {"EnableRoad",         "Turns the road feel (texture, bumps and ground) on or off."},
-            {"RoadViaRbr",         "How the road vibration reaches the wheel. Through RBR's force: it is added to RBR's own steering force, so the wheel gets no extra road effect. Own effect: the road is one sine effect of its own, less detailed but easy on the wheel. If the road makes the wheel feel heavy or sticky to turn, use Through RBR's force; it may need a higher road gain. Without RBR's force updates it falls back to the own effect by itself."},
-            {"EnableBrake",        "Turns the braking judder and front-wheel lock-up shake on or off."},
-            {"EnableSurfaceFeel",  "Lets the ground under each tyre shape the road feel, together with how fast the car goes and how much the wheels slip: loose ground is grainy and throws stones, soft ground is dull, slippery hard ground is quiet with sharp cracks, cobbles hammer in time with your speed. Needs the road feel effect. Off, the road feels the same on every surface."},
+            {"EnableBrake",        "Turns the brake feel on or off: the braking judder, the scrub when the front wheels lock, and the steering going light when they do. It rides on RBR's own force like the road feel."},
+            {"LockLightness",      "How much RBR's steering force drops while the front tyres are locked: they have stopped gripping, so the wheel goes light. x1.00 takes half of it away when both are fully locked. 0 = off."},
+            {"EnableCrash",        "Turns the crash jolt on or off: when the car hits a tree, a rock or a wall, the wheel is yanked for a moment (RBR's own force, boosted)."},
+            {"CrashBoost",         "How hard the wheel is yanked in a full-strength crash, as a multiple of RBR's own force (80% = 1.8x). Never more than the overall limit (MaxForceMultiplier in ForceFX.ini)."},
+            {"CrashMinPush",       "The least extra push of a full-strength crash, a share of full torque, so a hit is felt even when RBR's force is nearly zero."},
+            {"EnableSurfaceFeel",  "Lets the ground under each tyre shape the road feel, together with how fast the car goes and how much the wheels slip: loose ground is grainy and throws stones, soft ground is dull, slippery hard ground is quiet with sharp cracks. Needs the road feel effect. Off, the road feels the same on every surface."},
             {"EnableLandingBoost", "Turns the landing boost on or off. With it off, landings feel exactly as RBR sends them."},
-            {"EnableAccelLight",   "Turns light steering on or off: while the car accelerates forward and the front tyres carry less weight than they do standing still, the steering loses force in proportion. With it off, the steering feels exactly as RBR sends it."},
-            {"AccelLightness",     "How much of the front load that is lost shows up as lighter steering. At x1.00 the steering loses force in proportion to the front weight lost under acceleration, measured from the strut forces against the car standing still on the start line (never more than 60% of RBR's force); x2 doubles it, 0 turns it off. ForceFX.log shows how far the front unloads."},
+            {"EnableWeightTransfer", "Turns the weight transfer feel on or off: the steering force follows how the car's weight moves. It gets lighter when the front tyres lose load under acceleration, heavier when they gain it under braking, and heavier as the weight builds up on the outside tyres in a corner or swings across the car in a direction change. It only scales RBR's own force, so it never pulls the wheel by itself. With it off, the steering feels exactly as RBR sends it. ForceFX.log shows how far the weight moves (\"Weight transfer: ...\")."},
+            {"WeightLightness",    "How much of the front load lost under hard acceleration shows up as lighter steering. At x1.00 the steering loses force in proportion to the front weight lost, as the tyres would (never more than 60% off); x2 doubles it, 0 turns it off. It only acts while the ground speed says the car is really accelerating."},
+            {"WeightHeaviness",    "How much of the front load gained under hard braking shows up as heavier steering. RBR already makes the steering heavier in braking, so this is 0 (off) unless you want more: at x1.00 the steering gains force in proportion to the front weight gained (never more than 60% more); x2 doubles it."},
+            {"WeightCornering",    "How strong the sideways weight feel is: the steering force grows by up to 25% as the weight builds up on the outside tyres in a hard corner, and by up to 35% while it swings across the car in a direction change (never more than 50% together). x2 doubles it, 0 turns it off. It needs real sideways acceleration, so a rough road on a straight adds nothing."},
             {"EnableWater",        "Turns the water feel on or off: a heavy thump and a tug on the wheel when a tyre hits standing water (harder the faster you go), a churning rumble while the tyres are in it, and a smaller kick when they come out. Only standing water counts; wet tarmac is left to the road feel."},
             {"WaterGain",          "How strong the splash, the wading rumble and the tug on entry are. At x1.00 a full-speed splash is about as hard as a heavy kerb strike; the rumble stays well below that."},
             {"WaterHeaviness",     "How much heavier the steering gets while the front tyres push through standing water: the water drags on the turned tyres and wants to keep them straight. It scales RBR's own force up (100% = double, 0 = off), so it never pushes the wheel on its own and never more than triples it."},
@@ -3031,7 +2551,7 @@ private:
             {"TotalMaxMagnitude",  "The most that engine, road and brake can add together. If the wheel feels too busy or too strong, start here."},
             {"EngineMaxMagnitude", "How strong the engine vibration is. It's the quietest layer and steps aside for road and landings."},
             {"RoadMaxMagnitude",   "How strong the road feel is. This is the one setting for it: the ground and what the car is doing decide what it feels like. Higher makes everything from gravel to kerbs feel rougher."},
-            {"BrakeMaxMagnitude",  "How strong the braking judder and front-wheel lock-up shake are."},
+            {"BrakeMaxMagnitude",  "How strong the braking judder and the front-wheel lock-up scrub are."},
             {"ImpactGain",         "How easily a landing counts as a big one. Turn it up if small jumps feel too soft."},
             {"LandingAirLevel",    "How light the car has to get before it counts as airborne. Raise it to catch smaller hops and crests."},
             {"LandingBoost",       "Extra pull added to RBR's own steering force at the peak of a full landing. At 200%, the wheel gets three times the force RBR was sending."},
@@ -3086,9 +2606,6 @@ private:
         line(Surf::Status().c_str());
         line(m_audio.status().c_str());
         line(m_camera.status().c_str());
-        { char cb[160]; snprintf(cb, sizeof(cb), "Cobble detection: %s, roughness per speed %.2f (blend starts %.1f, full at %.1f), cobble feel %d%%",
-                                 Surf::g_cobbleDetect ? "on" : "off", (double)m_cobLevel.load(), (double)Surf::g_cobbleLo, (double)Surf::g_cobbleHi, (int)(m_cobScore.load() * 100.0f + 0.5f));
-          line(cb); }
         y += 6.0f;
 
         uint8_t pkt[2048]; int len;
@@ -3122,6 +2639,7 @@ private:
 public:
     explicit ForceFXPlugin(IRBRGame* game) : game_(game) {
         g_dir = pluginDirectory();
+        MoveFileExA((g_dir + "ForceFX.log").c_str(), (g_dir + "ForceFX.old.log").c_str(), MOVEFILE_REPLACE_EXISTING);   // a fresh log each run, the last one kept
         m_iniPath = g_dir + "ForceFX.ini";
         std::memset(m_pkt, 0, sizeof(m_pkt));
         for (int i = 0; i < S_COUNT; ++i) { m_mag[i] = 0; m_hz[i] = 0; }
@@ -3130,6 +2648,13 @@ public:
         if (!exists) SyncConfig(m_cfg, m_iniPath, true);     // first run: write an ini with every key and its default
         SyncConfig(m_cfg, m_iniPath, false);
         m_userGain = m_cfg.userGain;
+        {   // the same materials.csv that corrects the audio's table corrects the road feel and the tyre reader (before the reader starts, so Map= still wins)
+            ffx::MaterialTable base, ovr;
+            if (ovr.loadOverrides(g_dir + "ForceFXAudio\\materials.csv")) {
+                const int n = Road::ApplyMaterialOverrides(base, ovr);
+                if (n) Logf("Surface: %d material id(s) corrected by ForceFXAudio\\materials.csv, for the road feel as well as the audio", n);
+            }
+        }
         Surf::Start(m_iniPath);               // reads which ground is under the tyres
         Logf("Version: %s", VersionText().c_str());
         Logf("Build: with dynamic audio module");
@@ -3138,7 +2663,10 @@ public:
             h.readIds = [](int ids[4]) { return Surf::Ids(ids); };
             h.idsAvailable = []() { return Surf::Found(); };
             h.idsStatus = []() { return Surf::Status(); };
+            h.readSurface = [](SurfaceModel::Tyre out[4]) { return Surf::Tyres(out); };   // the audio gets what the road feel gets
+            h.cameraType = []() { return ffx::cam::CameraType(); };                       // inside or outside the car: the sound follows the camera view
             h.log = [](const std::string& s) { Logf("%s", s.c_str()); };
+            m_audio.setLayout(LayoutFromConfig(m_cfg));
             m_audio.configure(g_dir, h);
             m_audio.setSpeedUnits(m_cfg.speedIsKph != 0);
         }
@@ -3148,6 +2676,7 @@ public:
             h.carKey = [this]() { std::lock_guard<std::mutex> lk(m_mtx); return m_carKey; };       // a new car starts with a clean windscreen
             h.readIds = [](int ids[4]) { return Surf::Ids(ids); };      // the windscreen colours and amounts follow the ground under the tyres
             Logf("Build: with camera module");
+            m_camera.setLayout(LayoutFromConfig(m_cfg));
             m_camera.configure(g_dir, h, m_cfg.fxCamera != 0, m_cfg.fxWindscreen != 0);
         }
 
@@ -3174,25 +2703,7 @@ public:
         }
     }
 
-    // One line ten times a second while SurfaceProbe=1: what the tyres touch and what the road signals do there.
-    // Drive tarmac, then a cobbled stretch, then a bridge, and the columns show how they differ.
-    void WriteProbe(const Signals& s, std::chrono::steady_clock::time_point now) {
-        if (now - m_probeT < std::chrono::milliseconds(100)) return;
-        m_probeT = now;
-        if (!m_probe) {
-            m_probe = fopen((g_dir + "ForceFX_probe.csv").c_str(), "w");
-            if (!m_probe) return;
-            fprintf(m_probe, "t_s,speed_ms,id_fl,id_fr,id_rl,id_rr,cls_fl,cls_fr,cls_rl,cls_rr,rough,piston,texture,texL,texR,bump,airborne,loadL,loadR,cobble_level,cobble_score\n");
-        }
-        int id[4], cls[4]; Surf::Raw(id, cls);
-        fprintf(m_probe, "%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.3f,%.3f,%.3f,%.3f\n",
-                std::chrono::duration<double>(now.time_since_epoch()).count(), (double)s.speed, id[0], id[1], id[2], id[3], cls[0], cls[1], cls[2], cls[3],
-                (double)s.rough, (double)s.piston, (double)s.texture, (double)s.texL, (double)s.texR, (double)s.bump, (double)s.airborne, (double)s.loadL, (double)s.loadR, (double)m_cobLevel.load(), (double)m_cobScore.load());
-        fflush(m_probe);
-    }
-
     ~ForceFXPlugin() {
-        if (m_probe) { fclose(m_probe); m_probe = nullptr; }
         PacketTap::SetSink(nullptr);       // no more packets for the camera
         Disconnect();                      // stops the telemetry thread, the only one that feeds the audio
         m_audio.shutdown();

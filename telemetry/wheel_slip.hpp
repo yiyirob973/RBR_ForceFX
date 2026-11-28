@@ -194,21 +194,32 @@ private:
 // that worked (0 = not known).
 class GroundSpeed {
 public:
+    // Which speed counts as the ground speed. Auto (0) takes the velocity vector, and the Speed field only if the vector is dead; 1 = always the
+    // vector; 2 = always the Speed field (as it is, unscaled).
+    void setMode(int mode) { mode_ = mode < 0 || mode > 2 ? 0 : mode; }
+    // What the Speed field reads against the true ground speed before it has been learned from a steady roll (RBR/NGP: about 1.6).
+    void setInitialFieldScale(double s) { initScale_ = s > 0.2 && s < 5.0 ? s : 1.609; }
+
+    // fieldRaw: the Speed field in m/s. velSurge/velSway: the velocity vector in m/s. Returns the ground speed in m/s, or 0 when it is not known
+    // (the vector is dead and the field has never been compared with it).
     double update(double fieldRaw, double velSurge, double velSway, double throttle, double brake, double dt) {
         const double vel = std::sqrt(velSurge * velSurge + velSway * velSway);
         if (fieldRaw > 8.0 && throttle < 0.1 && brake < 0.1) { if (vel < 0.5) dead_ += dt; else dead_ = 0; }
         else if (vel > 2.0) dead_ = 0;
-        fromVel_ = dead_ < 2.0;
+        fromVel_ = mode_ == 1 || (mode_ == 0 && dead_ < 2.0);
         if (fromVel_ && vel > 8.0 && fieldRaw > 8.0 && throttle < 0.12 && brake < 0.03) {   // a steady roll: how the field compares with the vector
-            const double r = fieldRaw / vel;
+            const double r = std::max(1.0, std::min(2.5, fieldRaw / vel));
             scale_ = haveScale_ ? scale_ + (1.0 - std::exp(-dt / 4.0)) * (r - scale_) : r; haveScale_ = true;
         }
         if (fromVel_) return vel;
+        if (mode_ == 2) return fieldRaw;
         return haveScale_ ? fieldRaw / scale_ : 0.0;
     }
     bool fromVelocity() const { return fromVel_; }
+    // The speed of the driven wheels as a road speed, from the Speed field: scaled down while the true ground speed comes from the vector.
+    double drivenMs(double fieldRaw) const { return fromVel_ ? fieldRaw / (haveScale_ ? scale_ : initScale_) : fieldRaw; }
 private:
-    double dead_ = 0, scale_ = 1; bool fromVel_ = true, haveScale_ = false;
+    double dead_ = 0, scale_ = 1, initScale_ = 1.609; int mode_ = 0; bool fromVel_ = true, haveScale_ = false;
 };
 
 }  // namespace Slip

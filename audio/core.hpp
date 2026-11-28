@@ -10,9 +10,13 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include "../materials.hpp"
-#include "../wheel_slip.hpp"   // wheel slip from the segment counter (shared with the road feel)
-#include "../tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slide (shared with the road feel)
+#include "road/materials.hpp"
+#include "cabin.hpp"
+#include "road/surface_model.hpp"    // what the plugin knows about the ground under a tyre, shared with the road feel
+#include "telemetry/telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
+#include "telemetry/wheel_slip.hpp"   // wheel slip from the segment counter (shared with the road feel)
+#include "telemetry/tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slide (shared with the road feel)
+#include <atomic>
 #include "crash.hpp"             // crashes (trees, rocks, walls) from the body acceleration
 
 namespace ffx {
@@ -50,26 +54,9 @@ private:
 };
 
 // -------------------------------------------------------------------- settings
-// Byte offsets of the NGP packet fields, as laid out in NGP 7.4.778 (rbr.telemetry.data.TelemetryData.h).
-// "Packet.<Name> = <offset>" in the [Audio] section of ForceFX.ini overrides one if a future NGP changes the layout.
-struct PacketLayout {
-    int minLength = 664;
-    int steps = 0;                                    // totalSteps_: NGP's own step counter, a clean clock for the wheel counters (-1 = not there)
-    int steering = 24, throttle = 28, brake = 32, handbrake = 36, gear = 44;
-    int speed = 60, velSurge = 88, velSway = 92, velHeave = 96, yawRate = 108;
-    int accSurge = 112, accSway = 116, accHeave = 120;
-    int suspBase[4] = {152, 280, 408, 536};   // LF, RF, LB, RB
-    int springDeflection = 0, rollbarForce = 4, springForce = 8, damperForce = 12, strutForce = 16;
-    int pistonVelocity = 28, brakeDiskTemp = 36, tirePressure = 44, tireTemp = 48, tireTreadTemp = 56, currentSegment = 60;
-    int neededLength() const {
-        int m = std::max({steps, steering, throttle, brake, handbrake, gear, speed, velSurge, velSway, velHeave, yawRate,
-                          accSurge, accSway, accHeave});
-        int inBlock = std::max({springDeflection, rollbarForce, springForce, damperForce, strutForce, pistonVelocity,
-                                brakeDiskTemp, tirePressure, tireTemp, tireTreadTemp, currentSegment});
-        for (int b : suspBase) m = std::max(m, b + inBlock);
-        return std::max(minLength, m + 4);
-    }
-};
+// Where the NGP packet fields are: the same table the force feedback and the camera use (telemetry_layout.hpp). The plugin hands it over from the
+// Offset* keys in [ForceFX] of ForceFX.ini, so a future NGP that moves a field is fixed in one place.
+using PacketLayout = Telem::Layout;
 
 struct Settings {
     std::string soundsFolder;          // blank = "<plugin folder>\ForceFXAudio\sounds"
@@ -87,8 +74,8 @@ struct Settings {
     // sideways, or locked under braking. Any tyre can slide; only the driven ones can spin.
     double squealStart = Tyre::kSpinStart, slideStart = Tyre::kSlideStart;
     int drivetrain = Tyre::kDefaultDrivetrain;   // which tyres the engine drives (FWD, RWD, AWD); the plugin sets it per car (ForceFXCars.ini), with the car geometry below
-    bool cabinEffect = true;           // sound as heard from inside the car: muffled, bassy, with cabin reflections
-    double cabinLowpassHz = 2600, cabinBassDb = 6, cabinReverb = 0.2;
+    // Inside the car (cabin.hpp): follows the camera view by itself. Only the camera types that count as inside can be set.
+    int cabinTypeLo = cabin::kTypeLo, cabinTypeHi = cabin::kTypeHi;
     bool speedIsKph = true;
     // Two different speeds exist in the telemetry. The velocity vector (VelSurge/VelSway) is the car's true speed over the
     // ground, in m/s. The Speed field is the speedometer, a driven-wheel speed: it jumps up in wheelspin, drops in lock-up,
@@ -151,10 +138,8 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "SlideLevel") s.slideLevel = d();
     else if (key == "SquealStart") s.squealStart = clampd(d(), 0.1, 3.0);
     else if (key == "SlideStart") s.slideStart = clampd(d(), 0.2, 4.0);
-    else if (key == "CabinEffect") s.cabinEffect = toBool(v);
-    else if (key == "CabinLowpassHz") s.cabinLowpassHz = d();
-    else if (key == "CabinBassDb") s.cabinBassDb = d();
-    else if (key == "CabinReverb") s.cabinReverb = d();
+    else if (key == "CabinCameraMin") s.cabinTypeLo = (int)clampd(d(), 0.0, 99.0);
+    else if (key == "CabinCameraMax") s.cabinTypeHi = (int)clampd(d(), 0.0, 99.0);
     else if (key == "SpeedIsKph") s.speedIsKph = toBool(v);
     else if (key == "GroundSpeedSource") { std::string lv = v; for (char& ch : lv) ch = (char)std::tolower((unsigned char)ch); s.groundSource = (lv == "velocity" || lv == "1") ? 1 : (lv == "speed" || lv == "speedfield" || lv == "2") ? 2 : 0; }
     else if (key == "VelocityScale") s.velocityScale = clampd(d(), 0.01, 100.0);
@@ -186,25 +171,6 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "CrashLevel") s.crashLevel = clampd(d(), 0.0, 6.0);
     else if (key == "DebugLog") s.debugLog = toBool(v);
     else if (key == "StartupBeep") s.startupBeep = toBool(v);
-    else if (key.compare(0, 7, "Packet.") == 0) {
-        PacketLayout& p = s.packet;
-        std::string k = key.substr(7);
-        int val = (int)std::strtol(v.c_str(), nullptr, 0);
-        if (k == "MinLength") p.minLength = val; else if (k == "Steering") p.steering = val;
-        else if (k == "Throttle") p.throttle = val; else if (k == "Brake") p.brake = val;
-        else if (k == "Handbrake") p.handbrake = val; else if (k == "Gear") p.gear = val;
-        else if (k == "Speed") p.speed = val; else if (k == "VelSurge") p.velSurge = val;
-        else if (k == "VelSway") p.velSway = val; else if (k == "VelHeave") p.velHeave = val;
-        else if (k == "YawRate") p.yawRate = val; else if (k == "AccSurge") p.accSurge = val;
-        else if (k == "AccSway") p.accSway = val; else if (k == "AccHeave") p.accHeave = val;
-        else if (k == "SpringDeflection") p.springDeflection = val; else if (k == "RollbarForce") p.rollbarForce = val;
-        else if (k == "SpringForce") p.springForce = val; else if (k == "DamperForce") p.damperForce = val;
-        else if (k == "StrutForce") p.strutForce = val; else if (k == "PistonVelocity") p.pistonVelocity = val;
-        else if (k == "BrakeDiskTemp") p.brakeDiskTemp = val; else if (k == "TirePressure") p.tirePressure = val;
-        else if (k == "TireTemp") p.tireTemp = val; else if (k == "TireTreadTemp") p.tireTreadTemp = val;
-        else if (k == "CurrentSegment") p.currentSegment = val;
-        else if (k == "SuspBase") { auto q = split(v, ','); for (size_t i = 0; i < q.size() && i < 4; ++i) p.suspBase[i] = (int)std::strtol(q[i].c_str(), nullptr, 0); }
-    }
 }
 
 // Reads key = value lines. With a section name, only that [section] is read (ForceFX.ini holds several); with an empty
@@ -247,6 +213,7 @@ struct TelemetryFrame {
     float speed = 0;          // raw game units (kph or mph)
     float steering = 0, throttle = 0, brake = 0, handbrake = 0;
     int gear = 0;
+    float rpm = 0;            // engine speed (the layout's RpmScale applied); 0 when the packet has none
     float velSurge = 0, velSway = 0, velHeave = 0, yawRate = 0;
     float accSurge = 0, accSway = 0, accHeave = 0;
     WheelSample wheels[4];
@@ -256,13 +223,14 @@ struct TelemetryFrame {
 // Offsets come from PacketLayout so a changed NGP layout can be handled from the ini.
 inline bool parsePacket(const uint8_t* d, size_t length, double time, TelemetryFrame& f,
                         const PacketLayout& L = PacketLayout()) {
-    if (!d || length < (size_t)L.neededLength()) return false;
+    if (!d || length < (size_t)L.NeededLength()) return false;
     auto F = [&](int o) { float v; std::memcpy(&v, d + o, 4); return std::isfinite(v) ? v : 0.0f; };
     auto U = [&](int o) { uint32_t v; std::memcpy(&v, d + o, 4); return v; };
     f.time = time;
     f.haveSteps = L.steps >= 0; f.steps = f.haveSteps ? U(L.steps) : 0u;
     f.steering = F(L.steering); f.throttle = F(L.throttle); f.brake = F(L.brake); f.handbrake = F(L.handbrake);
     f.gear = (int)U(L.gear);
+    f.rpm = L.rpm >= 0 && (size_t)(L.rpm + 4) <= length ? std::max(0.0f, F(L.rpm) * L.rpmScale) : 0.0f;
     f.speed = std::fabs(F(L.speed));
     f.velSurge = F(L.velSurge); f.velSway = F(L.velSway); f.velHeave = F(L.velHeave); f.yawRate = F(L.yawRate);
     f.accSurge = F(L.accSurge); f.accSway = F(L.accSway); f.accHeave = F(L.accHeave);
@@ -331,7 +299,6 @@ class WheelAnalyzer {
 public:
     double probs[4] = {1, 0, 0, 0};      // final class probabilities (game memory when healthy, else inference)
     double inferred[4] = {1, 0, 0, 0};   // from telemetry only
-    int wetness = 0;                     // 0 dry, 1 damp, 2 wet (only known from game memory)
     double load = 0, loadRef = 0, roughness = 0, pistonHp = 0, pistonRms = 0, pistonRefRms = 0;
     double loadSmooth = 0;               // strut load smoothed over about 0.4 s: weight transfer from body roll, braking and crests, without the bumps
     double pistonRaw = 0;                // damper piston velocity as reported (m/s): slow strokes are what make suspension squeak
@@ -397,12 +364,12 @@ public:
             rollLearned = have;
             wheelSpeedValid = have ? slip_.wheelValid : true;
             wheelSpeedMs = have ? (slip_.wheelValid ? slip_.wheelMs : tyreGroundMs) : drivenMs;
-            double ls = (wheelSpeedMs - tyreGroundMs) / std::max(tyreGroundMs, 3.0);
+            double launchRatio = (wheelSpeedMs - tyreGroundMs) / std::max(tyreGroundMs, 3.0);
             // A wheel speed from a count has an error too: only what lies beyond it is wheelspin or lock-up.
             const double band = (have ? slip_.wheelErrMs / std::max(tyreGroundMs, 3.0) : 0.08) + (have ? 0.03 : 0.0);
-            ls = ls >= 0 ? std::max(0.0, ls - band) : (have ? std::min(0.0, ls + band) : 0.0);   // before the size is learned: wheelspin only
+            launchRatio = launchRatio >= 0 ? std::max(0.0, launchRatio - band) : (have ? std::min(0.0, launchRatio + band) : 0.0);   // before the size is learned: wheelspin only
             launchValid = wheelSpeedValid && !slipValid;
-            launchSlip = launchSmooth_.update(launchValid ? ls : 0.0, dt);
+            launchSlip = launchSmooth_.update(launchValid ? launchRatio : 0.0, dt);
         }
     }
 
@@ -483,10 +450,11 @@ public:
     CarDynamics dynamics;
     Tyre::GripLearner grip;       // how hard the car can accelerate on each kind of ground
     double gripUse = -1.0;        // share of that grip in use now (-1 = not learned yet)
-    // Optional game-memory input, set by the controller before update(): per tyre class (0..3) and wetness.
+    // Optional game-memory input, set by the controller before update(): per tyre class (0..3).
     bool memValid[4] = {false, false, false, false};
-    int memClass[4] = {0, 0, 0, 0}, memWet[4] = {0, 0, 0, 0};
+    int memClass[4] = {0, 0, 0, 0};
     double memLoose[4] = {-1, -1, -1, -1};   // how much loose material the game says is under each tyre (-1 = not known)
+    bool memClassFirst[4] = {false, false, false, false};   // the reader's class (a Map= or materials.csv correction) overrides the material's own sound set
     double speedMs = 0, landingAirTime = 0;   // speedMs = true ground speed
     double fieldMs = 0, drivenMs = 0;         // the Speed field (speedometer) and the driven-wheel road speed derived from it
     bool groundFromVelocity = true;
@@ -498,23 +466,21 @@ public:
     static double slipGate(double throttle, double brake, double speedMs) {
         return (1.0 - smoothstep((brake - 0.05) / 0.2)) * (1.0 - smoothstep((throttle - 0.45) / 0.3)) * (speedMs > 5.0 ? 1.0 : 0.0);
     }
-    double velDead_ = 0; Ema fieldScale_{4.0};
+    Slip::GroundSpeed gspeed_;                // the shared ground-speed logic (wheel_slip.hpp), the same one the force feedback uses
     int falseAirborneResets = 0;   // times the 1.5 s airborne safety net fired (shown in the debug log)
 
     void update(const TelemetryFrame& f, double dt) {
         fieldMs = f.speed * (s_.speedIsKph ? (1.0 / 3.6) : 0.44704);
-        double velMag = std::sqrt((double)f.velSurge * f.velSurge + (double)f.velSway * f.velSway) * s_.velocityScale;
         // A vector that stays at zero while the car is clearly rolling (steady, no pedals) is a dead channel: fall back to the field.
-        if (fieldMs > 8.0 && f.throttle < 0.1f && f.brake < 0.1f) { if (velMag < 0.5) velDead_ += dt; else velDead_ = 0.0; }
-        else if (velMag > 2.0) velDead_ = 0.0;
-        groundFromVelocity = s_.groundSource == 1 || (s_.groundSource == 0 && velDead_ < 2.0);
-        speedMs = groundFromVelocity ? velMag : fieldMs;
+        gspeed_.setMode(s_.groundSource); gspeed_.setInitialFieldScale(s_.speedFieldScale);
+        speedMs = gspeed_.update(fieldMs, (double)f.velSurge * s_.velocityScale, (double)f.velSway * s_.velocityScale, f.throttle, f.brake, dt);
+        groundFromVelocity = gspeed_.fromVelocity();
+        if (!groundFromVelocity && speedMs <= 0.0) speedMs = fieldMs;   // nothing to compare the field with yet: the audio uses it as it is
         justLanded = false;
         bool coasting = f.throttle < 0.12f && f.brake < 0.03f && f.handbrake < 0.03f &&
                         std::fabs(f.accSway * dynamics.accelScale(s_)) < s_.coastAccelLimit &&
                         std::fabs(f.accSurge * dynamics.accelScale(s_)) < s_.coastAccelLimit && speedMs > 8.0;
-        if (groundFromVelocity && coasting && speedMs > 8.0) fieldScale_.update(clampd(fieldMs / speedMs, 1.0, 2.5), dt);
-        drivenMs = groundFromVelocity ? fieldMs / (fieldScale_.hasValue() ? fieldScale_.value() : s_.speedFieldScale) : fieldMs;
+        drivenMs = gspeed_.drivenMs(fieldMs);
         const Slip::Timebase::Stamp stamp = timebase_.stamp(f.steps, f.haveSteps, f.time);
         dynamics.update(f, dt, speedMs, s_, groundFromVelocity);   // first: each tyre's own ground speed is what its spin is compared with
         double total = 0, raw[4];
@@ -524,7 +490,6 @@ public:
             classify(wheels[i].roughness, std::fabs(wheels[i].slip) * slipGate((double)f.throttle, (double)f.brake, speedMs), wheels[i].slipValid, s_, raw);
             wheels[i].applyProbabilities(raw, dt, speedMs < 12.0);   // settle fast while pulling away from a standstill
             wheels[i].finalizeProbabilities(memValid[i], memClass[i], dt);
-            wheels[i].wetness = memValid[i] ? memWet[i] : 0;
         }
         {   // grip: how much of what this ground allows the car is using. Learned only while the wheels are down and acceleration is in m/s^2.
             double share[Tyre::GripLearner::kClasses] = {0, 0, 0, 0, 0, 0, 0, 0}, ld = 0;
@@ -570,6 +535,9 @@ class ISurfaceMemory {
 public:
     virtual ~ISurfaceMemory() {}
     virtual bool readMaterials(int ids[4]) = 0;      // false = nothing usable this frame
+    // What the plugin's tyre reader decided about each tyre (class, looseness): the same information the road feel uses. False = not
+    // available, and the controller works it out from the ids with its own table, as it did before.
+    virtual bool readSurface(SurfaceModel::Tyre out[4]) { (void)out; return false; }
     virtual bool configured() const = 0;             // false until the reader has found the tyres
     virtual std::string statusText() const = 0;
 };
@@ -651,6 +619,8 @@ public:
     virtual void setRumble(float gl, float gr) = 0;
     // Telemetry-driven tone for one tyre's sounds, -1 (deep, dull) .. +1 (bright, crisp). Optional.
     virtual void setWheelTone(int wheel, float tone) { (void)wheel; (void)tone; }
+    // The camera view: how inside the car the listener is, 0 (outside) .. 1 (the cockpit) (see cabin.hpp). Optional.
+    virtual void setInside(float a) { (void)a; }
     virtual void trigger(SoundEvent kind, int cls, float gl, float gr, float rate) = 0;
     virtual void silence() = 0;
     // The sink decides which sets exist (it owns the sound bank); the controller follows it.
@@ -695,7 +665,7 @@ public:
         if (s.enableCrashes) crashes(f, a, s, dt, sink, sv);
         if (s.enableImpacts && !a.airborne) impacts(a, s, sink, sv);
         if (s.enableLandings && a.justLanded && a.landingAirTime > 0.15) landing(a, sink, sv);
-        if (s.enableStones && !a.airborne) stones(f, a, s, dt, sink, sv);
+        if (s.enableStones && !a.airborne) stones(f, a, dt, sink, sv);
         rumble(a, s, sink);
         tyres(a, s, sink, sv);
     }
@@ -759,7 +729,7 @@ private:
     //    start throws stones too) and how hard it is pushed (slip and throttle). There is no speed cut-off: rate and strength grow
     //    with surface speed.
     // The rate is not a setting. On clean tarmac the ground half is zero, so nothing is thrown whatever the car does.
-    void stones(const TelemetryFrame& f, SurfaceAnalyzer& a, const Settings&, double dt, IAudioSink& sink, const SetView& sv) {
+    void stones(const TelemetryFrame& f, SurfaceAnalyzer& a, double dt, IAudioSink& sink, const SetView& sv) {
         constexpr double kStonesPerSecond = 10.0;      // what a gravel road gives at 90 km/h with the tyres working: fixed, not a setting
         double weight[4], total = 0, spray[4];
         for (int w = 0; w < 4; ++w) {
@@ -780,7 +750,8 @@ private:
         for (int w = 0; w < 4; ++w) { pick -= weight[w]; if (pick <= 0) { wheel = w; break; } }
         float gain = (float)(0.4 + 0.6 * rng_.next()) * (float)clampd(spray[wheel] / 100.0, 0.15, 1.0), l, rr;
         panGains(kWheelPan[wheel], gain * kWheelScale[wheel], l, rr);
-        sink.trigger(SoundEvent::StoneHit, sv.dominant(wheel), l, rr, rate(0.12));
+        const int set = sv.dominant(wheel);
+        sink.trigger(SoundEvent::StoneHit, set, l, rr, rate(0.12));
     }
 
     // Suspension sounds from the damper and strut telemetry of each tyre. Both are rare, deliberate events, not texture:
@@ -883,6 +854,13 @@ class AudioController {
     Rng rng_;
     double lastTime_ = -1;
     ISurfaceMemory* mem_ = nullptr;
+    std::atomic<int> cameraType_{-1};
+    cabin::Inside inside_;
+    // The camera view decides how inside the car the sound is.
+    void cabinStep(double dt) {
+        const int view = cabin::ViewOf(cameraType_.load(), s_.cabinTypeLo, s_.cabinTypeHi);
+        sink_.setInside(inside_.Step(view, dt));
+    }
     MaterialTable table_;
     MemoryHealth health_;
     ClassSoundSets defaultSets_;
@@ -898,6 +876,8 @@ public:
 
     // Optional: the surface reader (null or not configured = telemetry inference only).
     void setSurfaceMemory(ISurfaceMemory* m) { mem_ = m; }
+    // The game's camera type (-1 = not known). Safe from any thread.
+    void setCameraType(int t) { cameraType_ = t; }
     // Normally taken from the sink; override only in tests. Null = one set per coarse class.
     void setSoundSets(const ISoundSets* sets) {
         sets_ = sets ? sets : &defaultSets_;
@@ -909,7 +889,7 @@ public:
     bool usingMemory() const { return mem_ && mem_->configured() && health_.usable(); }
 
     std::string surfaceSourceText() const {
-        if (!telemetry_.ok()) return "Telemetry: packet layout looks wrong (values out of range), so the audio is silent. Check the Packet.* offsets in [Audio] of ForceFX.ini.";
+        if (!telemetry_.ok()) return "Telemetry: packet layout looks wrong (values out of range), so the audio is silent. Check the Offset* keys in [ForceFX] of ForceFX.ini.";
         if (!mem_ || !mem_->configured()) return "Surface source: telemetry inference (tyre reader: " + (mem_ ? mem_->statusText() : std::string("no reader")) + ")";
         if (health_.usable()) return "Surface source: tyre reader (" + mem_->statusText() + ")";
         return std::string("Surface source: telemetry inference (tyre reader ") + health_.text() + "; " + mem_->statusText() + ")";
@@ -927,13 +907,23 @@ public:
         bool readOk = false;
         bool useMem = mem_ && mem_->configured();
         if (useMem) readOk = mem_->readMaterials(ids);
+        // The plugin's tyre reader says what each tyre is on (class, looseness), the same as it tells the road feel. Without it the
+        // controller works it out from the ids with its own table.
+        SurfaceModel::Tyre sf[4]; const bool surfOk = readOk && mem_->readSurface(sf);
         for (int w = 0; w < 4; ++w) {
             int cls = readOk ? table_.cls(ids[w]) : -2;
+            double loose = readOk ? table_.looseness(ids[w]) : -1.0;
+            bool first = false;
+            if (surfOk) {
+                if (sf[w].audioClass >= 0) { first = sf[w].audioClass != cls; cls = sf[w].audioClass; }
+                if (sf[w].loose >= 0.0f) loose = sf[w].loose;
+            }
             analyzer.memValid[w] = useMem && health_.usable() && cls >= 0;   // objects / unknown ids: no info for this tyre
             analyzer.memClass[w] = cls >= 0 ? cls : 0;
-            analyzer.memWet[w] = readOk ? table_.wet(ids[w]) : 0;
-            analyzer.memLoose[w] = readOk ? table_.looseness(ids[w]) : -1.0;
+            analyzer.memLoose[w] = loose;
+            analyzer.memClassFirst[w] = first;
         }
+        cabinStep(dt);
 
         analyzer.update(f, dt);
         if (useMem) health_.update(readOk, ids, table_);
@@ -955,7 +945,7 @@ private:
             std::fill(target_.begin(), target_.end(), 0.0);
             bool mem = analyzer.memValid[w];
             if (mem) {
-                int st = sets_->forMaterial(ids[w]);
+                int st = analyzer.memClassFirst[w] ? -1 : sets_->forMaterial(ids[w]);
                 if (st < 0 || st >= n) st = sets_->forClass(analyzer.memClass[w]);
                 target_[std::min(std::max(st, 0), n - 1)] = 1.0;
             } else {
