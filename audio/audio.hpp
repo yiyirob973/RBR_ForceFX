@@ -372,7 +372,7 @@ private:
 // extra file you add makes that surface more specific. audio/surfaces.md lists the search order for every material.
 class SoundSetMap : public ISoundSets {
 public:
-    struct Info { std::string loop, slide, squeal, hit, label; float vol = 1.f; bool wetNative = false; };   // wetNative: the loop is a recording of damp or wet ground
+    struct Info { std::string loop, slide, squeal, hit, label; float vol = 1.f; };
 
     SoundSetMap(const SoundBank& bank, const MaterialTable& table, const Settings& s) : bank_(bank) {
         for (int& m : mat_) m = -1;
@@ -387,7 +387,6 @@ public:
     int forMaterial(int id) const override { return id >= 0 && id < 256 ? mat_[id] : -1; }
     int forClass(int cls) const override { return cls_[cls >= 0 && cls < 4 ? cls : 0]; }
     float volume(int set) const override { return set >= 0 && set < (int)sets_.size() ? sets_[set].vol : 1.f; }
-    bool wetNative(int set) const override { return set >= 0 && set < (int)sets_.size() && sets_[set].wetNative; }
     const Info& info(int set) const { return sets_[set]; }
 
     // Names searched for a material, most specific first (pure function; also used to generate audio/surfaces.md).
@@ -434,7 +433,6 @@ private:
         in.loop = first("loop"); in.slide = first("slide"); in.squeal = first("squeal"); in.hit = first("hit");
         for (const std::string* k : {&in.loop, &in.squeal, &in.slide, &in.hit}) if (!k->empty()) { in.label = *k; break; }
         if (in.label.empty()) in.label = chain.empty() ? "(none)" : chain.back() + " (no files)";
-        for (const std::string& tok : detail::split(in.loop, '_')) if (tok == "wet" || tok == "damp") in.wetNative = true;   // e.g. gravel_wet_loop
         return in;
     }
     int add(Info in, float vol, int fallback) {
@@ -464,8 +462,6 @@ public:
                 wheel_[w].back()->toneSet = t; slide_[w].back()->toneSet = t; squeal_[w].back()->toneSet = 0.3f * t;
             }
         rumble_ = mixer.addVoice(bank.get("debris_rumble"));
-        fan_ = mixer.addVoice(bank.get("cabin_fan_loop")); wind_ = mixer.addVoice(bank.get("cabin_wind_loop")); buzz_ = mixer.addVoice(bank.get("cabin_buzz_loop"));
-        for (int w = 0; w < 4; ++w) hiss_[w] = mixer.addVoice(bank.get("wet_hiss_loop"));      // the spray of wet ground: a recording of it if there is one, else made in code
     }
     const ISoundSets* soundSets() const override { return map_; }
 
@@ -475,26 +471,12 @@ public:
         for (LoopVoice* v : slide_[w]) v->toneDyn = tone;
         for (LoopVoice* v : squeal_[w]) v->toneDyn = 0.3f * tone;
     }
-    void setInside(float a) override { inside_ = a; mixer_.cabin.setInside(a); }
-    void setCabinLevel(float l) override { cabinLevel_ = l; }
-    // The interior noises (see cabin.hpp): the fan and the wind sit centred and a little wide, the panel buzz slightly to the right of the engine.
-    void setCabin(float fan, float wind, float buzz, float buzzRate) override {
-        auto put = [](LoopVoice* v, float l, float r, float rate) { if (v) { v->tgtL = l; v->tgtR = r; v->rate = rate; } };
-        put(fan_, fan * 0.9f, fan * 0.9f, 1.0f); put(wind_, wind * 0.95f, wind * 0.95f, 1.0f); put(buzz_, buzz * 0.85f, buzz * 1.0f, buzzRate);
-    }
-    void setWetHiss(int w, float gl, float gr, float rate) override { if (w >= 0 && w < 4 && hiss_[w]) { hiss_[w]->tgtL = gl; hiss_[w]->tgtR = gr; hiss_[w]->rate = rate; } }
+    void setInside(float a) override { mixer_.cabin.setInside(a); }
     void setSlideLoop(int w, int i, float gl, float gr, float rate) override { set(slide_[w], i, gl, gr, rate); }
     void setSquealLoop(int w, int i, float gl, float gr, float rate) override { set(squeal_[w], i, gl, gr, rate); }
     void setRumble(float gl, float gr) override { rumble_->tgtL = gl * rumbleLevel_; rumble_->tgtR = gr * rumbleLevel_; rumble_->rate = 1.f; }
     void trigger(SoundEvent kind, int i, float gl, float gr, float rate) override {
         if (i < 0 || i >= map_->count()) return;
-        // Inside the car, hits and bumps set things rattling: a small knock of a rattle sound with the event itself.
-        if (kind == SoundEvent::Impact || kind == SoundEvent::Landing || kind == SoundEvent::SuspBottom || kind >= SoundEvent::CrashLight) {
-            if (kind != SoundEvent::WetStone) {
-                const float g = cabin::RattleGain(0.5f * (gl + gr), inside_.load(), cabinLevel_.load());
-                if (g > 0.0f) mixer_.playOneShot(pickShot("cabin_rattle"), g, g, 0.9f + 0.2f * (float)(rng_() % 100) / 100.0f);
-            }
-        }
         const std::string& hit = map_->info(i).hit;
         const SoundBank::Variants* v = nullptr;
         switch (kind) {
@@ -504,7 +486,6 @@ public:
             case SoundEvent::SuspSqueak: v = bank_.get("susp_squeak"); break;
             case SoundEvent::SuspBottom: v = bank_.get("susp_bottom"); break;
             case SoundEvent::Splash: v = bank_.get("water_splash"); if (!v) v = bank_.get("debris_splash"); break;
-            case SoundEvent::WetStone: v = bank_.get("water_hit"); if (!v) v = bank_.get("water_surface_hit"); break;      // a stone landing in the water on wet ground
             // Crashes: each takes its own sound (the RBR Impact folders, see tools/Copy-RbrSounds.ps1), and the thumps fall back to the bump and landing sounds
             case SoundEvent::CrashLight: v = bank_.get("crash_light"); if (!v) v = bank_.get("debris_impact"); break;
             case SoundEvent::CrashMedium: v = bank_.get("crash_medium"); if (!v) v = bank_.get("debris_impact"); break;
@@ -517,7 +498,7 @@ public:
         if (!v || v->empty()) return;
         float g;
         switch (kind) {
-            case SoundEvent::StoneHit: case SoundEvent::WetStone: g = stoneLevel_ * liveStone_.load(); break;
+            case SoundEvent::StoneHit: g = stoneLevel_ * liveStone_.load(); break;
             case SoundEvent::SuspSqueak: g = squeakLevel_ * liveSusp_.load(); break;
             case SoundEvent::SuspBottom: g = bottomLevel_ * liveSusp_.load(); break;
             case SoundEvent::CrashLight: case SoundEvent::CrashMedium: case SoundEvent::CrashHeavy: case SoundEvent::CrashMetal:
@@ -532,7 +513,6 @@ public:
         for (int w = 0; w < 4; ++w)
             for (size_t i = 0; i < wheel_[w].size(); ++i) { set(wheel_[w], (int)i, 0, 0, 1); set(slide_[w], (int)i, 0, 0, 1); set(squeal_[w], (int)i, 0, 0, 1); }
         rumble_->tgtL = rumble_->tgtR = 0.f;
-        for (int w = 0; w < 4; ++w) if (hiss_[w]) hiss_[w]->tgtL = hiss_[w]->tgtR = 0.f;
     }
 private:
     static void set(std::vector<LoopVoice*>& v, int i, float gl, float gr, float rate) {
@@ -546,10 +526,6 @@ private:
     const SoundSetMap* map_ = nullptr;
     std::vector<LoopVoice*> wheel_[4], slide_[4], squeal_[4];
     LoopVoice* rumble_ = nullptr;
-    LoopVoice* hiss_[4] = {nullptr, nullptr, nullptr, nullptr};
-    const std::vector<float>* pickShot(const char* key) { const SoundBank::Variants* v = bank_.get(key); return v && !v->empty() ? &(*v)[rng_() % v->size()] : nullptr; }
-    LoopVoice *fan_ = nullptr, *wind_ = nullptr, *buzz_ = nullptr;
-    std::atomic<float> inside_{1.0f}, cabinLevel_{1.0f};
     std::mt19937 rng_{4242};
 };
 

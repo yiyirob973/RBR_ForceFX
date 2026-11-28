@@ -3,7 +3,7 @@
 //
 // The tyre reader (Surf::Reader in RBR_ForceFX.cpp) is the one place that decides what a tyre is on: the game's material id, the class it
 // belongs to (with [Surface] Map= corrections applied), and from those the ground (road_feel.hpp).
-// The audio used to read the same ids but work the class, wetness and looseness out again from its own table. Now the plugin hands it this.
+// The audio used to read the same ids but work the class and looseness out again from its own table. Now the plugin hands it this.
 #pragma once
 
 namespace SurfaceModel {
@@ -11,7 +11,6 @@ namespace SurfaceModel {
 struct Tyre {
     int id = -1;             // the game's material id under the tyre (-1 = not known)
     int audioClass = -1;     // 0 tarmac, 1 loose (gravel, dirt), 2 rough (grass, soft ground), 3 slippery (snow, ice); -1 = the reader has no class
-    int wet = 0;             // the game's 0 dry, 1 damp, 2 wet
     float loose = -1.0f;     // how much loose material the ground has, 0..1 (-1 = not known)
 };
 

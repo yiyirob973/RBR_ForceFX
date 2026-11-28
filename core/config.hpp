@@ -36,8 +36,6 @@ struct Config {
     int   fxAudio = 0;               // dynamic audio (settings in the [Audio] section of ForceFX.ini); off until switched on
     float audioDebris = 1.0f;        // 0..4 live multiplier on the stone / debris sounds (on top of StoneLevel in [Audio] of ForceFX.ini)
     float audioImpact = 1.0f;        // 0..4 live multiplier on impacts and landings (on top of EventLevel)
-    float audioCabin = 1.0f;         // 0..2 live multiplier on the interior noises (fan, wind, panel buzz, rattles), heard only from inside the car
-    float audioWet = 1.0f;           // 0..2 live multiplier on how much damp and wet ground changes the tyre sounds (on top of the Wet* settings in [Audio])
     float audioSusp = 1.0f;          // 0..4 live multiplier on suspension creaks and bottoming out (on top of SqueakLevel / BottomOutLevel)
     int   fxCamera = 0;              // head movement in the cockpit camera (settings in the [Camera...] sections of ForceFX.ini)
     int   fxWindscreen = 0;          // rain, snow and mud on the windscreen; off by default. Its hooks are installed at startup, so switching it on needs a restart
@@ -143,7 +141,7 @@ inline void ClampConfig(Config& c) {
     c.crashBoost = clampf(c.crashBoost, 0.0f, 3.0f); c.crashAdd = clampf(c.crashAdd, 0.0f, 1.0f);
     c.maxForceMul = ForceScale::Cap(c.maxForceMul);
     c.fxAudio = c.fxAudio ? 1 : 0;
-    c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f); c.audioWet = clampf(c.audioWet, 0.0f, 2.0f); c.audioCabin = clampf(c.audioCabin, 0.0f, 2.0f);
+    c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f);
     c.fxCamera = c.fxCamera ? 1 : 0; c.fxWindscreen = c.fxWindscreen ? 1 : 0;
     c.fxWater = c.fxWater ? 1 : 0; c.waterGain = clampf(c.waterGain, 0.0f, 2.0f); c.waterHeavy = clampf(c.waterHeavy, 0.0f, 2.0f);
     c.fxWeight = c.fxWeight ? 1 : 0;

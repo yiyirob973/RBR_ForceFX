@@ -13,7 +13,6 @@
 #include "road/materials.hpp"
 #include "cabin.hpp"
 #include "road/surface_model.hpp"    // what the plugin knows about the ground under a tyre, shared with the road feel
-#include "road/wet_surface.hpp"      // what damp and wet ground do to the tyre sounds
 #include "telemetry/telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
 #include "telemetry/wheel_slip.hpp"   // wheel slip from the segment counter (shared with the road feel)
 #include "telemetry/tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slide (shared with the road feel)
@@ -70,16 +69,13 @@ struct Settings {
     double stoneLevel = 2.0;           // stones and debris thrown at the car (separate from impacts: they are quick, light sounds that need more gain)
     double loopBoost = 2.0;            // extra rolling-noise gain at full slip / very rough ground (0 = flat level)
     double loopLevel = 0.25, squealLevel = 0.5, slideLevel = 0.5;   // mix levels per tyre (each of 4 tyres has its own)
-    // Damp and wet ground (wet_surface.hpp): the dry loops get duller and quieter and a spray hiss is added, unless a real wet recording is used.
-    bool wetTreatment = true; double wetTone = 0.6, wetCrunch = 0.3, wetHiss = 0.5, wetStones = 0.4;
     // Where the squeal and the slide begin, in units of the tyre's grip limit (1 = the limit, from PeakSlipRatio / PeakSlipAngleDeg).
     // Squeal is wheelspin: a driven tyre turning faster than the ground under power. A slide is a tyre moving the wrong way:
     // sideways, or locked under braking. Any tyre can slide; only the driven ones can spin.
     double squealStart = Tyre::kSpinStart, slideStart = Tyre::kSlideStart;
     int drivetrain = Tyre::kDefaultDrivetrain;   // which tyres the engine drives (FWD, RWD, AWD); the plugin sets it per car (ForceFXCars.ini), with the car geometry below
-    // Inside the car (cabin.hpp): follows the camera view by itself. Only the camera types that count as inside can be set, and the level of the interior noises.
+    // Inside the car (cabin.hpp): follows the camera view by itself. Only the camera types that count as inside can be set.
     int cabinTypeLo = cabin::kTypeLo, cabinTypeHi = cabin::kTypeHi;
-    double cabinAmbience = 1.0;        // level of the interior noises (fan, wind, panel buzz, rattles): 0 = none
     bool speedIsKph = true;
     // Two different speeds exist in the telemetry. The velocity vector (VelSurge/VelSway) is the car's true speed over the
     // ground, in m/s. The Speed field is the speedometer, a driven-wheel speed: it jumps up in wheelspin, drops in lock-up,
@@ -134,11 +130,6 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "TotalGain") s.totalGain = (float)clampd(d(), 0.0, 8.0);
     else if (key == "NormalizeSounds") s.normalizeSounds = toBool(v);
     else if (key == "LoopLevel") s.loopLevel = d();
-    else if (key == "WetTreatment") s.wetTreatment = toBool(v);
-    else if (key == "WetTone") s.wetTone = clampd(d(), 0.0, 1.0);
-    else if (key == "WetCrunch") s.wetCrunch = clampd(d(), 0.0, 1.0);
-    else if (key == "WetHiss") s.wetHiss = clampd(d(), 0.0, 1.0);
-    else if (key == "WetStones") s.wetStones = clampd(d(), 0.0, 1.0);
     else if (key == "EventLevel") s.eventLevel = clampd(d(), 0.0, 4.0);
     else if (key == "StoneLevel") s.stoneLevel = clampd(d(), 0.0, 6.0);
     else if (key == "RumbleLevel") s.rumbleLevel = clampd(d(), 0.0, 4.0);
@@ -149,7 +140,6 @@ inline void applySetting(Settings& s, const std::string& key, const std::string&
     else if (key == "SlideStart") s.slideStart = clampd(d(), 0.2, 4.0);
     else if (key == "CabinCameraMin") s.cabinTypeLo = (int)clampd(d(), 0.0, 99.0);
     else if (key == "CabinCameraMax") s.cabinTypeHi = (int)clampd(d(), 0.0, 99.0);
-    else if (key == "CabinAmbience") s.cabinAmbience = clampd(d(), 0.0, 2.0);
     else if (key == "SpeedIsKph") s.speedIsKph = toBool(v);
     else if (key == "GroundSpeedSource") { std::string lv = v; for (char& ch : lv) ch = (char)std::tolower((unsigned char)ch); s.groundSource = (lv == "velocity" || lv == "1") ? 1 : (lv == "speed" || lv == "speedfield" || lv == "2") ? 2 : 0; }
     else if (key == "VelocityScale") s.velocityScale = clampd(d(), 0.01, 100.0);
@@ -309,7 +299,6 @@ class WheelAnalyzer {
 public:
     double probs[4] = {1, 0, 0, 0};      // final class probabilities (game memory when healthy, else inference)
     double inferred[4] = {1, 0, 0, 0};   // from telemetry only
-    int wetness = 0;                     // 0 dry, 1 damp, 2 wet (only known from game memory)
     double load = 0, loadRef = 0, roughness = 0, pistonHp = 0, pistonRms = 0, pistonRefRms = 0;
     double loadSmooth = 0;               // strut load smoothed over about 0.4 s: weight transfer from body roll, braking and crests, without the bumps
     double pistonRaw = 0;                // damper piston velocity as reported (m/s): slow strokes are what make suspension squeak
@@ -461,12 +450,11 @@ public:
     CarDynamics dynamics;
     Tyre::GripLearner grip;       // how hard the car can accelerate on each kind of ground
     double gripUse = -1.0;        // share of that grip in use now (-1 = not learned yet)
-    // Optional game-memory input, set by the controller before update(): per tyre class (0..3) and wetness.
+    // Optional game-memory input, set by the controller before update(): per tyre class (0..3).
     bool memValid[4] = {false, false, false, false};
-    int memClass[4] = {0, 0, 0, 0}, memWet[4] = {0, 0, 0, 0};
+    int memClass[4] = {0, 0, 0, 0};
     double memLoose[4] = {-1, -1, -1, -1};   // how much loose material the game says is under each tyre (-1 = not known)
     bool memClassFirst[4] = {false, false, false, false};   // the reader's class (a Map= or materials.csv correction) overrides the material's own sound set
-    double wetLevel = 1.0;                   // the live multiplier on the wet treatment from the menu
     double speedMs = 0, landingAirTime = 0;   // speedMs = true ground speed
     double fieldMs = 0, drivenMs = 0;         // the Speed field (speedometer) and the driven-wheel road speed derived from it
     bool groundFromVelocity = true;
@@ -502,7 +490,6 @@ public:
             classify(wheels[i].roughness, std::fabs(wheels[i].slip) * slipGate((double)f.throttle, (double)f.brake, speedMs), wheels[i].slipValid, s_, raw);
             wheels[i].applyProbabilities(raw, dt, speedMs < 12.0);   // settle fast while pulling away from a standstill
             wheels[i].finalizeProbabilities(memValid[i], memClass[i], dt);
-            wheels[i].wetness = memValid[i] ? memWet[i] : 0;
         }
         {   // grip: how much of what this ground allows the car is using. Learned only while the wheels are down and acceleration is in m/s^2.
             double share[Tyre::GripLearner::kClasses] = {0, 0, 0, 0, 0, 0, 0, 0}, ld = 0;
@@ -548,7 +535,7 @@ class ISurfaceMemory {
 public:
     virtual ~ISurfaceMemory() {}
     virtual bool readMaterials(int ids[4]) = 0;      // false = nothing usable this frame
-    // What the plugin's tyre reader decided about each tyre (class, wetness, looseness): the same information the road feel uses. False = not
+    // What the plugin's tyre reader decided about each tyre (class, looseness): the same information the road feel uses. False = not
     // available, and the controller works it out from the ids with its own table, as it did before.
     virtual bool readSurface(SurfaceModel::Tyre out[4]) { (void)out; return false; }
     virtual bool configured() const = 0;             // false until the reader has found the tyres
@@ -594,7 +581,7 @@ private:
 };
 
 // ------------------------------------------------------------------ audio sink
-enum class SoundEvent { StoneHit, Impact, Landing, SuspSqueak, SuspBottom, Splash, CrashLight, CrashMedium, CrashHeavy, CrashMetal, CrashCrumple, CrashBranch, CrashGlass, WetStone };
+enum class SoundEvent { StoneHit, Impact, Landing, SuspSqueak, SuspBottom, Splash, CrashLight, CrashMedium, CrashHeavy, CrashMetal, CrashCrumple, CrashBranch, CrashGlass };
 
 constexpr int kMaxSets = 64;
 
@@ -608,7 +595,6 @@ public:
     virtual int forMaterial(int id) const = 0;     // -1 if not a ground material
     virtual int forClass(int cls) const = 0;       // coarse class 0..3 (used with telemetry inference)
     virtual float volume(int set) const = 0;
-    virtual bool wetNative(int set) const { (void)set; return false; }   // true if the set's loop is a recording of damp or wet ground
 };
 
 // Default: one set per coarse class (what a plain tarmac / gravel / grass / snow pack provides).
@@ -633,12 +619,8 @@ public:
     virtual void setRumble(float gl, float gr) = 0;
     // Telemetry-driven tone for one tyre's sounds, -1 (deep, dull) .. +1 (bright, crisp). Optional.
     virtual void setWheelTone(int wheel, float tone) { (void)wheel; (void)tone; }
-    // The camera view: how inside the car the listener is, 0 (outside) .. 1 (the cockpit), and the interior noises (see cabin.hpp). Optional.
+    // The camera view: how inside the car the listener is, 0 (outside) .. 1 (the cockpit) (see cabin.hpp). Optional.
     virtual void setInside(float a) { (void)a; }
-    virtual void setCabinLevel(float l) { (void)l; }
-    virtual void setCabin(float fan, float wind, float buzz, float buzzRate) { (void)fan; (void)wind; (void)buzz; (void)buzzRate; }
-    // The spray hiss of wet ground under one tyre (made in code, see wet_surface.hpp). Optional.
-    virtual void setWetHiss(int wheel, float gl, float gr, float rate) { (void)wheel; (void)gl; (void)gr; (void)rate; }
     virtual void trigger(SoundEvent kind, int cls, float gl, float gr, float rate) = 0;
     virtual void silence() = 0;
     // The sink decides which sets exist (it owns the sound bank); the controller follows it.
@@ -669,11 +651,6 @@ struct SetView {
     float volume(int set) const { return sets ? sets->volume(set) : 1.f; }
 };
 
-inline WetSurface::Params wetParams(const Settings& s) {
-    WetSurface::Params p; p.on = s.wetTreatment; p.tone = (float)s.wetTone; p.crunch = (float)s.wetCrunch; p.hiss = (float)s.wetHiss; p.stones = (float)s.wetStones;
-    return p;
-}
-
 // Situation streams on top of the per-tyre loops: impacts, landings, stone spray, rumble, squeal/slide.
 class DebrisTriggers {
 public:
@@ -688,7 +665,7 @@ public:
         if (s.enableCrashes) crashes(f, a, s, dt, sink, sv);
         if (s.enableImpacts && !a.airborne) impacts(a, s, sink, sv);
         if (s.enableLandings && a.justLanded && a.landingAirTime > 0.15) landing(a, sink, sv);
-        if (s.enableStones && !a.airborne) stones(f, a, s, dt, sink, sv);
+        if (s.enableStones && !a.airborne) stones(f, a, dt, sink, sv);
         rumble(a, s, sink);
         tyres(a, s, sink, sv);
     }
@@ -752,16 +729,14 @@ private:
     //    start throws stones too) and how hard it is pushed (slip and throttle). There is no speed cut-off: rate and strength grow
     //    with surface speed.
     // The rate is not a setting. On clean tarmac the ground half is zero, so nothing is thrown whatever the car does.
-    void stones(const TelemetryFrame& f, SurfaceAnalyzer& a, const Settings& s, double dt, IAudioSink& sink, const SetView& sv) {
+    void stones(const TelemetryFrame& f, SurfaceAnalyzer& a, double dt, IAudioSink& sink, const SetView& sv) {
         constexpr double kStonesPerSecond = 10.0;      // what a gravel road gives at 90 km/h with the tyres working: fixed, not a setting
-        double weight[4], total = 0, spray[4], groundOf[4];
+        double weight[4], total = 0, spray[4];
         for (int w = 0; w < 4; ++w) {
             const WheelAnalyzer& wa = a.wheels[w];
             spray[w] = std::max(a.speedMs, wa.contactSpeedMs()) * 3.6;                   // km/h
             double ground = a.memValid[w] && a.memLoose[w] >= 0.0 ? a.memLoose[w]
                                                                    : 0.8 * clampd(1.0 - wa.inferred[Tarmac], 0.0, 1.0);
-            groundOf[w] = ground;
-            ground *= WetSurface::Make(wa.wetness, (float)ground, 0.0f, 1.0f, (float)a.wetLevel, wetParams(s)).stones;   // wet ground holds on to its stones
             double slip = std::min(wa.slipNorm, 1.0);                                  // wheelspin or sliding: the tyre is throwing material
             weight[w] = ground * (0.4 + 0.6 * std::max(slip, (double)f.throttle)) * clampd(spray[w] / 90.0, 0.0, 1.5);
             total += weight[w];
@@ -777,9 +752,6 @@ private:
         panGains(kWheelPan[wheel], gain * kWheelScale[wheel], l, rr);
         const int set = sv.dominant(wheel);
         sink.trigger(SoundEvent::StoneHit, set, l, rr, rate(0.12));
-        // On wet ground some of the stones land in water: a small splash with the stone (not when the set's own recording already has it).
-        const WetSurface::Plan wp = WetSurface::Make(a.wheels[wheel].wetness, (float)groundOf[wheel], 0.0f, sv.sets && sv.sets->wetNative(set) ? 1.0f : 0.0f, (float)a.wetLevel, wetParams(s));
-        if (wp.wetStone > 0.0f && rng_.next() < wp.wetStone) sink.trigger(SoundEvent::WetStone, set, 0.7f * l, 0.7f * rr, rate(0.15));
     }
 
     // Suspension sounds from the damper and strut telemetry of each tyre. Both are rare, deliberate events, not texture:
@@ -882,26 +854,12 @@ class AudioController {
     Rng rng_;
     double lastTime_ = -1;
     ISurfaceMemory* mem_ = nullptr;
-    std::atomic<float> wetLevel_{1.0f};
     std::atomic<int> cameraType_{-1};
-    std::atomic<float> cabinLevel_{1.0f};
     cabin::Inside inside_;
-    // The camera view decides how inside the car the sound is, and the interior makes its own noise: the fan, the wind, panels buzzing with the engine.
-    void cabinStep(const TelemetryFrame& f, double dt) {
+    // The camera view decides how inside the car the sound is.
+    void cabinStep(double dt) {
         const int view = cabin::ViewOf(cameraType_.load(), s_.cabinTypeLo, s_.cabinTypeHi);
-        const float in = inside_.Step(view, dt);
-        const float lvl = (float)(cabinLevel_.load() * s_.cabinAmbience);
-        cabin::In ci;
-        ci.speedKph = (float)(analyzer.speedMs * 3.6);
-        ci.rpm = f.rpm; ci.throttle = f.throttle;
-        double rough = 0; for (int w = 0; w < 4; ++w) rough += analyzer.wheels[w].roughness / std::max(s_.roughThreshold, 1e-3);
-        ci.rough = (float)clampd(rough / 4.0 - 0.3, 0.0, 1.0);
-        ci.airborne = analyzer.airborne ? 1.0f : 0.0f;
-        ci.inside = in; ci.level = lvl;
-        const cabin::Ambience a = cabin::Make(ci);
-        sink_.setInside(in);
-        sink_.setCabinLevel(lvl);
-        sink_.setCabin(a.fan, a.wind, a.buzz, a.buzzRate);
+        sink_.setInside(inside_.Step(view, dt));
     }
     MaterialTable table_;
     MemoryHealth health_;
@@ -918,11 +876,8 @@ public:
 
     // Optional: the surface reader (null or not configured = telemetry inference only).
     void setSurfaceMemory(ISurfaceMemory* m) { mem_ = m; }
-    // The live multiplier on the wet treatment (the menu), 0 .. 2. Safe from any thread.
-    void setWetLevel(float v) { wetLevel_ = v; }
-    // The game's camera type (-1 = not known) and the live level of the interior noises, 0 .. 2. Safe from any thread.
+    // The game's camera type (-1 = not known). Safe from any thread.
     void setCameraType(int t) { cameraType_ = t; }
-    void setCabinLevel(float v) { cabinLevel_ = v; }
     // Normally taken from the sink; override only in tests. Null = one set per coarse class.
     void setSoundSets(const ISoundSets* sets) {
         sets_ = sets ? sets : &defaultSets_;
@@ -952,27 +907,23 @@ public:
         bool readOk = false;
         bool useMem = mem_ && mem_->configured();
         if (useMem) readOk = mem_->readMaterials(ids);
-        // The plugin's tyre reader says what each tyre is on (class, wetness, looseness), the same as it tells the road feel. Without it the
+        // The plugin's tyre reader says what each tyre is on (class, looseness), the same as it tells the road feel. Without it the
         // controller works it out from the ids with its own table.
         SurfaceModel::Tyre sf[4]; const bool surfOk = readOk && mem_->readSurface(sf);
         for (int w = 0; w < 4; ++w) {
             int cls = readOk ? table_.cls(ids[w]) : -2;
             double loose = readOk ? table_.looseness(ids[w]) : -1.0;
-            int wet = readOk ? table_.wet(ids[w]) : 0;
             bool first = false;
             if (surfOk) {
                 if (sf[w].audioClass >= 0) { first = sf[w].audioClass != cls; cls = sf[w].audioClass; }
                 if (sf[w].loose >= 0.0f) loose = sf[w].loose;
-                wet = sf[w].wet;
             }
             analyzer.memValid[w] = useMem && health_.usable() && cls >= 0;   // objects / unknown ids: no info for this tyre
             analyzer.memClass[w] = cls >= 0 ? cls : 0;
-            analyzer.memWet[w] = wet;
             analyzer.memLoose[w] = loose;
             analyzer.memClassFirst[w] = first;
         }
-        analyzer.wetLevel = wetLevel_.load();
-        cabinStep(f, dt);
+        cabinStep(dt);
 
         analyzer.update(f, dt);
         if (useMem) health_.update(readOk, ids, table_);
@@ -1028,29 +979,18 @@ private:
             double activity = std::max(slipAct, roughAct);
             double sq = 0; for (int i = 0; i < n; ++i) sq += weights[i] * weights[i];
             if (sq < 1e-9) sq = 1;
-            // Damp and wet ground: the dry loops are dulled, a little quieter and joined by a spray hiss, in proportion to how much of this tyre's
-            // sound is not a real recording of wet ground (see wet_surface.hpp).
-            double native = 0; for (int i = 0; i < n; ++i) if (sets_->wetNative(i)) native += weights[i] * weights[i] / sq;
-            const double looseHere = analyzer.memValid[w] && analyzer.memLoose[w] >= 0.0 ? analyzer.memLoose[w] : 0.8 * clampd(1.0 - wa.inferred[Tarmac], 0.0, 1.0);
-            const WetSurface::Plan wet = WetSurface::Make(wa.wetness, (float)looseHere, (float)kph, (float)native, (float)analyzer.wetLevel, wetParams(s_));
             for (int i = 0; i < n; ++i) {
                 double share = std::sqrt(weights[i] * weights[i] / sq);   // equal power: two uncorrelated sounds crossfade without a dip
                 double g = s_.enableWheelLoops ? share * s_.loopLevel * (1.0 + s_.loopBoost * activity) * sets_->volume(i) * shape * std::max(0.4, wa.loadFraction()) : 0.0;
-                if (!sets_->wetNative(i)) g *= wet.gain;
                 float l, r; panGains(kWheelPan[w], (float)g * kWheelScale[w], l, r);
                 sink_.setWheelLoop(w, i, l, r, rate);
-            }
-            {
-                const double hg = s_.enableWheelLoops && shape > 0.0 ? s_.loopLevel * wet.hiss * std::max(0.4, wa.loadFraction()) : 0.0;
-                float hl, hr; panGains(kWheelPan[w], (float)hg * kWheelScale[w], hl, hr);
-                sink_.setWetHiss(w, hl, hr, (float)(0.9 + 0.2 * clampd(kph / 200.0, 0.0, 1.0)));
             }
             // Tone from the telemetry, on top of each sound set's own character (dry stones/rubble bright, wet/snow deep):
             // faster = brighter, more loose/rough ground = crisper, slippery (low grip, smooth) = duller and deeper,
             // a heavily loaded tyre = a little fuller.
             double tone = 0.5 * (clampd(kph / 150.0, 0.0, 1.0) - 0.4) + 0.35 * (wa.inferred[1] + wa.inferred[2]) - 0.7 * wa.inferred[3]
                           - 0.15 * clampd(wa.loadFraction() - 1.0, 0.0, 1.0);
-            sink_.setWheelTone(w, (float)clampd(tone + wet.tone, -1.0, 1.0));
+            sink_.setWheelTone(w, (float)clampd(tone, -1.0, 1.0));
         }
     }
 };

@@ -27,7 +27,7 @@ TEST(every_audio_class_goes_back_to_a_matching_reader_class) {
     for (int a = 0; a < 4; ++a) CHECK(SurfaceModel::AudioClassOf(SurfaceModel::SurfClassOfAudio(a)) == a);
 }
 TEST(a_tyre_with_nothing_known_says_so) {
-    SurfaceModel::Tyre t; CHECK(t.id == -1 && t.audioClass == -1 && t.wet == 0 && t.loose < 0.0f);
+    SurfaceModel::Tyre t; CHECK(t.id == -1 && t.audioClass == -1 && t.loose < 0.0f);
 }
 
 int main() { return mini::RunAll(); }

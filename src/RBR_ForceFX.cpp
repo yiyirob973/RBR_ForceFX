@@ -99,7 +99,6 @@
 #include "effects/water_fx.hpp"     // splash, wading and heavy steering when the tyres are in standing water
 #include "effects/weight_transfer.hpp"  // weight transfer: one tracker of the load along and across the car, one function for RBR's steering force
 #include "road/surface_model.hpp"       // what the plugin knows about the ground under a tyre: one form for the road feel and the audio
-#include "road/wet_surface.hpp"        // what damp and wet ground do to the tyre sounds
 #include "telemetry/telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
 #include "effects/brake_fx.hpp"     // brake judder, lock-up lightening, heavy braking
 #include "effects/force_scale.hpp"  // combines the scalings of RBR's force and keeps them in bounds
@@ -210,7 +209,7 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     I("OffsetGear", c.offGear); I("OffsetCarRoll", c.offCarRoll); I("OffsetVelHeave", c.offVelHeave);
     I("EnableWater", c.fxWater); F("WaterGain", c.waterGain); F("WaterHeaviness", c.waterHeavy);
     I("EnableWeightTransfer", c.fxWeight); F("WeightLightness", c.weightLight); F("WeightHeaviness", c.weightHeavy); F("WeightCornering", c.weightCorner);
-    I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp); F("AudioWetLevel", c.audioWet); F("AudioCabinLevel", c.audioCabin);
+    I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp);
     I("EnableCamera", c.fxCamera); I("EnableWindscreen", c.fxWindscreen);
     I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingAirLevel", c.airLevel);
     F("EngineMinHz", c.engineMinHz); F("EngineMaxHz", c.engineMaxHz);
@@ -1874,7 +1873,7 @@ bool Ids(int out[4]) {
     return true;
 }
 bool Found() { return g_reader && g_reader->nTyres.load() >= 4; }
-// What the reader decided about each tyre, in the form the audio takes: the same class, wetness and ground the road feel works with
+// What the reader decided about each tyre, in the form the audio takes: the same class and ground the road feel works with
 // (Map= corrections and materials.csv overrides included). False until the reader knows a class for at least one tyre.
 bool Tyres(SurfaceModel::Tyre out[4]) {
     if (!g_reader) return false;
@@ -1886,7 +1885,6 @@ bool Tyres(SurfaceModel::Tyre out[4]) {
         t.id = id;
         if (cls == C_NONE || id < 0) continue;
         t.audioClass = SurfaceModel::AudioClassOf(cls);
-        t.wet = Road::WetOfId(id);
         const Road::Ground g = Road::GroundForTyre(id, cls);
         t.loose = g.loose;
         any = true;
@@ -2211,8 +2209,6 @@ private:
 
         m_audio.setActive(base.fxAudio != 0);
         m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
-        m_audio.setWetLevel(base.audioWet);
-        m_audio.setCabinLevel(base.audioCabin);
         while (m_run) {
             // Wait for a packet from either source (or 20 ms), then handle everything that has arrived.
             if (nWait) {
@@ -2249,8 +2245,6 @@ private:
                 m_audio.setCar(eff.drivetrain, eff.wheelbase, eff.cgToFront, eff.trackWidth);
                 m_audio.setActive(base.fxAudio != 0);
                 m_audio.setLevels(base.audioDebris, base.audioImpact, base.audioSusp);
-                m_audio.setWetLevel(base.audioWet);
-                m_audio.setCabinLevel(base.audioCabin);
             }
             if (m_audio.msSinceFrame() > 500) { if (!audioQuiet) { audioQuiet = true; m_audio.telemetryLost(); } }   // menus, pause, stage end, or packets that are not real telemetry: let the loops fade out
             else audioQuiet = false;
@@ -2420,8 +2414,6 @@ private:
             {"Audio: debris level",              "AudioDebrisLevel",   nullptr, &Config::audioDebris, 0.0f,   4.0f, 0.1f,  'x', false},
             {"Audio: impact / landing level",    "AudioImpactLevel",   nullptr, &Config::audioImpact, 0.0f,   4.0f, 0.1f,  'x', false},
             {"Audio: suspension level",          "AudioSuspensionLevel", nullptr, &Config::audioSusp, 0.0f,   4.0f, 0.1f,  'x', false},
-            {"Audio: wet ground level",          "AudioWetLevel",      nullptr, &Config::audioWet,     0.0f,   2.0f, 0.1f,  'x', false},
-            {"Audio: cabin noises level",        "AudioCabinLevel",    nullptr, &Config::audioCabin,   0.0f,   2.0f, 0.1f,  'x', false},
             {"Camera movement",                  "EnableCamera",       &Config::fxCamera,     nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Windscreen effects (restart)",     "EnableWindscreen",   &Config::fxWindscreen, nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             // effect switches (turn effects off to feel the others on their own)
@@ -2543,8 +2535,6 @@ private:
             {"EnableRoad",         "Turns the road feel (texture, bumps and ground) on or off."},
             {"EnableBrake",        "Turns the brake feel on or off: the braking judder, the scrub when the front wheels lock, and the steering going light when they do. It rides on RBR's own force like the road feel."},
             {"LockLightness",      "How much RBR's steering force drops while the front tyres are locked: they have stopped gripping, so the wheel goes light. x1.00 takes half of it away when both are fully locked. 0 = off."},
-            {"AudioCabinLevel",    "How loud the car's interior noises are: the heater fan, wind round the glass, panels buzzing with the engine and things rattling over bumps. They are made in code and heard only when the camera is inside the car; outside views are not affected. 0 = off, 1 = normal, 2 = twice as loud. (The muffled, boomy cabin sound itself is automatic: it follows the camera view.)"},
-            {"AudioWetLevel",      "How much damp and wet ground changes the tyre sounds: duller, quieter loose-ground loops and a spray hiss that grows with speed, made from the dry loops unless you have real wet recordings (gravel_wet_loop.wav, ...). 0 = off, 1 = the Wet* settings in ForceFX.ini, 2 = twice as much."},
             {"EnableCrash",        "Turns the crash jolt on or off: when the car hits a tree, a rock or a wall, the wheel is yanked for a moment (RBR's own force, boosted)."},
             {"CrashBoost",         "How hard the wheel is yanked in a full-strength crash, as a multiple of RBR's own force (80% = 1.8x). Never more than the overall limit (MaxForceMultiplier in ForceFX.ini)."},
             {"CrashMinPush",       "The least extra push of a full-strength crash, a share of full torque, so a hit is felt even when RBR's force is nearly zero."},

@@ -20,7 +20,6 @@
 #include "core.hpp"
 #include "audio.hpp"
 #include "water_sounds.hpp"
-#include "cabin_sounds.hpp"
 #include "waveout.hpp"
 
 namespace ffx {
@@ -30,7 +29,7 @@ namespace ffx {
 class ForceFXSurfaceMemory : public ISurfaceMemory {
 public:
     std::function<bool(int ids[4])> read;      // false = no usable ids right now
-    std::function<bool(SurfaceModel::Tyre out[4])> surface;   // class, wetness and looseness per tyre from the plugin; false = not available
+    std::function<bool(SurfaceModel::Tyre out[4])> surface;   // class and looseness per tyre from the plugin; false = not available
     std::function<bool()> available;           // true once the reader has found the tyres
     std::function<std::string()> status;
 
@@ -143,19 +142,6 @@ public:
         if (s_) s_->sink->setLiveLevels(debris, impacts, suspension);
     }
 
-    // Live multiplier on the wet-ground treatment from the menu: 0 = none, 1 = as set in [Audio] of ForceFX.ini, 2 = twice. Safe from any thread.
-    void setWetLevel(float v) {
-        liveWet_ = v;
-        std::lock_guard<std::mutex> lk(mu_);
-        if (s_) s_->controller->setWetLevel(v);
-    }
-    // Live level of the interior noises (fan, wind, panel buzz, rattles) from the menu: 0 = none, 1 = normal, 2 = twice. Safe from any thread.
-    void setCabinLevel(float v) {
-        liveCabin_ = v;
-        std::lock_guard<std::mutex> lk(mu_);
-        if (s_) s_->controller->setCabinLevel(v);
-    }
-
     // A tyre hit (or left) standing water: plays the splash, panned to that tyre, louder and lower the harder it hit (0..1).
     // Safe to call from any thread.
     void splash(float strength, int tyre) {
@@ -235,7 +221,7 @@ private:
         st.drivetrain = drive_.load(); st.wheelbase = wheelbase_.load(); st.cgToFront = cgToFront_.load(); st.trackWidth = trackWidth_.load();
     }
     std::atomic<bool> speedKph_{true};
-    std::atomic<float> liveDebris_{1.0f}, liveImpacts_{1.0f}, liveSusp_{1.0f}, liveWet_{1.0f}, liveCabin_{1.0f};
+    std::atomic<float> liveDebris_{1.0f}, liveImpacts_{1.0f}, liveSusp_{1.0f};
     int lastCamType_ = -2;
     std::atomic<long long> lastFrameNs_{0};
     long long nextDebugNs_ = 0;
@@ -269,8 +255,6 @@ private:
         Session& s = *s_;
         s.controller.reset(new AudioController(s.settings, *s.sink));
         s.controller->setSurfaceMemory(&mem_);
-        s.controller->setWetLevel(liveWet_.load());
-        s.controller->setCabinLevel(liveCabin_.load());
         s.controller->materials().loadOverrides(dir_ + "ForceFXAudio\\materials.csv");
         s.sink->silence();
     }
@@ -302,8 +286,6 @@ private:
             log("Dynamic audio: " + std::to_string(s->bank->fileCount) + " sound files from " + sounds);
             bool fromRbr = false;
             if (const int made = wsnd::addWaterFallbacks(*s->bank, &fromRbr)) log("Dynamic audio: made " + std::to_string(made) + " of splash / water_loop / water_hit that the sounds folder does not have" + (fromRbr ? " (the splash is built from RBR's own water sound)" : " in code") + " (add your own water_*.wav to replace them)");
-            if (wsnd::addWetFallbacks(*s->bank)) log("Dynamic audio: made wet_hiss_loop (the spray of wet ground) in code");
-            if (const int made = wsnd::addCabinFallbacks(*s->bank)) log("Dynamic audio: made " + std::to_string(made) + " interior sound(s) (fan, wind, panel buzz, rattles) in code");
             log("Audio devices: " + WaveOutPlayer::describeDevices());
             for (const std::string& e : s->bank->errors) log("  sound problem: " + e);
 
@@ -317,7 +299,7 @@ private:
             s->sink.reset(new MixerSink(*s->mixer, *s->bank, st, s->sets.get()));
             s->sink->setLiveLevels(liveDebris_.load(), liveImpacts_.load(), liveSusp_.load());
             s->controller.reset(new AudioController(st, *s->sink));
-            s->controller->setSurfaceMemory(&mem_); s->controller->setWetLevel(liveWet_.load()); s->controller->setCabinLevel(liveCabin_.load());
+            s->controller->setSurfaceMemory(&mem_);
             s->controller->materials().loadOverrides(dataDir + "materials.csv");
 
             if (!wantOn_.load()) { state_ = Off; loading_ = false; return; }   // switched off again while loading
