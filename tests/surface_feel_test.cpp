@@ -9,7 +9,6 @@
 
 using namespace Surf;
 
-static bool near(float a, float b, float e = 1e-4f) { return std::fabs(a - b) <= e; }
 static void resetMap() { for (int i = 0; i < 256; ++i) IdMap()[i] = 0; }
 
 // ---------------------------------------------------------------- classes by id

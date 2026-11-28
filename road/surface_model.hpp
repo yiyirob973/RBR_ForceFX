@@ -3,7 +3,7 @@
 //
 // The tyre reader (Surf::Reader in RBR_ForceFX.cpp) is the one place that decides what a tyre is on: the game's material id, the class it
 // belongs to (with [Surface] Map= corrections applied), and from those the ground (road_feel.hpp).
-// The audio used to read the same ids but work the class and looseness out again from its own table. Now the plugin hands it this.
+// The audio takes the class and looseness from here, rather than working them out again from its own table.
 #pragma once
 
 namespace SurfaceModel {

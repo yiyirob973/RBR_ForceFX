@@ -364,12 +364,12 @@ public:
             rollLearned = have;
             wheelSpeedValid = have ? slip_.wheelValid : true;
             wheelSpeedMs = have ? (slip_.wheelValid ? slip_.wheelMs : tyreGroundMs) : drivenMs;
-            double ls = (wheelSpeedMs - tyreGroundMs) / std::max(tyreGroundMs, 3.0);
+            double launchRatio = (wheelSpeedMs - tyreGroundMs) / std::max(tyreGroundMs, 3.0);
             // A wheel speed from a count has an error too: only what lies beyond it is wheelspin or lock-up.
             const double band = (have ? slip_.wheelErrMs / std::max(tyreGroundMs, 3.0) : 0.08) + (have ? 0.03 : 0.0);
-            ls = ls >= 0 ? std::max(0.0, ls - band) : (have ? std::min(0.0, ls + band) : 0.0);   // before the size is learned: wheelspin only
+            launchRatio = launchRatio >= 0 ? std::max(0.0, launchRatio - band) : (have ? std::min(0.0, launchRatio + band) : 0.0);   // before the size is learned: wheelspin only
             launchValid = wheelSpeedValid && !slipValid;
-            launchSlip = launchSmooth_.update(launchValid ? ls : 0.0, dt);
+            launchSlip = launchSmooth_.update(launchValid ? launchRatio : 0.0, dt);
         }
     }
 

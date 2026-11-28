@@ -100,7 +100,7 @@
 #include "effects/weight_transfer.hpp"  // weight transfer: one tracker of the load along and across the car, one function for RBR's steering force
 #include "road/surface_model.hpp"       // what the plugin knows about the ground under a tyre: one form for the road feel and the audio
 #include "telemetry/telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
-#include "effects/brake_fx.hpp"     // brake judder, lock-up lightening, heavy braking
+#include "effects/brake_fx.hpp"     // brake judder and lock-up lightening
 #include "effects/force_scale.hpp"  // combines the scalings of RBR's force and keeps them in bounds
 #include "effects/crash_fx.hpp"     // the wheel's jolt when the car hits something
 #include "effects/rev_limit.hpp"    // learned rev limit and a finder for a rev-limit field in the packet

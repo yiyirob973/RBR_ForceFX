@@ -155,7 +155,7 @@ template <class F> bool wsMakeTex(IDirect3DDevice9* d, IDirect3DTexture9** t, in
     return true;
 }
 
-// Water bead artwork lives in ws_art.hpp (it can be rendered offline, see tests/ws_art_preview.cpp). Cell 0 is a standing drop, cell 1 a running one.
+// Water bead artwork lives in ws_art.hpp (pure code, tested in tests/ws_art_test.cpp). Cell 0 is a standing drop, cell 1 a running one.
 void wsFromArt(const wsl::art::Px& q, WsPx& p) { for (int i = 0; i < 3; ++i) p.c[i] = q.c[i]; p.a = q.a; }
 void wsBeadShade(int cell, float u, float v, WsPx& p) { wsl::art::Px q; wsl::art::shade(cell, u, v, q); wsFromArt(q, p); }
 // Mud / slush atlas: 4 x 2 cells of 128 px (luminance in rgb, tinted by the vertex colour). Cells 0-3 are thrown-mud splats like the ones on a rally car's

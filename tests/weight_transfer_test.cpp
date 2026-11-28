@@ -16,7 +16,7 @@ using WeightTransfer::In; using WeightTransfer::Out; using WeightTransfer::Gains
 
 // A front share with the rest spread evenly behind it and nothing across the car.
 static void Front(In& in, float share) { in.wload[0] = in.wload[1] = share * 0.5f; in.wload[2] = in.wload[3] = (1.0f - share) * 0.5f; }
-// RBR's force times the weight transfer function with only the lightness on (the old light steering), only the heaviness on, only the cornering on.
+// RBR's force times the weight transfer function with only the lightness on, only the heaviness on, only the cornering on.
 static float LightMul(const Out& o, float g) { Gains k; k.light = g; k.heavy = 0.0f; k.corner = 0.0f; return WeightTransfer::Mul(o, k); }
 static float HeavyMul(const Out& o, float g) { Gains k; k.light = 0.0f; k.heavy = g; k.corner = 0.0f; return WeightTransfer::Mul(o, k); }
 static float CornerMul(const Out& o, float g) { Gains k; k.light = 0.0f; k.heavy = 0.0f; k.corner = g; return WeightTransfer::Mul(o, k); }

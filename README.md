@@ -10,7 +10,7 @@ Extra force feedback for Richard Burns Rally. ForceFX reads NGP telemetry and ad
 
 - **Engine:** vibration that follows rpm, throttle and the rev limit.
 - **Road:** vibration that follows the ground under each tyre, your speed, wheel slip and how rough the tyres measure.
-- **Braking:** front-end judder that grows with the pedal and the weight on the front tyres, a coarser scrub when the front wheels lock (its pitch follows the ground), and RBR's own steering force going light while they are locked. It rides on RBR's force like the road feel. Heavier steering in hard braking is available but off, since RBR already does that (`BrakeHeaviness`).
+- **Braking:** front-end judder that grows with the pedal and the weight on the front tyres, a coarser scrub when the front wheels lock (its pitch follows the ground), and RBR's own steering force going light while they are locked. It rides on RBR's force like the road feel. Heavier steering in hard braking is part of the weight transfer below and is off by default, since RBR already does that (`WeightHeaviness`).
 - **Crashes:** when the car hits a tree, a rock or a wall, the wheel is yanked for a moment (RBR's own force, boosted). No effect of its own.
 - **Landings:** after a real jump, RBR's own steering force pulls harder for a moment. Bumps never trigger it.
 - **Water:** a thump and a tug when a tyre hits standing water, a rumble while you wade, heavier steering while the front tyres push through.

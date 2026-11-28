@@ -1,5 +1,5 @@
 // Dynamic audio: WAV loading, sound bank, mixer and the sink that connects the controller to it.
-// Portable (no Windows APIs); the waveOut device lives in win_platform.hpp.
+// Portable (no Windows APIs); the waveOut device lives in waveout.hpp.
 #pragma once
 #include <atomic>
 #include <cctype>
