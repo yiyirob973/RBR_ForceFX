@@ -5,7 +5,6 @@
 #include <cmath>
 #include "core/common.hpp"
 #include "core/config.hpp"
-#include "effects/accel_light.hpp"
 #include "effects/brake_fx.hpp"
 #include "effects/crash_fx.hpp"
 #include "effects/force_scale.hpp"
@@ -100,11 +99,9 @@ struct Synth {
     Water::Out wout;                                       // its result for the current step
     unsigned waterSeenEvt = 0;                             // last landing event the water tracker has seen
     float waterJit[2][Water::kBands] = {{1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}};   // random strength per side and band for the wading: slaps, not a hum
-    AccelLight::Tracker accel; AccelLight::Out aout;       // front load under acceleration: how light the steering should go
-    WeightTransfer::Lateral lateral; WeightTransfer::Out lout;   // side load: weight built up in a corner and swinging across the car
-    double wtLogT = -10.0; int wtLogN = 0;                 // when the last weight-transfer line was logged, and how many were
-    double accLogT = -10.0; int accLogN = 0;               // when the last light-steering line was logged, and how many were
-    bool accWasRest = false; int accRestLogs = 0;          // the standing front share was known on the last step, and how many times it was logged
+    WeightTransfer::Tracker weight; WeightTransfer::Out wt;   // where the weight is: along the car (acceleration, braking) and across it (corners)
+    double wtLogT = -10.0, wtLogSideT = -10.0; int wtLogN = 0, wtLogSideN = 0;   // when the last weight-transfer line was logged (front, side), and how many were
+    bool wtWasRest = false; int wtRestLogs = 0;            // the standing front share was known on the last step, and how many times it was logged
     unsigned waterEvents = 0; float waterEntry = 0.0f; int waterEntryTyre = -1; bool waterEntryIn = false;   // goes up for every splash; strength, tyre and whether it was going in (not out) for the last one (for sound and glass)
 
     // The targets of the two engine sines (the strength each should reach), before the smoothing in Finish.
@@ -119,8 +116,7 @@ struct Synth {
         thrSm += (s.throttle - thrSm) * alphaFor(dt, 0.12f);
         const EngineOut eng = StepEngine(c, s, t, dt, hz);
         StepWater(c, s, dt);
-        StepFrontLoad(c, s, t, dt);
-        StepSideLoad(c, s, t, dt);
+        StepWeight(c, s, t, dt);
         StepTyres(c, s, dt);
         const RoadOut road = StepRoad(c, s, t, dt, hz);
         const float brake = StepBrake(c, s, road, hz);
@@ -183,41 +179,36 @@ struct Synth {
         }
     }
 
-    void StepFrontLoad(const Config& c, const Signals& s, double t, float dt) {
-        // ---------------- LIGHT STEERING FROM THE FRONT LOAD: the share of the weight on the front tyres (from the four strut forces) against what it is standing still on the
-        // start line. Hard acceleration moves weight to the rear, and the steering loses force in proportion. Scales RBR's own force down (see boost below).
-        {
-            AccelLight::In ai;
-            ai.frontShare = s.wload[0] + s.wload[1]; ai.throttle = s.throttle; ai.brake = s.brake; ai.speed = s.ground > 0.0f ? s.ground : s.speed;
-            ai.airborne = s.airborne; ai.accMag = s.accMag; ai.accOk = s.accOk;
-            if (!c.fxAccelLight && !c.fxBrake) { accel.Reset(); aout = AccelLight::Out(); }   // it also measures the dive for the brake feel
-            else aout = accel.Update(ai, dt);
-            if (c.fxAccelLight && aout.fromRest && !accWasRest && accRestLogs < 10) {   // the car stood still long enough: say what it read, so a start on a slope shows in the log
-                ++accRestLogs;
-                Logf("Light steering: standing front share %.3f (acceleration reads %.2f m/s^2 standing%s)", (double)aout.base, (double)ai.accMag, ai.accOk ? "" : ", units not known yet");
-            }
-            accWasRest = aout.fromRest;
-            if (c.fxAccelLight && aout.rawDrop > 0.04f && aout.drop > 0.02f && t - accLogT > 1.5 && accLogN < 60) {   // how much the front really unloads, to tune AccelLightness by
-                accLogT = t; ++accLogN;
-                Logf("Light steering: front load %.0f%% below standing (standing %.2f, now %.2f), accelerating %.2f g, %.0f km/h -> steering force x%.2f", (double)(100.0f * aout.rawDrop), (double)aout.base, (double)ai.frontShare, (double)aout.accelG, (double)(ai.speed * 3.6f), (double)AccelLight::Mul(aout, c.accelLight));
-            }
+    void StepWeight(const Config& c, const Signals& s, double t, float dt) {
+        // ---------------- WEIGHT TRANSFER: where the weight is, from the four strut-force shares (effects/weight_transfer.hpp). Along the car the front share against what
+        // it is standing still on the start line (lighter steering under acceleration, heavier under braking), across the car the side load (swell in a corner, surge in
+        // a direction change). It only scales RBR's own force (see the force step below), and it also measures the dive for the brake judder.
+        WeightTransfer::In wi;
+        for (int w = 0; w < 4; ++w) wi.wload[w] = s.wload[w];
+        wi.throttle = s.throttle; wi.brake = s.brake; wi.speed = s.ground > 0.0f ? s.ground : s.speed;
+        wi.airborne = s.airborne; wi.accMag = s.accMag; wi.accOk = s.accOk; wi.latG = s.latG; wi.latOk = s.accOk;
+        if (!c.fxWeight && !c.fxBrake) { weight.Reset(); wt = WeightTransfer::Out(); }
+        else wt = weight.Update(wi, dt);
+        if (!c.fxWeight) return;
+        if (wt.fromRest && !wtWasRest && wtRestLogs < 10) {   // the car stood still long enough: say what it read, so a start on a slope shows in the log
+            ++wtRestLogs;
+            Logf("Weight transfer: standing front share %.3f (acceleration reads %.2f m/s^2 standing%s)", (double)wt.base, (double)wi.accMag, wi.accOk ? "" : ", units not known yet");
+        }
+        wtWasRest = wt.fromRest;
+        WeightTransfer::Gains gf = WeightGains(c, 1.0f), gs = gf;   // what each log line reports: the front part alone, the side part alone
+        gf.corner = 0.0f; gs.light = 0.0f; gs.heavy = 0.0f;
+        if ((wt.light > 0.02f || wt.heavy > 0.02f) && t - wtLogT > 1.5 && wtLogN < 60) {   // how much the front really loads or unloads, to tune the lightness and heaviness by
+            wtLogT = t; ++wtLogN;
+            Logf("Weight transfer: front load %+.0f%% against standing (standing %.2f, now %.2f), %.2f g forward, %.0f km/h -> steering force x%.2f", (double)(100.0f * wt.rawChange), (double)wt.base, (double)wt.share, (double)wt.accelG, (double)(wi.speed * 3.6f), (double)WeightTransfer::Mul(wt, gf));
+        }
+        if ((wt.swell > 0.5f || wt.surge > 0.4f) && t - wtLogSideT > 1.5 && wtLogSideN < 60) {   // how far the weight really moves sideways, to tune the cornering weight by
+            wtLogSideT = t; ++wtLogSideN;
+            Logf("Weight transfer: side load %+.0f%% of the weight, %.2f g sideways, swell %.2f, surge %.2f -> steering force x%.2f", (double)(100.0f * wt.side), (double)s.latG, (double)wt.swell, (double)wt.surge, (double)WeightTransfer::Mul(wt, gs));
         }
     }
 
-    void StepSideLoad(const Config& c, const Signals& s, double t, float dt) {
-        // ---------------- SIDE LOAD: the weight across the car, from the same strut-force shares. Scales RBR's force (swell in a corner, surge in a direction change).
-        {
-            WeightTransfer::In wi;
-            wi.lateral = (s.wload[1] + s.wload[3]) - (s.wload[0] + s.wload[2]); wi.speed = s.ground > 0.0f ? s.ground : s.speed;
-            wi.airborne = s.airborne; wi.latG = s.latG; wi.latOk = s.accOk;
-            if (!c.fxWeight) { lateral.Reset(); lout = WeightTransfer::Out(); }
-            else lout = lateral.Update(wi, dt);
-            if (c.fxWeight && (lout.swell > 0.5f || lout.surge > 0.4f) && t - wtLogT > 1.5 && wtLogN < 60) {   // how far the weight really moves, to tune WeightTransferGain by
-                wtLogT = t; ++wtLogN;
-                Logf("Weight transfer: side load %+.0f%% of the weight, %.2f g sideways, swell %.2f, surge %.2f -> steering force x%.2f", (double)(100.0f * lout.load), (double)s.latG, (double)lout.swell, (double)lout.surge, (double)WeightTransfer::LateralMul(lout, c.weightGain));
-            }
-        }
-    }
+    // The three weight transfer settings as the function wants them, times the live level.
+    static WeightTransfer::Gains WeightGains(const Config& c, float ugc) { WeightTransfer::Gains g; g.light = c.weightLight * ugc; g.heavy = c.weightHeavy * ugc; g.corner = c.weightCorner * ugc; return g; }
 
     void StepTyres(const Config& c, const Signals& s, float dt) {
         // ---------------- TYRE MOTION: wheelspin and slides, each tyre judged against the grip limit of the ground under it.
@@ -331,7 +322,7 @@ struct Synth {
         const float gB = smooth01(2.0f, 8.0f, s.speed);
         // Lock-up shakes the wheel according to the ground: soft ground swallows it, hard ground passes it on.
         const float lockU = std::max(s.lock, lockAmt) * (c.fxSurface ? clampf(0.5f * (road.fes[0].amp + road.fes[1].amp), 0.4f, 1.3f) : 1.0f);
-        const float Ab = BrakeFx::JudderAmp(s.brake, std::max(s.dive, aout.dive), lockU);
+        const float Ab = BrakeFx::JudderAmp(s.brake, std::max(s.dive, wt.dive), lockU);
         const float gHard = c.fxSurface ? 0.5f * (gnd[0].hard + gnd[1].hard) : 0.4f, gLoose = c.fxSurface ? 0.5f * (gnd[0].loose + gnd[1].loose) : 0.6f;   // the ground under the front tyres sets the pitch of a lock-up scrub
         hz[S_BRAKE] = BrakeFx::JudderHz(lockU, s.frontRev, gHard, gLoose, lockU > 0.1f ? rnd() : 0.0f, c.brakeHzScale);
         float t4 = c.brakeMaxMag * Ab * gB * clampf(0.65f + 0.35f * s.loadF, 0.5f, 1.3f);   // more load on the fronts means more judder
@@ -366,10 +357,9 @@ struct Synth {
             fp.waterKick = Water::KickMul(wout, c.waterGain * ugc);
             fp.waterHeavy = Water::HeavyMul(wout, c.waterHeavy * ugc);
         }
-        // The front load: lighter while hard acceleration unloads the front, heavier in hard braking (off unless wanted: RBR already does this).
-        fp.frontLoad = WeightTransfer::FrontMul(aout, c.fxAccelLight ? c.accelLight * ugc : 0.0f, c.fxBrake ? c.brakeHeavy * ugc : 0.0f);
+        // The weight transfer: lighter while acceleration unloads the front, heavier in hard braking (if wanted) and as the weight builds up on the outside in a corner.
+        if (c.fxWeight) fp.weight = WeightTransfer::Mul(wt, WeightGains(c, ugc));
         if (c.fxBrake) fp.brakeLock = BrakeFx::LockMul(lockFront, c.lockLight * ugc);   // lighter while the front tyres are locked
-        if (c.fxWeight) fp.lateral = WeightTransfer::LateralMul(lout, c.weightGain * ugc);               // heavier as the weight builds up on the outside and swings across the car
         if (c.fxCrash) {                                                              // a jolt when the car hits something
             const float lev = crashEnv.Step(s.crashSeq, s.crashSev, dt, ugc);
             fp.crash = CrashFx::Mul(lev, c.crashBoost);

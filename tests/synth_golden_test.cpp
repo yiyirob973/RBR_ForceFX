@@ -19,7 +19,7 @@ void Logf(const char* fmt, ...) { char b[512]; va_list ap; va_start(ap, fmt); vs
 
 using namespace ForceFX;
 
-static const unsigned long long kGolden = 0x44282ff27075a96aULL;
+static const unsigned long long kGolden = 0x396cfe2e7946c0dfULL;
 
 static unsigned g_seed = 12345;
 static float rf() { g_seed = g_seed * 1664525u + 1013904223u; return (float)((g_seed >> 8) & 0xFFFF) / 65535.0f; }
@@ -32,25 +32,27 @@ struct Seen { bool finite = true; int steps = 0; int magMax = 0; float hzMax = 0
 static void Drive(const Config& c, int variant, std::string& text, Seen& seen, bool breakTelemetry = false) {
     srand(7); g_seed = 12345u + (unsigned)variant;
     Synth sy; Signals s;
-    unsigned evt = 0, crash = 0; double t = 0;
+    unsigned evt = 0, crash = 0; double t = 0; float vPrev = 0.0f;
     char b[256];
     for (int i = 0; i < 6000; ++i, t += 0.01) {
         const float ph = (float)i * 0.01f;
         s.rpm = i < 100 ? 900.0f : 2500.0f + 4500.0f * (0.5f + 0.5f * std::sin(ph * 0.7f));
         if (i % 2400 > 2300) s.rpm = 7600.0f;
-        s.speed = i < 200 ? 0.0f : std::min(45.0f, (ph - 2.0f) * 4.0f);
-        s.ground = s.speed * (i % 900 < 450 ? 1.0f : 0.0f);
+        const float ramp = std::min(1.0f, std::max(0.0f, (ph - 2.0f) / 6.0f));          // away from the line, then speeding up and slowing down by about 0.8 g, over and over
+        s.speed = ramp * (25.0f + 18.0f * std::sin((ph - 2.0f) * 0.45f));
+        const float lonG = i == 0 ? 0.0f : (s.speed - vPrev) / 0.01f / 9.81f; vPrev = s.speed;
+        s.ground = s.speed * (i % 900 < 600 ? 1.0f : 0.0f);
         s.throttle = clampf(0.5f + 0.5f * std::sin(ph * 0.9f), 0.0f, 1.0f);
-        s.brake = (i / 300) % 3 == 2 ? 0.8f : 0.0f;
+        s.brake = lonG < -0.2f ? 0.8f : 0.0f;
         s.handbrake = (i / 700) % 5 == 4 ? 1.0f : 0.0f;
         s.texture = 0.5f + 0.4f * std::sin(ph * 1.3f); s.texL = clamp01(s.texture + 0.1f * std::sin(ph * 3)); s.texR = clamp01(s.texture - 0.1f * std::sin(ph * 3));
         s.bump = rf() < 0.02f ? rf() : s.bump * 0.9f;
         s.loadL = 1.0f + 0.5f * std::sin(ph * 1.1f); s.loadR = 1.0f - 0.5f * std::sin(ph * 1.1f); s.loadF = 1.0f + 0.3f * std::sin(ph * 0.6f);
         s.airborne = (i % 1500 > 1420) ? 1.0f : 0.0f;
-        const float lat = 0.4f * std::sin(ph * 1.7f), lon = 0.15f * std::sin(ph * 0.8f);
+        const float lat = 0.4f * std::sin(ph * 1.7f), lon = -0.15f * std::max(-1.0f, std::min(1.0f, lonG / 0.8f));   // acceleration unloads the front, braking loads it
         s.wload[0] = 0.27f + 0.5f * lat * 0.5f + lon * 0.2f; s.wload[1] = 0.27f - 0.5f * lat * 0.5f + lon * 0.2f;
         s.wload[2] = 0.23f + 0.5f * lat * 0.5f - lon * 0.2f; s.wload[3] = 0.23f - 0.5f * lat * 0.5f - lon * 0.2f;
-        s.accOk = i > 300; s.accMag = std::fabs(lon) * 9.81f * 3.0f; s.latG = s.accOk ? std::fabs(lat) * 1.8f : 0.0f;
+        s.accOk = i > 300; s.accMag = std::fabs(lonG) * 9.81f; s.latG = s.accOk ? std::fabs(lat) * 1.8f : 0.0f;
         s.dive = (s.brake > 0.1f) ? 0.4f : 0.0f; s.lock = (i % 1000 > 960) ? 0.8f : 0.0f;
         s.frontRev = 8.0f + s.speed * 0.5f;
         for (int w = 0; w < 4; ++w) {
@@ -87,12 +89,12 @@ static void Drive(const Config& c, int variant, std::string& text, Seen& seen, b
 
 static Config Variant(int v) {
     Config c;
-    if (v == 1) { c.fxWeight = 0; c.fxAccelLight = 0; }
+    if (v == 1) c.fxWeight = 0;
     if (v == 2) { c.fxBrake = 0; c.fxWater = 0; c.fxSurface = 0; }
-    if (v == 3) { c.brakeHeavy = 1.0f; c.accelLight = 1.5f; c.weightGain = 2.0f; }
+    if (v == 3) { c.weightHeavy = 1.0f; c.weightLight = 1.5f; c.weightCorner = 2.0f; }
     if (v == 4) { c.fxCrash = 0; c.fxLandBoost = 0; c.fxRoad = 0; c.fxEngine = 0; }
-    if (v == 5) { c.fxAccelLight = 0; c.fxBrake = 1; c.brakeHeavy = 2.0f; }
-    if (v == 6) { c.maxForceMul = 1.2f; c.weightGain = 2.0f; }
+    if (v == 5) { c.weightLight = 0.0f; c.fxBrake = 1; c.weightHeavy = 2.0f; }
+    if (v == 6) { c.maxForceMul = 1.2f; c.weightCorner = 2.0f; }
     return c;
 }
 

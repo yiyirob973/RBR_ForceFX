@@ -97,12 +97,11 @@
 #include "telemetry/wheel_slip.hpp"   // wheel slip from the segment counter, shared with the audio module
 #include "telemetry/tyre_motion.hpp"  // drivetrain, per-tyre ground speed, grip, wheelspin vs slides (shared with the audio module)
 #include "effects/water_fx.hpp"     // splash, wading and heavy steering when the tyres are in standing water
-#include "effects/accel_light.hpp"  // the shared front-load tracker: lighter steering under acceleration, dive and heavy braking
+#include "effects/weight_transfer.hpp"  // weight transfer: one tracker of the load along and across the car, one function for RBR's steering force
 #include "road/surface_model.hpp"       // what the plugin knows about the ground under a tyre: one form for the road feel and the audio
 #include "road/wet_surface.hpp"        // what damp and wet ground do to the tyre sounds
 #include "telemetry/telemetry_layout.hpp"   // where the fields are in an NGP packet: one table for the force feedback, the audio and the camera
 #include "effects/brake_fx.hpp"     // brake judder, lock-up lightening, heavy braking
-#include "effects/weight_transfer.hpp"   // front load and side load as a change in how heavy RBR's force is
 #include "effects/force_scale.hpp"  // combines the scalings of RBR's force and keeps them in bounds
 #include "effects/crash_fx.hpp"     // the wheel's jolt when the car hits something
 #include "effects/rev_limit.hpp"    // learned rev limit and a finder for a rev-limit field in the packet
@@ -206,11 +205,11 @@ void SyncConfig(Config& c, const std::string& path, bool write) {
     F("BrakeHzScale", c.brakeHzScale); F("PriorityDuck", c.priorityDuck);
     I("EnableEngine", c.fxEngine); I("EnableRoad", c.fxRoad); I("EnableBrake", c.fxBrake);
     I("EnableCrash", c.fxCrash); F("CrashBoost", c.crashBoost); F("CrashMinPush", c.crashAdd);
-    F("LockLightness", c.lockLight); F("BrakeHeaviness", c.brakeHeavy);
+    F("LockLightness", c.lockLight);
     F("MaxForceMultiplier", c.maxForceMul);
     I("OffsetGear", c.offGear); I("OffsetCarRoll", c.offCarRoll); I("OffsetVelHeave", c.offVelHeave);
     I("EnableWater", c.fxWater); F("WaterGain", c.waterGain); F("WaterHeaviness", c.waterHeavy);
-    I("EnableAccelLight", c.fxAccelLight); F("AccelLightness", c.accelLight); I("EnableWeightTransfer", c.fxWeight); F("WeightTransferGain", c.weightGain);
+    I("EnableWeightTransfer", c.fxWeight); F("WeightLightness", c.weightLight); F("WeightHeaviness", c.weightHeavy); F("WeightCornering", c.weightCorner);
     I("EnableDynamicAudio", c.fxAudio); F("AudioDebrisLevel", c.audioDebris); F("AudioImpactLevel", c.audioImpact); F("AudioSuspensionLevel", c.audioSusp); F("AudioWetLevel", c.audioWet); F("AudioCabinLevel", c.audioCabin);
     I("EnableCamera", c.fxCamera); I("EnableWindscreen", c.fxWindscreen);
     I("EnableSurfaceFeel", c.fxSurface); I("EnableLandingBoost", c.fxLandBoost); F("LandingBoost", c.landingBoost); F("LandingMinPush", c.landingAdd); F("LandingAirLevel", c.airLevel);
@@ -1432,7 +1431,7 @@ void ParsePacket(const Config& c, const uint8_t* b, int n, Signals& s, Dsp& d, f
         s.evtSev = clamp01(lo.evtSev * c.impactGain);      // an impactGain above 1 lets mid-size hits reach full strength
     }
 
-    // (Braking: the weight moving onto the front tyres is measured by the shared front-load tracker, accel_light.hpp, in the synth.)
+    // (Braking: the weight moving onto the front tyres is measured by the weight transfer tracker, effects/weight_transfer.hpp, in the synth.)
 
     // ---- wheel spin and slip. NGP has no slip value, only a segment counter per wheel, so the spin is counted over a window with
     //      enough steps and compared with the car's real speed over the ground (wheel_slip.hpp). Slip only counts past the
@@ -2278,7 +2277,7 @@ private:
 
             m_dRpm = sig.rpm; m_dSpeed = sig.speed; m_dThr = sig.throttle; m_dBrk = sig.brake;
             m_dTex = sig.texture; m_dRough = sig.rough; m_dBump = sig.bump;
-            m_dDive = std::max(sig.dive, synth.aout.dive); m_dLock = std::max(sig.lock, synth.lockAmt);
+            m_dDive = std::max(sig.dive, synth.wt.dive); m_dLock = std::max(sig.lock, synth.lockAmt);
             m_dStat = sig.staticLoad; m_dLoadL = sig.loadL; m_dLoadR = sig.loadR; m_dAir = sig.airborne;
             {   // the ground class is only read while telemetry is flowing (a stage is running)
                 const bool telemLive = !m_test && std::chrono::duration<double>(now - lastRx).count() < 0.4;
@@ -2432,8 +2431,7 @@ private:
             {"Effect: Braking",                  "EnableBrake",        &Config::fxBrake,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Landing boost",            "EnableLandingBoost", &Config::fxLandBoost,  nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Water",                    "EnableWater",        &Config::fxWater,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
-            {"Effect: Light steering (accel)",   "EnableAccelLight",   &Config::fxAccelLight, nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
-            {"Effect: Weight transfer (sides)",  "EnableWeightTransfer", &Config::fxWeight,   nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
+            {"Effect: Weight transfer",          "EnableWeightTransfer", &Config::fxWeight,   nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             {"Effect: Crash jolt",               "EnableCrash",        &Config::fxCrash,      nullptr,  0.0f,   1.0f, 1.0f, 'o', false},
             // gains
             {"Live level (Numpad +/- in game)", "UserGain",           nullptr, &Config::userGain,      0.0f,  1.0f, 0.05f, '%', true },
@@ -2441,10 +2439,10 @@ private:
             {"Engine gain",                      "EngineMaxMagnitude", &Config::engineMaxMag, nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Road gain",                        "RoadMaxMagnitude",   &Config::roadMaxMag,   nullptr,  0.0f,   M,    100.0f, 'g', false},
             {"Brake gain",                       "BrakeMaxMagnitude",  &Config::brakeMaxMag,  nullptr,  0.0f,   M,    100.0f, 'g', false},
-            {"Light steering gain",              "AccelLightness",     nullptr, &Config::accelLight,    0.0f,  2.0f, 0.1f,  'x', false},
-            {"Weight transfer gain",             "WeightTransferGain", nullptr, &Config::weightGain,    0.0f,  2.0f, 0.1f,  'x', false},
+            {"Weight: lighter (acceleration)",   "WeightLightness",    nullptr, &Config::weightLight,   0.0f,  2.0f, 0.1f,  'x', false},
+            {"Weight: heavier (braking)",        "WeightHeaviness",    nullptr, &Config::weightHeavy,   0.0f,  2.0f, 0.1f,  'x', false},
+            {"Weight: cornering",                "WeightCornering",    nullptr, &Config::weightCorner,  0.0f,  2.0f, 0.1f,  'x', false},
             {"Brake: lock-up lightening",        "LockLightness",      nullptr, &Config::lockLight,     0.0f,  2.0f, 0.1f,  'x', false},
-            {"Brake: heavy braking",             "BrakeHeaviness",     nullptr, &Config::brakeHeavy,    0.0f,  2.0f, 0.1f,  'x', false},
             {"Crash jolt (x RBR force)",         "CrashBoost",         nullptr, &Config::crashBoost,    0.0f,  3.0f, 0.1f,  '%', false},
             {"Crash minimum push",               "CrashMinPush",       nullptr, &Config::crashAdd,      0.0f,  1.0f, 0.05f, '%', false},
             {"Water gain",                       "WaterGain",          nullptr, &Config::waterGain,     0.0f,  2.0f, 0.1f,  'x', false},
@@ -2545,7 +2543,6 @@ private:
             {"EnableRoad",         "Turns the road feel (texture, bumps and ground) on or off."},
             {"EnableBrake",        "Turns the brake feel on or off: the braking judder, the scrub when the front wheels lock, and the steering going light when they do. It rides on RBR's own force like the road feel."},
             {"LockLightness",      "How much RBR's steering force drops while the front tyres are locked: they have stopped gripping, so the wheel goes light. x1.00 takes half of it away when both are fully locked. 0 = off."},
-            {"BrakeHeaviness",     "Extra weight in the steering under hard braking, from the front load the telemetry measures. RBR already makes it heavier, so this is 0 (off) unless you want more."},
             {"AudioCabinLevel",    "How loud the car's interior noises are: the heater fan, wind round the glass, panels buzzing with the engine and things rattling over bumps. They are made in code and heard only when the camera is inside the car; outside views are not affected. 0 = off, 1 = normal, 2 = twice as loud. (The muffled, boomy cabin sound itself is automatic: it follows the camera view.)"},
             {"AudioWetLevel",      "How much damp and wet ground changes the tyre sounds: duller, quieter loose-ground loops and a spray hiss that grows with speed, made from the dry loops unless you have real wet recordings (gravel_wet_loop.wav, ...). 0 = off, 1 = the Wet* settings in ForceFX.ini, 2 = twice as much."},
             {"EnableCrash",        "Turns the crash jolt on or off: when the car hits a tree, a rock or a wall, the wheel is yanked for a moment (RBR's own force, boosted)."},
@@ -2553,10 +2550,10 @@ private:
             {"CrashMinPush",       "The least extra push of a full-strength crash, a share of full torque, so a hit is felt even when RBR's force is nearly zero."},
             {"EnableSurfaceFeel",  "Lets the ground under each tyre shape the road feel, together with how fast the car goes and how much the wheels slip: loose ground is grainy and throws stones, soft ground is dull, slippery hard ground is quiet with sharp cracks. Needs the road feel effect. Off, the road feels the same on every surface."},
             {"EnableLandingBoost", "Turns the landing boost on or off. With it off, landings feel exactly as RBR sends them."},
-            {"EnableAccelLight",   "Turns light steering on or off: while the car accelerates forward and the front tyres carry less weight than they do standing still, the steering loses force in proportion. With it off, the steering feels exactly as RBR sends it."},
-            {"AccelLightness",     "How much of the front load that is lost shows up as lighter steering. At x1.00 the steering loses force in proportion to the front weight lost under acceleration, measured from the strut forces against the car standing still on the start line (never more than 60% of RBR's force); x2 doubles it, 0 turns it off. ForceFX.log shows how far the front unloads."},
-            {"EnableWeightTransfer", "Turns the sideways weight feel on or off: the steering gets a little heavier as the weight builds up on the outside tyres in a corner, and swells while the weight swings across the car in a direction change. It only scales RBR's own force, so it never pulls the wheel by itself. With it off, the steering feels exactly as RBR sends it."},
-            {"WeightTransferGain",  "How strong the sideways weight feel is. At x1.00 the steering force grows by up to 25% in a hard corner and by up to 35% while the weight swings across the car (never more than 50% together); x2 doubles it, 0 turns it off. It needs real sideways acceleration, so a rough road on a straight adds nothing. ForceFX.log shows how far the weight moves (\"Weight transfer: ...\")."},
+            {"EnableWeightTransfer", "Turns the weight transfer feel on or off: the steering force follows how the car's weight moves. It gets lighter when the front tyres lose load under acceleration, heavier when they gain it under braking, and heavier as the weight builds up on the outside tyres in a corner or swings across the car in a direction change. It only scales RBR's own force, so it never pulls the wheel by itself. With it off, the steering feels exactly as RBR sends it. ForceFX.log shows how far the weight moves (\"Weight transfer: ...\")."},
+            {"WeightLightness",    "How much of the front load lost under hard acceleration shows up as lighter steering. At x1.00 the steering loses force in proportion to the front weight lost, as the tyres would (never more than 60% off); x2 doubles it, 0 turns it off. It only acts while the ground speed says the car is really accelerating."},
+            {"WeightHeaviness",    "How much of the front load gained under hard braking shows up as heavier steering. RBR already makes the steering heavier in braking, so this is 0 (off) unless you want more: at x1.00 the steering gains force in proportion to the front weight gained (never more than 60% more); x2 doubles it."},
+            {"WeightCornering",    "How strong the sideways weight feel is: the steering force grows by up to 25% as the weight builds up on the outside tyres in a hard corner, and by up to 35% while it swings across the car in a direction change (never more than 50% together). x2 doubles it, 0 turns it off. It needs real sideways acceleration, so a rough road on a straight adds nothing."},
             {"EnableWater",        "Turns the water feel on or off: a heavy thump and a tug on the wheel when a tyre hits standing water (harder the faster you go), a churning rumble while the tyres are in it, and a smaller kick when they come out. Only standing water counts; wet tarmac is left to the road feel."},
             {"WaterGain",          "How strong the splash, the wading rumble and the tug on entry are. At x1.00 a full-speed splash is about as hard as a heavy kerb strike; the rumble stays well below that."},
             {"WaterHeaviness",     "How much heavier the steering gets while the front tyres push through standing water: the water drags on the turned tyres and wants to keep them straight. It scales RBR's own force up (100% = double, 0 = off), so it never pushes the wheel on its own and never more than triples it."},

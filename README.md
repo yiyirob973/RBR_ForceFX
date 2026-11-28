@@ -14,8 +14,7 @@ Extra force feedback for Richard Burns Rally. ForceFX reads NGP telemetry and ad
 - **Crashes:** when the car hits a tree, a rock or a wall, the wheel is yanked for a moment (RBR's own force, boosted). No effect of its own.
 - **Landings:** after a real jump, RBR's own steering force pulls harder for a moment. Bumps never trigger it.
 - **Water:** a thump and a tug when a tyre hits standing water, a rumble while you wade, heavier steering while the front tyres push through.
-- **Light steering under hard acceleration:** the steering loses force in proportion to the weight the front tyres lose (never more than 60%).
-- **Sideways weight:** the steering gets a little heavier as the weight builds up on the outside tyres in a corner, and swells while the weight swings across the car in a direction change. It only scales RBR's own force.
+- **Weight transfer:** the steering force follows where the car's weight is, read from the four strut forces. Under hard acceleration the front tyres lose load and the steering goes lighter, in proportion (never more than 60%). Under braking they gain load and the steering can go heavier (off by default, RBR already does this). In a corner the steering gets a little heavier as the weight builds up on the outside tyres, and swells while the weight swings across the car in a direction change. One tracker and one function, so trail braking is both at once; it only scales RBR's own force and never pulls the wheel by itself.
 - **Dynamic audio (off by default):** tyre squeal, slides, rolling noise, stones, bumps, landings, water and crashes, following each wheel.
 - **Camera movement (off by default):** your head moves with the car in the cockpit view.
 - **Windscreen effects (alpha, off by default):** rain, snow and mud on the glass, with wipers.
@@ -43,7 +42,7 @@ Everything is in `ForceFX.ini`, which describes each option, and the main ones a
 - **Live level:** Numpad **+** and **-** turn everything down or up (never above the ini values), Numpad **\*** mutes. Keys are configurable.
 - **Car profiles** are in `ForceFXCars.ini`: engine and road strength per car, and `Drivetrain=RWD|FWD|AWD`. Cars without an entry count as RWD.
 - **How the road and brake feel reach the wheel:** they are added to RBR's own force, so the wheel gets no extra effect. Without RBR's force updates (menus, test mode) they play as effects of their own.
-- **Limits:** landing, water, light steering, brake lock-up and crash all scale RBR's force. Together they never go past `MaxForceMultiplier` (3 by default), and the multiplier cannot jump in one step.
+- **Limits:** landing, water, weight transfer, brake lock-up and crash all scale RBR's force. Together they never go past `MaxForceMultiplier` (3 by default), and the multiplier cannot jump in one step.
 
 ## How the road feel works
 
@@ -109,7 +108,7 @@ All telemetry field offsets are the `Offset*` keys in `[ForceFX]` of `ForceFX.in
 |---|---|
 | `src/` | The Windows plugin: `RBR_ForceFX.cpp` (hooks, telemetry parsing, the force feedback device, the menu) and its export list. |
 | `core/` | The portable core, no Windows needed: `config.hpp` (every setting, its default and its clamp), `synth.hpp` (the synthesis from analysed telemetry to effects and force scalings), `common.hpp` (hard ceilings, small helpers). |
-| `effects/` | One header per effect on the force: landing, water, light and heavy steering, brake judder, crash, rev limiter, weight transfer, and `force_scale.hpp`, which combines and bounds all the scalings of RBR's own force. |
+| `effects/` | One header per effect on the force: landing, water, weight transfer (acceleration, braking and cornering in one tracker and one function), brake judder and lock-up, crash, rev limiter, and `force_scale.hpp`, which combines and bounds all the scalings of RBR's own force. |
 | `road/` | The ground: material table, surface classes, the road vibration bands and what shapes them. |
 | `telemetry/` | Where the fields are in an NGP packet, tyre motion and slip. |
 | `audio/` | The dynamic audio (logic, mixer, cabin) and its tools. |

@@ -23,13 +23,12 @@ struct Config {
     int   fxEngine = 1, fxRoad = 1, fxBrake = 1, fxLandBoost = 1, fxSurface = 1;
     int   fxWater = 1;               // splash, wading and (optionally) aquaplaning when the tyres are in standing water
     float waterGain = 1.0f;          // 0..2: strength of the splash thump, the wading rumble and the kick on entry
-    int   fxAccelLight = 1;          // lighter steering under hard acceleration, from the measured front load and the measured acceleration
-    float accelLight = 1.0f;         // 0..2: 1 = the steering loses force in proportion to the front load lost (never more than 60%); 0 = off
-    int   fxWeight = 1;              // the weight swelling RBR's force in corners and swinging across the car in a direction change
-    float weightGain = 1.0f;         // 0..2: 1 = up to 25% more force from cornering load and up to 35% more while the load swings across (never more than 50% together)
+    int   fxWeight = 1;              // weight transfer: RBR's steering force follows the weight on the front tyres and across the car (effects/weight_transfer.hpp)
+    float weightLight = 1.0f;        // 0..2: 1 = the steering loses force in proportion to the front load lost under acceleration (never more than 60%); 0 = off
+    float weightHeavy = 0.0f;        // 0..2: 1 = the steering gains force in proportion to the front load gained under braking (0 = off: RBR already makes it heavy)
+    float weightCorner = 1.0f;       // 0..2: 1 = up to 25% more force from cornering load and up to 35% more while the load swings across (never more than 50% together)
     float waterHeavy = 0.6f;         // 0..2: how much heavier the steering gets while the front tyres push through water (0 = off, 1 = double RBR's force)
     float lockLight = 1.0f;          // 0..2: how far RBR's force lightens while the front tyres are locked (0 = off, 1 = by half when both are fully locked)
-    float brakeHeavy = 0.0f;         // 0..2: how much heavier the steering gets in hard braking (0 = off: RBR already makes it heavy)
     int   fxCrash = 1;               // a jolt on RBR's own force when the car hits something
     float crashBoost = 0.8f;         // 0..3: how much the force grows in a full-strength crash (0.8 = 1.8x)
     float crashAdd = 0.15f;          // 0..1: the minimum extra push of a full-strength crash, a share of full torque
@@ -140,15 +139,15 @@ inline void ClampConfig(Config& c) {
     c.priorityDuck = clampf(c.priorityDuck, 0.0f, 1.0f);
     c.fxEngine = c.fxEngine ? 1 : 0; c.fxRoad = c.fxRoad ? 1 : 0; c.fxBrake = c.fxBrake ? 1 : 0; c.fxLandBoost = c.fxLandBoost ? 1 : 0; c.fxSurface = c.fxSurface ? 1 : 0;
     c.fxCrash = c.fxCrash ? 1 : 0;
-    c.lockLight = clampf(c.lockLight, 0.0f, 2.0f); c.brakeHeavy = clampf(c.brakeHeavy, 0.0f, 2.0f);
+    c.lockLight = clampf(c.lockLight, 0.0f, 2.0f);
     c.crashBoost = clampf(c.crashBoost, 0.0f, 3.0f); c.crashAdd = clampf(c.crashAdd, 0.0f, 1.0f);
     c.maxForceMul = ForceScale::Cap(c.maxForceMul);
     c.fxAudio = c.fxAudio ? 1 : 0;
     c.audioDebris = clampf(c.audioDebris, 0.0f, 4.0f); c.audioImpact = clampf(c.audioImpact, 0.0f, 4.0f); c.audioSusp = clampf(c.audioSusp, 0.0f, 4.0f); c.audioWet = clampf(c.audioWet, 0.0f, 2.0f); c.audioCabin = clampf(c.audioCabin, 0.0f, 2.0f);
     c.fxCamera = c.fxCamera ? 1 : 0; c.fxWindscreen = c.fxWindscreen ? 1 : 0;
     c.fxWater = c.fxWater ? 1 : 0; c.waterGain = clampf(c.waterGain, 0.0f, 2.0f); c.waterHeavy = clampf(c.waterHeavy, 0.0f, 2.0f);
-    c.fxAccelLight = c.fxAccelLight ? 1 : 0; c.accelLight = clampf(c.accelLight, 0.0f, 2.0f);
-    c.fxWeight = c.fxWeight ? 1 : 0; c.weightGain = clampf(c.weightGain, 0.0f, 2.0f);
+    c.fxWeight = c.fxWeight ? 1 : 0;
+    c.weightLight = clampf(c.weightLight, 0.0f, 2.0f); c.weightHeavy = clampf(c.weightHeavy, 0.0f, 2.0f); c.weightCorner = clampf(c.weightCorner, 0.0f, 2.0f);
     c.landingBoost = clampf(c.landingBoost, 0.0f, 4.0f);
     c.landingAdd = clampf(c.landingAdd, 0.0f, 1.0f);
     c.airLevel = clampf(c.airLevel, 0.2f, 0.8f);

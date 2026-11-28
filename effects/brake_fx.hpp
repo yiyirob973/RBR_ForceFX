@@ -1,12 +1,11 @@
 // Brake feel, built from the same signals as the rest of the plugin. Pure logic, no Windows or game access, tested in tests/brake_fx_test.cpp.
 //
-// Three parts:
+// Two parts:
 //   JUDDER     the front-end shake under braking (strength from the pedal, the weight that has moved to the front tyres and any lock-up; the
 //              pitch from the front wheels, or a lock-up scrub whose pitch follows the ground). It rides on RBR's own force like the road
 //              vibration does, as one more band of it, instead of being a separate effect on the wheel.
 //   LOCK-UP    when the front tyres lock, they stop gripping and the steering goes light. LockMul scales RBR's force down by how far the front
-//              tyres are locked, the same way light steering under acceleration does.
-//   HEAVY      hard braking loads the front tyres and makes the steering heavier. RBR already does that, so this is off unless it is wanted.
+//              tyres are locked, the same way the front load does in weight_transfer.hpp (which also owns the heavier steering in hard braking).
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -15,8 +14,6 @@ namespace BrakeFx {
 
 constexpr float kLockCut = 0.5f;       // at gain 1 and both front tyres fully locked, RBR's force loses this share ...
 constexpr float kLockCutMax = 0.7f;    // ... and never more than this, whatever the gain
-constexpr float kHeavyAdd = 0.3f;      // at gain 1 and full heavy braking RBR's force grows by this share ...
-constexpr float kHeavyAddMax = 0.6f;   // ... and never more than this
 
 namespace detail {
 inline float c01(float v) { return !(v > 0.0f) ? 0.0f : (v > 1.0f ? 1.0f : v); }          // NaN comes out as 0
@@ -30,12 +27,6 @@ inline float FrontLock(const float lock[4]) { return detail::c01(0.5f * (lock[0]
 inline float LockMul(float frontLock, float gain) {
     const float cut = detail::gain(gain) * kLockCut * detail::c01(frontLock);
     return 1.0f - (cut > kLockCutMax ? kLockCutMax : cut);
-}
-
-// RBR's force times this (>= 1) in heavy braking. gain: 0 = off, 1 = normal, at most 2.
-inline float HeavyMul(float heavy, float gain) {
-    const float add = detail::gain(gain) * kHeavyAdd * detail::c01(heavy);
-    return 1.0f + (add > kHeavyAddMax ? kHeavyAddMax : add);
 }
 
 // The pitch of the lock-up scrub (Hz). Hard ground chatters higher, loose and soft ground scrubs lower and coarser; r is a random number in -1..1.

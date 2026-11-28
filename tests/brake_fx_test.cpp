@@ -32,13 +32,6 @@ TEST(lock_lightening_is_bounded_whatever_the_gain) {
 TEST(gain_zero_and_bad_numbers_turn_it_off) {
     CHECK(BrakeFx::LockMul(1.0f, 0.0f) == 1.0f); CHECK(BrakeFx::LockMul(1.0f, -3.0f) == 1.0f);
     CHECK(BrakeFx::LockMul(1.0f, kNaN) == 1.0f); CHECK(BrakeFx::LockMul(kNaN, 1.0f) == 1.0f);
-    CHECK(BrakeFx::HeavyMul(1.0f, 0.0f) == 1.0f); CHECK(BrakeFx::HeavyMul(kNaN, 1.0f) == 1.0f);
-}
-TEST(heavy_braking_adds_force_and_is_bounded) {
-    CHECK(BrakeFx::HeavyMul(0.0f, 1.0f) == 1.0f);
-    CHECK(std::fabs(BrakeFx::HeavyMul(1.0f, 1.0f) - 1.3f) < 1e-5f);
-    CHECK(BrakeFx::HeavyMul(1.0f, 2.0f) <= 1.0f + BrakeFx::kHeavyAddMax + 1e-6f);
-    CHECK(BrakeFx::HeavyMul(0.5f, 1.0f) < BrakeFx::HeavyMul(1.0f, 1.0f));
 }
 TEST(lock_up_pitch_follows_the_ground) {
     const float tarmac = BrakeFx::LockHz(1.0f, 0.0f, 0.0f), gravel = BrakeFx::LockHz(0.4f, 0.6f, 0.0f), snow = BrakeFx::LockHz(0.15f, 0.9f, 0.0f);

@@ -13,7 +13,7 @@ static const float kNaN = std::numeric_limits<float>::quiet_NaN();
 using namespace ForceScale;
 
 TEST(no_scaling_is_exactly_one) { Parts p; CHECK(Product(p) == 1.0f); Limiter l; CHECK(l.Step(Product(p), 0.01f, 3.0f) == 1.0f); }
-TEST(the_parts_multiply) { Parts p; p.landing = 2.0f; p.waterHeavy = 1.5f; p.frontLoad = 0.8f; CHECK(std::fabs(Product(p) - 2.4f) < 1e-5f); }
+TEST(the_parts_multiply) { Parts p; p.landing = 2.0f; p.waterHeavy = 1.5f; p.weight = 0.8f; CHECK(std::fabs(Product(p) - 2.4f) < 1e-5f); }
 TEST(a_broken_part_counts_as_no_change) { Parts p; p.landing = kNaN; p.crash = -4.0f; p.waterKick = 0.0f; p.brakeLock = 0.5f; CHECK(Product(p) == 0.5f); }
 TEST(the_cap_stops_a_stack_of_boosts) {
     Parts p; p.landing = 5.0f; p.waterKick = 2.0f; p.waterHeavy = 3.0f;          // 30x
